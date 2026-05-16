@@ -205,3 +205,87 @@ fn events(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn short_id_extracts_uuid_prefix() {
+        // SessionId newtype shape `{"0": "<uuid>"}` → first 8 chars of the uuid.
+        let value = serde_json::json!({"0": "abcd1234-5678-90ab-cdef-1234567890ab"});
+        assert_eq!(short_id(&value), "abcd1234");
+    }
+
+    #[test]
+    fn short_id_truncates_to_eight_chars() {
+        // Any inner uuid string must collapse to exactly 8 characters.
+        let value = serde_json::json!({"0": "0123456789abcdef-rest-ignored"});
+        assert_eq!(short_id(&value).chars().count(), 8);
+    }
+
+    #[test]
+    fn short_id_falls_back_when_field_missing() {
+        // Missing `0` key or a scalar value → the placeholder.
+        assert_eq!(short_id(&serde_json::json!({})), "????????");
+        assert_eq!(short_id(&serde_json::json!("scalar")), "????????");
+    }
+
+    #[test]
+    fn short_id_falls_back_when_value_not_str() {
+        // `0` present but not a string → the placeholder.
+        assert_eq!(short_id(&serde_json::json!({"0": 42})), "????????");
+    }
+
+    #[test]
+    fn cli_parses_status() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "status"]).unwrap();
+        assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn cli_parses_start_no_args() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "start"]).unwrap();
+        match cli.command {
+            Command::Start { workdir } => assert_eq!(workdir, None),
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_start_with_workdir() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "start", "--workdir", "/tmp"]).unwrap();
+        match cli.command {
+            Command::Start { workdir } => assert_eq!(workdir.as_deref(), Some("/tmp")),
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_stop() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "stop", "abc-123"]).unwrap();
+        match cli.command {
+            Command::Stop { id } => assert_eq!(id, "abc-123"),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_events() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "events"]).unwrap();
+        assert!(matches!(cli.command, Command::Events));
+    }
+
+    #[test]
+    fn cli_url_flag_overrides_default() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "--url", "http://x:9", "status"]).unwrap();
+        assert_eq!(cli.url, "http://x:9");
+    }
+
+    #[test]
+    fn cli_rejects_no_subcommand() {
+        // A subcommand is mandatory; bare invocation must error.
+        assert!(Cli::try_parse_from(["trusty-mpm"]).is_err());
+    }
+}

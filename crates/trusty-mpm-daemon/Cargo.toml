@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Long-running trusty-mpm daemon: session control, hook interception, artifact serving"
 
+[lib]
+name = "trusty_mpm_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "trusty-mpmd"
 path = "src/main.rs"

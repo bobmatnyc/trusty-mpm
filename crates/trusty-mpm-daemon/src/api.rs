@@ -269,6 +269,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_session_returns_id_even_without_tmux() {
+        // Graceful-degradation invariant: tmux is unavailable in CI, yet
+        // `POST /sessions` must still return a JSON body carrying an `id`, and
+        // that id must be visible in the subsequent `GET /sessions` snapshot.
+        let state = DaemonState::shared();
+        let Json(body) = register_session(
+            State(Arc::clone(&state)),
+            Json(RegisterSession {
+                workdir: "/tmp/no-tmux".into(),
+            }),
+        )
+        .await;
+        let id_str = body
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("response body must contain an `id` string");
+        let listed = state.list_sessions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id.0.to_string(), id_str);
+    }
+
+    #[tokio::test]
     async fn hook_relay_rejects_bad_session_id() {
         let (state, _) = state_with_session();
         let post = HookPost {

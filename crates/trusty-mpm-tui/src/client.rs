@@ -49,6 +49,13 @@ pub struct EventRow {
     pub event: String,
     /// RFC3339 timestamp the daemon received the event.
     pub at: String,
+    /// Opaque event payload; defaults to `Null` when the daemon omits it.
+    ///
+    /// Captured from the wire so a future panel can show event detail; the
+    /// current dashboard renders only the summary line, hence `allow(dead_code)`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub payload: serde_json::Value,
 }
 
 /// One circuit-breaker row as returned by `GET /breakers`.
@@ -190,6 +197,87 @@ mod tests {
         }
         let row: WireRow = serde_json::from_value(json).unwrap();
         assert_eq!(row.agent, "research");
+        assert_eq!(row.breaker.state, "closed");
+        assert_eq!(row.breaker.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn event_row_deserializes_session_id_shape() {
+        // The `SessionId` newtype wire shape `{"0": "<uuid>"}` round-trips.
+        let json = serde_json::json!({
+            "session": {"0": "abcd1234-5678-90ab-cdef-1234567890ab"},
+            "event": "Stop",
+            "at": "2024-01-01T00:00:00Z",
+            "payload": null
+        });
+        let row: EventRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.event, "Stop");
+        assert_eq!(
+            row.session.get("0").and_then(|v| v.as_str()),
+            Some("abcd1234-5678-90ab-cdef-1234567890ab")
+        );
+        assert!(row.payload.is_null());
+    }
+
+    #[test]
+    fn event_row_defaults_payload_when_absent() {
+        // An omitted `payload` field must default to JSON `Null`.
+        let json = serde_json::json!({
+            "session": {"0": "abcd1234-5678-90ab-cdef-1234567890ab"},
+            "event": "Stop",
+            "at": "2024-01-01T00:00:00Z"
+        });
+        let row: EventRow = serde_json::from_value(json).unwrap();
+        assert!(row.payload.is_null());
+    }
+
+    #[test]
+    fn breaker_row_full_deserialization() {
+        // The nested `breaker` object with an open state and a config block
+        // deserializes; unknown `config` fields are ignored.
+        let json = serde_json::json!({
+            "agent": "eng",
+            "breaker": {
+                "state": "open",
+                "consecutive_failures": 3,
+                "config": { "failure_threshold": 3, "max_depth": 5 }
+            }
+        });
+        #[derive(serde::Deserialize)]
+        struct WireBreaker {
+            state: String,
+            consecutive_failures: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct WireRow {
+            agent: String,
+            breaker: WireBreaker,
+        }
+        let row: WireRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.agent, "eng");
+        assert_eq!(row.breaker.state, "open");
+        assert_eq!(row.breaker.consecutive_failures, 3);
+    }
+
+    #[test]
+    fn breaker_row_deserialization_closed() {
+        // A closed breaker reports zero consecutive failures.
+        let json = serde_json::json!({
+            "agent": "qa",
+            "breaker": { "state": "closed", "consecutive_failures": 0 }
+        });
+        #[derive(serde::Deserialize)]
+        struct WireBreaker {
+            state: String,
+            consecutive_failures: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct WireRow {
+            agent: String,
+            breaker: WireBreaker,
+        }
+        let row: WireRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.agent, "qa");
         assert_eq!(row.breaker.state, "closed");
         assert_eq!(row.breaker.consecutive_failures, 0);
     }

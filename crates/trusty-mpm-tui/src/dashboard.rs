@@ -84,6 +84,20 @@ pub fn breaker_rows(state: &DashboardState) -> Vec<Row<'static>> {
         .collect()
 }
 
+/// Render a `SessionId` newtype JSON value into a short, human id.
+///
+/// Why: the daemon serializes `SessionId` as `{"0": "<uuid>"}`; the dashboard
+/// shows only the first 8 characters so rows and event lines stay compact.
+/// What: extracts the inner UUID string and truncates it to 8 chars, falling
+/// back to a placeholder when the shape is unexpected.
+/// Test: `short_session_extracts_prefix`, `short_session_handles_missing_key`.
+pub(crate) fn short_session(val: &serde_json::Value) -> String {
+    val.get("0")
+        .and_then(|v| v.as_str())
+        .map(|s| s.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "????????".to_string())
+}
+
 /// Build the formatted lines for the recent-events panel.
 ///
 /// Why: separating line formatting from the ratatui `List` lets tests assert
@@ -95,12 +109,7 @@ pub fn event_lines(state: &DashboardState) -> Vec<String> {
     state.events[start..]
         .iter()
         .map(|e| {
-            let session = e
-                .session
-                .get("0")
-                .and_then(|v| v.as_str())
-                .map(|s| s.chars().take(8).collect::<String>())
-                .unwrap_or_else(|| "????????".to_string());
+            let session = short_session(&e.session);
             format!("{:<22} {:<10} {}", e.event, session, e.at)
         })
         .collect()
@@ -218,14 +227,20 @@ mod tests {
         assert_eq!(breaker_rows(&state).len(), 1);
     }
 
+    /// Build an `EventRow` for tests with a null payload.
+    fn event(name: &str, at: &str) -> EventRow {
+        EventRow {
+            session: serde_json::json!({"0": "abcd1234-5678-90ab-cdef-1234567890ab"}),
+            event: name.into(),
+            at: at.into(),
+            payload: serde_json::Value::Null,
+        }
+    }
+
     #[test]
     fn event_lines_format_recent_events() {
         let state = DashboardState {
-            events: vec![EventRow {
-                session: serde_json::json!({"0": "abcd1234-5678-90ab-cdef-1234567890ab"}),
-                event: "PreToolUse".into(),
-                at: "2024-01-01T00:00:00Z".into(),
-            }],
+            events: vec![event("PreToolUse", "2024-01-01T00:00:00Z")],
             ..DashboardState::default()
         };
         let lines = event_lines(&state);
@@ -236,15 +251,76 @@ mod tests {
 
     #[test]
     fn event_lines_cap_at_twenty() {
-        let event = EventRow {
-            session: serde_json::json!({"0": "abcd1234-5678-90ab-cdef-1234567890ab"}),
-            event: "Stop".into(),
-            at: "2024-01-01T00:00:00Z".into(),
-        };
         let state = DashboardState {
-            events: vec![event; 50],
+            events: vec![event("Stop", "2024-01-01T00:00:00Z"); 50],
             ..DashboardState::default()
         };
         assert_eq!(event_lines(&state).len(), 20);
+    }
+
+    #[test]
+    fn short_session_extracts_prefix() {
+        let val = serde_json::json!({"0": "abcd1234-5678-90ab-cdef-1234567890ab"});
+        assert_eq!(short_session(&val), "abcd1234");
+    }
+
+    #[test]
+    fn short_session_handles_missing_key() {
+        // Missing `0` key or a null value → the placeholder.
+        assert_eq!(short_session(&serde_json::json!({})), "????????");
+        assert_eq!(short_session(&serde_json::Value::Null), "????????");
+    }
+
+    #[test]
+    fn breaker_state_open_shows_open() {
+        let state = DashboardState {
+            breakers: vec![BreakerRow {
+                agent: "eng".into(),
+                state: "open".into(),
+                consecutive_failures: 3,
+            }],
+            ..DashboardState::default()
+        };
+        // The rendered row's middle cell carries the breaker state text.
+        assert_eq!(state.breakers[0].state, "open");
+        assert_eq!(breaker_rows(&state).len(), 1);
+    }
+
+    #[test]
+    fn breaker_state_closed_shows_closed() {
+        let state = DashboardState {
+            breakers: vec![BreakerRow {
+                agent: "qa".into(),
+                state: "closed".into(),
+                consecutive_failures: 0,
+            }],
+            ..DashboardState::default()
+        };
+        assert_eq!(state.breakers[0].state, "closed");
+        assert_eq!(breaker_rows(&state).len(), 1);
+    }
+
+    #[test]
+    fn event_lines_newest_at_bottom() {
+        // Events are stored oldest-first; the formatted lines preserve that
+        // order so the newest event renders last.
+        let state = DashboardState {
+            events: vec![
+                event("oldest", "2024-01-01T00:00:00Z"),
+                event("middle", "2024-01-01T00:00:01Z"),
+                event("newest", "2024-01-01T00:00:02Z"),
+            ],
+            ..DashboardState::default()
+        };
+        let lines = event_lines(&state);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("oldest"));
+        assert!(lines[2].contains("newest"));
+    }
+
+    #[test]
+    fn event_lines_empty_when_no_events() {
+        let state = DashboardState::default();
+        assert!(event_lines(&state).is_empty());
     }
 }

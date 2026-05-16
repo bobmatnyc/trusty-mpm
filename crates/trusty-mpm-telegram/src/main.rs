@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
 /// reply text rather than panics.
 /// Test: covered indirectly by `commands` parsing tests; live behaviour is
 /// exercised by running the bot against a daemon.
-async fn handle_command(cmd: commands::BotCommand, daemon_url: &str) -> String {
+pub(crate) async fn handle_command(cmd: commands::BotCommand, daemon_url: &str) -> String {
     use commands::BotCommand::*;
     let client = reqwest::Client::new();
     match cmd {
@@ -150,5 +150,115 @@ async fn handle_command(cmd: commands::BotCommand, daemon_url: &str) -> String {
         Approve { session_id } | Deny { session_id } => {
             format!("Permission approval for {session_id} not yet wired to daemon API")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commands::BotCommand;
+
+    /// Spawn the daemon's real HTTP API on a random loopback port.
+    ///
+    /// Why: lets the Telegram command handler be tested against the genuine
+    /// daemon routes without a live daemon, tmux, or external network.
+    /// What: builds `api::router(DaemonState::shared())`, binds an ephemeral
+    /// port, serves it on a background task, and returns the state plus base URL.
+    /// Test: used by the `handle_*` tests below.
+    async fn spawn_test_daemon() -> (
+        std::sync::Arc<trusty_mpm_daemon::state::DaemonState>,
+        String,
+    ) {
+        use std::future::IntoFuture;
+        use trusty_mpm_daemon::{api, state::DaemonState};
+        let state = DaemonState::shared();
+        let router = api::router(std::sync::Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router).into_future());
+        (state, format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn handle_help_returns_help_text() {
+        // Pure branch: `Help` echoes the static help text, no HTTP needed.
+        let reply = handle_command(BotCommand::Help, "http://unused").await;
+        assert_eq!(reply, commands::help_text());
+    }
+
+    #[tokio::test]
+    async fn handle_approve_contains_session_id() {
+        let reply = handle_command(
+            BotCommand::Approve {
+                session_id: "sess-42".into(),
+            },
+            "http://unused",
+        )
+        .await;
+        assert!(reply.contains("sess-42"));
+    }
+
+    #[tokio::test]
+    async fn handle_deny_contains_session_id() {
+        let reply = handle_command(
+            BotCommand::Deny {
+                session_id: "sess-99".into(),
+            },
+            "http://unused",
+        )
+        .await;
+        assert!(reply.contains("sess-99"));
+    }
+
+    #[tokio::test]
+    async fn handle_sessions_with_no_sessions_returns_empty_msg() {
+        let (_state, url) = spawn_test_daemon().await;
+        let reply = handle_command(BotCommand::Sessions, &url).await;
+        assert_eq!(reply, "No active sessions.");
+    }
+
+    #[tokio::test]
+    async fn handle_sessions_lists_one_session() {
+        use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
+        let (state, url) = spawn_test_daemon().await;
+        state.register_session(Session {
+            id: SessionId::new(),
+            workdir: "/tmp/proj".into(),
+            status: SessionStatus::Active,
+            control: ControlModel::Tmux,
+            active_delegations: 0,
+        });
+        let reply = handle_command(BotCommand::Sessions, &url).await;
+        assert!(reply.contains("/tmp/proj"));
+        assert_ne!(reply, "No active sessions.");
+    }
+
+    #[tokio::test]
+    async fn handle_sessions_daemon_unreachable_returns_error() {
+        // Port 1 is never bound by a daemon; the handler must report it.
+        let reply = handle_command(BotCommand::Sessions, "http://127.0.0.1:1").await;
+        assert!(reply.contains("unreachable"));
+    }
+
+    #[tokio::test]
+    async fn handle_status_no_events_returns_message() {
+        use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
+        let (state, url) = spawn_test_daemon().await;
+        let id = SessionId::new();
+        state.register_session(Session {
+            id,
+            workdir: "/tmp/proj".into(),
+            status: SessionStatus::Active,
+            control: ControlModel::Tmux,
+            active_delegations: 0,
+        });
+        let reply = handle_command(
+            BotCommand::Status {
+                session_id: id.0.to_string(),
+            },
+            &url,
+        )
+        .await;
+        assert!(reply.contains("no recent events"));
     }
 }

@@ -15,12 +15,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
-mod api;
-pub(crate) mod discover;
-mod mcp_backend;
-mod state;
-mod tmux;
-mod watcher;
+use trusty_mpm_daemon::{api, discover, mcp_backend, state, tmux, watcher};
 
 use mcp_backend::StateBackend;
 use state::DaemonState;
@@ -79,7 +74,7 @@ async fn run_http(state: Arc<DaemonState>, addr: SocketAddr) -> anyhow::Result<(
 
     // Discover the trusty sidecar addresses and record them in shared state.
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let addrs = crate::discover::discover_all(&home).await;
+    let addrs = discover::discover_all(&home).await;
     info!(
         "trusty-memory at {}, trusty-search at {}",
         addrs.memory, addrs.search
