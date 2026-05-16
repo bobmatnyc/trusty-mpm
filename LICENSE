@@ -1,0 +1,91 @@
+Elastic License 2.0
+
+ELASTIC LICENSE 2.0 (ELv2)
+
+URL: https://www.elastic.co/licensing/elastic-license
+
+ACCEPTANCE
+
+By accessing or using the software, you accept all the terms and conditions of this Elastic License 2.0.
+
+VALID LICENSEES
+
+Subject to the terms and conditions of this License, the Licensor grants you a
+non-exclusive, royalty-free, worldwide, non-sublicensable, non-transferable
+license to use, copy, modify, display, perform, and distribute the Software
+and prepare derivative works based upon the Software. All rights not expressly
+granted herein are reserved.
+
+RESTRICTIONS
+
+You may not provide the Software to third parties as a hosted or managed
+service, where the service provides users with access to any substantial set of
+the features or functionality of the Software.
+
+You may not move, change, disable, or circumvent any license key functionality
+in the Software, and you may not remove or obscure any proprietary notices or
+labels on the Software.
+
+TERM
+
+This License is effective until terminated. Your rights under this License will
+terminate automatically without notice from Licensor if you fail to comply with
+any of the terms of this License.
+
+Upon termination of this License, you shall cease all use of the Software and
+destroy all copies, full or partial, of the Software. However, your obligations
+under Section 2 will survive the termination of this License.
+
+LICENSOR'S PROPRIETARY NOTICES
+
+All information, content, and materials contained in or provided with the
+Software are the proprietary information of Licensor, and Licensor retains all
+right, title, and interest therein. You must not remove or alter any
+proprietary notice or label on the Software.
+
+ACKNOWLEDGMENTS
+
+The Software contains code licensed under the Elastic License 2.0 by Elastic or
+its affiliates, and you agree to comply with all terms of this Elastic License
+2.0.
+
+OPEN SOURCE COMPONENTS
+
+The Software may include components licensed under open source licenses, such as
+Apache License, GNU Affero General Public License, GNU General Public License, or
+others. Such open source components remain governed by the respective open source
+licenses, and your use of such components must comply with those licenses.
+
+PATENT RIGHTS
+
+Licensor hereby grants you a limited, royalty-free, non-exclusive patent license
+to make, have made, use, and offer to sell, sell, and import the Software. This
+patent grant does not include any personal services or transfer of Licensor's
+proprietary rights.
+
+NO WARRANTIES
+
+THE SOFTWARE IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL LICENSOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT,
+INCIDENTAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, HOWEVER CAUSED AND REGARDLESS
+OF THE THEORY OF LIABILITY, EVEN IF LICENSOR HAS BEEN ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+GOVERNING LAW
+
+This License is governed by the laws of the United States and the State of
+California, without regard to its conflict of laws provisions.
+
+ENTIRE AGREEMENT
+
+This License, together with any other agreements you have with Licensor
+concerning the Software, constitutes the entire agreement between you and
+Licensor regarding the Software and supersedes all prior agreements and
+understandings, whether written or oral.
+
+This is version 2.0 of the Elastic License 2.0.
