@@ -9,9 +9,14 @@
 //! Test: `cargo test -p trusty-mpm-core` exercises serde round-trips and the
 //! claude-mpm frontmatter parser against fixture files.
 
+pub mod agent;
 pub mod artifact;
+pub mod circuit;
 pub mod error;
+pub mod hook;
 pub mod ipc;
+pub mod memory;
 pub mod session;
+pub mod tmux;
 
 pub use error::{Error, Result};
