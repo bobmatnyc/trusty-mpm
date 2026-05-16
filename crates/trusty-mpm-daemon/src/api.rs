@@ -701,6 +701,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_events_returns_empty_initially() {
+        // A freshly-registered session has no hook events; `GET
+        // /sessions/{id}/events` must return 200 with an empty array.
+        let (state, id) = state_with_session();
+        let result = session_events(State(state), Path(id.0.to_string())).await;
+        let Json(body) = result.expect("valid session id resolves");
+        assert_eq!(body["events"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn recent_events_returns_ring_buffer() {
+        // A valid hook event posted via `POST /hooks` must appear in the
+        // `GET /events` ring-buffer feed.
+        let (state, id) = state_with_session();
+        let post = HookPost {
+            session_id: id.0.to_string(),
+            event: "PreToolUse".into(),
+            payload: serde_json::json!({"tool": "Read"}),
+        };
+        let _ = ingest_hook(State(Arc::clone(&state)), Json(post))
+            .await
+            .expect("known event ingests");
+
+        let Json(body) = recent_events(State(state)).await;
+        let events = body["events"].as_array().expect("events is an array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["session"], id.0.to_string());
+        assert_eq!(events[0]["event"], "PreToolUse");
+    }
+
+    #[tokio::test]
+    async fn breakers_endpoint_returns_200() {
+        // `GET /breakers` must return 200 with a well-formed `breakers` array,
+        // even when no breakers have been created yet.
+        let state = DaemonState::shared();
+        let Json(body) = breakers(State(state)).await;
+        assert!(body["breakers"].is_array());
+    }
+
+    #[tokio::test]
     async fn get_optimizer_returns_default() {
         let state = DaemonState::shared();
         let Json(body) = get_optimizer(State(state)).await;

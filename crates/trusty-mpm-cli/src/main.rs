@@ -93,6 +93,12 @@ enum Command {
         #[command(subcommand)]
         action: OptimizerAction,
     },
+    /// Inspect the session overseer.
+    Overseer {
+        /// Overseer action to perform.
+        #[command(subcommand)]
+        action: OverseerAction,
+    },
 }
 
 /// Actions for the `project` subcommand.
@@ -151,6 +157,20 @@ enum SessionAction {
         #[arg(long)]
         dir: Option<String>,
     },
+    /// Show the recent hook-event feed for one session.
+    Events {
+        /// Session id or friendly name.
+        id_or_name: String,
+    },
+    /// Show every agent's circuit-breaker state.
+    Breakers,
+}
+
+/// Actions for the `overseer` subcommand.
+#[derive(Debug, Subcommand)]
+enum OverseerAction {
+    /// Show the overseer's enabled status and handler type.
+    Status,
 }
 
 /// Actions for the `optimizer` subcommand.
@@ -211,6 +231,9 @@ struct EventRow {
     event: String,
     /// RFC3339 timestamp the daemon received the event.
     at: String,
+    /// Raw event payload (shape varies per event).
+    #[serde(default)]
+    payload: serde_json::Value,
 }
 
 #[tokio::main]
@@ -249,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
+        Command::Overseer { action } => overseer(&client, &cli.url, action).await,
     }
 }
 
@@ -606,6 +630,161 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
             let fw = trusty_mpm_core::paths::FrameworkPaths::default();
             let (output, _stash) = compose_session_instructions(&fw, &path)?;
             print!("{}", output.merged);
+        }
+        SessionAction::Events { id_or_name } => {
+            let id = match resolve_session_id(client, url, &id_or_name).await? {
+                Some(id) => id,
+                None => {
+                    println!("session '{id_or_name}' not found");
+                    return Ok(());
+                }
+            };
+            #[derive(Deserialize)]
+            struct Body {
+                events: Vec<EventRow>,
+            }
+            let body: Body = client
+                .get(format!("{url}/sessions/{id}/events"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if body.events.is_empty() {
+                println!("no events for session {id_or_name}");
+            }
+            for e in &body.events {
+                println!("{} {} {}", e.at, e.event, event_summary(&e.payload));
+            }
+        }
+        SessionAction::Breakers => {
+            #[derive(Deserialize)]
+            struct Row {
+                agent: String,
+                breaker: serde_json::Value,
+            }
+            #[derive(Deserialize)]
+            struct Body {
+                breakers: Vec<Row>,
+            }
+            let body: Body = client
+                .get(format!("{url}/breakers"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if body.breakers.is_empty() {
+                println!("no circuit breakers");
+            } else {
+                println!("{:<24} {:<12} FAILURES", "AGENT", "STATE");
+                for r in &body.breakers {
+                    let state = r
+                        .breaker
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let failures = r
+                        .breaker
+                        .get("consecutive_failures")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    println!("{:<24} {:<12} {}", r.agent, state, failures);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a session id-or-name to its UUID string via `GET /sessions`.
+///
+/// Why: `session events` calls `GET /sessions/{id}/events`, which requires a
+/// UUID; operators may pass a friendly `tmpm-<adj>-<noun>` name instead, so the
+/// name must be resolved against the live session list first.
+/// What: fetches `GET /sessions`, matching `id.0` or `tmux_name` against the
+/// argument; returns `Some(uuid)` on a hit, `None` when no session matches.
+/// Test: covered indirectly by `cli_parses_session_events`.
+async fn resolve_session_id(
+    client: &reqwest::Client,
+    url: &str,
+    id_or_name: &str,
+) -> anyhow::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Body {
+        sessions: Vec<serde_json::Value>,
+    }
+    let body: Body = client
+        .get(format!("{url}/sessions"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let found = body.sessions.iter().find_map(|s| {
+        // `SessionId` is a single-field newtype: serde serializes it as a bare
+        // UUID string, so `id` is read directly (not as `{"0": ...}`).
+        let uuid = s.get("id").and_then(|v| v.as_str());
+        let name = s.get("tmux_name").and_then(|v| v.as_str());
+        match uuid {
+            Some(u) if u == id_or_name || name == Some(id_or_name) => Some(u.to_string()),
+            _ => None,
+        }
+    });
+    Ok(found)
+}
+
+/// Summarize an opaque hook-event payload into a single short line.
+///
+/// Why: `session events` prints one row per event; a full JSON payload would
+/// wrap the terminal, so a compact summary keeps rows readable.
+/// What: shows the `tool` field when present, otherwise a truncated JSON dump.
+/// Test: covered by `event_summary_*` unit tests.
+fn event_summary(payload: &serde_json::Value) -> String {
+    if let Some(tool) = payload.get("tool").and_then(|v| v.as_str()) {
+        return format!("tool={tool}");
+    }
+    let dump = payload.to_string();
+    if dump.len() > 60 {
+        format!("{}…", &dump[..60])
+    } else {
+        dump
+    }
+}
+
+/// `overseer` subcommand — inspect the session overseer.
+///
+/// Why: operators need to see whether oversight is active without the TUI.
+/// What: `Status` calls `GET /overseer` and prints the enabled flag and
+/// handler type.
+/// Test: `cli_parses_overseer_status`.
+async fn overseer(
+    client: &reqwest::Client,
+    url: &str,
+    action: OverseerAction,
+) -> anyhow::Result<()> {
+    match action {
+        OverseerAction::Status => {
+            let body: serde_json::Value = client
+                .get(format!("{url}/overseer"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let overseer = &body["overseer"];
+            let enabled = overseer
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let handler = overseer
+                .get("handler")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!(
+                "overseer: {} (handler: {handler})",
+                if enabled { "enabled" } else { "disabled" }
+            );
         }
     }
     Ok(())
@@ -1165,6 +1344,75 @@ mod tests {
                 .any(|l| l.contains("engineer.md") && l.contains("composed:")),
             "lines = {lines:?}"
         );
+    }
+
+    #[test]
+    fn cli_parses_optimizer_status() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "optimizer", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Optimizer {
+                action: OptimizerAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_optimizer_set() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "optimizer", "set", "trim"]).unwrap();
+        match cli.command {
+            Command::Optimizer {
+                action: OptimizerAction::Set { level },
+            } => assert!(matches!(level, CliCompressionLevel::Trim)),
+            other => panic!("expected optimizer set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_events() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "events", "abc-123"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Events { id_or_name },
+            } => assert_eq!(id_or_name, "abc-123"),
+            other => panic!("expected session events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_breakers() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "breakers"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Session {
+                action: SessionAction::Breakers
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_overseer_status() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "overseer", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Overseer {
+                action: OverseerAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn event_summary_prefers_tool_field() {
+        let payload = serde_json::json!({"tool": "Bash", "input": {"command": "ls"}});
+        assert_eq!(event_summary(&payload), "tool=Bash");
+    }
+
+    #[test]
+    fn event_summary_truncates_long_payloads() {
+        let payload = serde_json::json!({"k": "x".repeat(200)});
+        let summary = event_summary(&payload);
+        assert!(summary.chars().count() <= 61);
+        assert!(summary.ends_with('\u{2026}'));
     }
 
     #[test]
