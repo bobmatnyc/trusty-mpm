@@ -10,6 +10,7 @@
 //! -p trusty-mpm-daemon` exercises them.
 
 pub mod api;
+pub mod audit;
 pub mod discover;
 pub mod mcp_backend;
 pub mod optimizer;

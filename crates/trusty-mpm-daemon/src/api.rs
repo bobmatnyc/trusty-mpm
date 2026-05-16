@@ -21,9 +21,11 @@ use axum::{
 };
 use serde_json::Value;
 use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
+use trusty_mpm_core::overseer::{OverseerContext, OverseerDecision};
 use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
 use trusty_mpm_core::tmux::TmuxTarget;
 
+use crate::audit::AuditEntry;
 use crate::state::DaemonState;
 use crate::tmux::TmuxDriver;
 
@@ -46,6 +48,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/hooks", post(ingest_hook))
         .route("/breakers", get(breakers))
         .route("/optimizer", get(get_optimizer))
+        .route("/overseer", get(get_overseer))
         .with_state(state)
 }
 
@@ -212,13 +215,40 @@ pub struct HookPost {
     pub payload: serde_json::Value,
 }
 
+/// Build an [`OverseerContext`] from a hook payload.
+///
+/// Why: the overseer evaluates events by tool name and input; extracting these
+/// from the opaque payload in one place keeps the relay handler readable.
+/// What: resolves the session's friendly tmux name (falling back to the UUID),
+/// reads `payload["tool"]` as the tool name, and serializes `payload["input"]`
+/// (or the whole payload when absent) as the tool input.
+fn overseer_context(state: &DaemonState, session: SessionId, payload: &Value) -> OverseerContext {
+    let tmux_name = state
+        .session(session)
+        .map(|s| s.tmux_name)
+        .unwrap_or_else(|| session.0.to_string());
+    let tool_name = payload
+        .get("tool")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let tool_input = payload
+        .get("input")
+        .map(|v| v.to_string())
+        .or_else(|| Some(payload.to_string()));
+    OverseerContext::new(session, tmux_name, tool_name, tool_input)
+}
+
 /// `POST /hooks` — universal hook relay; ingests one Claude Code hook event.
 ///
 /// Why: this is how the daemon achieves full observability — a forwarder shim
-/// configured for *all* 32 hook events posts each one here.
-/// What: parses the session id and event name, appends a `HookEventRecord` to
-/// the ring buffer; rejects unknown events/ids with `400`.
-/// Test: `hook_relay_ingests_known_event`, `hook_relay_rejects_unknown_event`.
+/// configured for *all* 32 hook events posts each one here. It is also the
+/// enforcement point for the optional session overseer.
+/// What: parses the session id and event name, runs the overseer on tool-use
+/// events (auditing every decision; a `Block` returns `403` early), compresses
+/// `PostToolUse` output, then appends a `HookEventRecord` to the ring buffer.
+/// Rejects unknown events/ids with `400`.
+/// Test: `hook_relay_ingests_known_event`, `hook_relay_rejects_unknown_event`,
+/// `overseer_blocks_pre_tool_use`.
 async fn ingest_hook(
     State(state): State<Arc<DaemonState>>,
     Json(post): Json<HookPost>,
@@ -226,9 +256,27 @@ async fn ingest_hook(
     let session = parse_id(&post.session_id)?;
     let event = HookEvent::from_wire(&post.event).ok_or(StatusCode::BAD_REQUEST)?;
 
+    let mut payload = post.payload;
+
+    // Overseer: evaluate and audit tool-use events. Skipped entirely when the
+    // overseer is disabled (the common, opt-out path).
+    let overseer = state.overseer();
+    if overseer.is_enabled()
+        && let Some(decision) = run_overseer(&state, &overseer, event, session, &payload)
+    {
+        // A Block verdict halts the event: return early with `403` so the
+        // forwarder shim can surface the refusal to Claude Code.
+        if matches!(decision, OverseerDecision::Block { .. }) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        // Respond verdicts are noted for the (future) tmux send-keys wiring.
+        if let OverseerDecision::Respond { text } = &decision {
+            tracing::info!("overseer auto-response for {session:?}: {text}");
+        }
+    }
+
     // For PostToolUse events, compress the tool output before it enters the
     // ring buffer (and hence the dashboard / compacted history).
-    let mut payload = post.payload;
     if event == HookEvent::PostToolUse {
         let tool_name = payload
             .get("tool")
@@ -241,6 +289,53 @@ async fn ingest_hook(
 
     state.push_hook_event(HookEventRecord::now(session, event, payload));
     Ok(Json(serde_json::json!({ "accepted": post.event })))
+}
+
+/// Run the overseer for one hook event and audit the verdict.
+///
+/// Why: keeping the event-kind dispatch and the audit write in one helper keeps
+/// [`ingest_hook`] focused on the relay flow.
+/// What: maps `PreToolUse` / `PostToolUse` / `Stop` events onto the matching
+/// overseer call, writes an [`AuditEntry`], and returns the decision. Events
+/// the overseer does not act on return `None`.
+fn run_overseer(
+    state: &DaemonState,
+    overseer: &Arc<dyn trusty_mpm_core::overseer::Overseer>,
+    event: HookEvent,
+    session: SessionId,
+    payload: &Value,
+) -> Option<OverseerDecision> {
+    let ctx = overseer_context(state, session, payload);
+    let (event_label, decision) = match event {
+        HookEvent::PreToolUse => ("PreToolUse", overseer.pre_tool_use(&ctx)),
+        HookEvent::PostToolUse => {
+            let output = payload.get("output").and_then(Value::as_str).unwrap_or("");
+            ("PostToolUse", overseer.post_tool_use(&ctx, output))
+        }
+        _ => return None,
+    };
+    state.audit().log(AuditEntry::from_decision(
+        &ctx,
+        event_label,
+        &decision,
+        "deterministic",
+    ));
+    Some(decision)
+}
+
+/// `GET /overseer` — current session-overseer configuration and status.
+///
+/// Why: the CLI and dashboard surface whether oversight is active and which
+/// strategy is in force.
+/// What: returns `{ "overseer": { "enabled": <bool>, "handler": "deterministic" } }`.
+/// Test: `get_overseer_returns_status`.
+async fn get_overseer(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "overseer": {
+            "enabled": state.overseer().is_enabled(),
+            "handler": "deterministic",
+        }
+    }))
 }
 
 /// `GET /optimizer` — current token-use optimizer configuration.
@@ -578,6 +673,31 @@ mod tests {
         };
         let err = ingest_hook(State(state), Json(post)).await.unwrap_err();
         assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_overseer_returns_status() {
+        // `GET /overseer` must return 200 with the enabled flag and handler.
+        // With no framework installed the overseer is disabled by default.
+        let state = DaemonState::shared();
+        let Json(body) = get_overseer(State(state)).await;
+        assert_eq!(body["overseer"]["enabled"], false);
+        assert_eq!(body["overseer"]["handler"], "deterministic");
+    }
+
+    #[tokio::test]
+    async fn hook_relay_runs_with_disabled_overseer() {
+        // With the overseer disabled (the default), a PreToolUse event must
+        // still be ingested normally — the overseer fast-path allows it.
+        let (state, id) = state_with_session();
+        let post = HookPost {
+            session_id: id.0.to_string(),
+            event: "PreToolUse".into(),
+            payload: serde_json::json!({"tool": "Bash", "input": {"command": "ls"}}),
+        };
+        let result = ingest_hook(State(state.clone()), Json(post)).await;
+        assert!(result.is_ok());
+        assert_eq!(state.recent_hook_events().len(), 1);
     }
 
     #[tokio::test]

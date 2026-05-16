@@ -20,12 +20,16 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use trusty_mpm_core::agent::Delegation;
 use trusty_mpm_core::circuit::{CircuitBreaker, CircuitConfig};
+use trusty_mpm_core::deterministic_overseer::DeterministicOverseer;
 use trusty_mpm_core::hook::HookEventRecord;
 use trusty_mpm_core::memory::{MemoryConfig, MemoryPressure, MemoryUsage};
+use trusty_mpm_core::overseer::Overseer;
+use trusty_mpm_core::overseer_config::OverseerConfig;
 use trusty_mpm_core::paths::FrameworkPaths;
 use trusty_mpm_core::project::ProjectInfo;
 use trusty_mpm_core::session::{Session, SessionId};
 
+use crate::audit::AuditLogger;
 use crate::optimizer::OptimizerConfig;
 use crate::tmux::TmuxDriver;
 
@@ -69,6 +73,14 @@ pub struct DaemonState {
     /// dashboard read this registry. An `RwLock<HashMap>` suits a low-churn
     /// registry that is read far more often than written.
     projects: Arc<RwLock<HashMap<PathBuf, ProjectInfo>>>,
+    /// Session overseer — evaluates hook events for allow/block/respond/flag.
+    ///
+    /// Why: oversight is a pluggable strategy; the daemon holds it behind
+    /// `dyn Overseer` so the deterministic and (future) LLM implementations are
+    /// interchangeable. Opt-in: a disabled overseer fast-paths every call.
+    overseer: Arc<dyn Overseer>,
+    /// Append-only JSONL logger for every overseer decision.
+    audit: Arc<AuditLogger>,
 }
 
 impl Default for DaemonState {
@@ -100,17 +112,45 @@ fn load_optimizer_config() -> OptimizerConfig {
     }
 }
 
+/// Build the session overseer from the installed framework policy.
+///
+/// Why: oversight is framework-managed and opt-in; daemon startup must reflect
+/// `~/.trusty-mpm/framework/hooks/overseer.toml` (or a safe disabled default
+/// when it is absent) without ever failing to construct.
+/// What: loads [`OverseerConfig`] from [`FrameworkPaths::overseer_config`] and
+/// wraps it in a [`DeterministicOverseer`]; a missing/malformed file yields the
+/// disabled default config (handled inside `OverseerConfig::load_from`).
+/// Test: `new_overseer_is_disabled_when_file_missing`.
+fn load_overseer() -> Arc<dyn Overseer> {
+    let path = FrameworkPaths::default().overseer_config();
+    let config = OverseerConfig::load_from(&path);
+    Arc::new(DeterministicOverseer::new(config))
+}
+
+/// Resolve the daemon's logs directory (`~/.trusty-mpm/logs`).
+///
+/// Why: the audit logger writes under a single well-known directory; resolving
+/// it via the home directory keeps it consistent with the framework root.
+/// What: returns `<home>/.trusty-mpm/logs`, falling back to `./.trusty-mpm/logs`
+/// when the home directory cannot be determined.
+/// Test: exercised indirectly by `new_builds_audit_logger`.
+fn logs_dir() -> PathBuf {
+    FrameworkPaths::default().root.join("logs")
+}
+
 impl DaemonState {
     /// Construct empty state with default thresholds.
     ///
-    /// Why: the optimizer policy is framework-managed on disk
-    /// (`~/.trusty-mpm/framework/hooks/optimizer.toml`); the daemon must reflect
-    /// whatever the installed framework declares without an API round-trip.
+    /// Why: the optimizer and overseer policies are framework-managed on disk
+    /// (`~/.trusty-mpm/framework/hooks/`); the daemon must reflect whatever the
+    /// installed framework declares without an API round-trip.
     /// What: reads the optimizer config from
-    /// [`FrameworkPaths::optimizer_config`], falling back to
-    /// `OptimizerConfig::default()` when the file is missing (framework not yet
-    /// installed) or unparseable (logged, not fatal).
-    /// Test: `new_reads_default_when_optimizer_file_missing`.
+    /// [`FrameworkPaths::optimizer_config`] and the overseer policy from
+    /// [`FrameworkPaths::overseer_config`], falling back to safe defaults when
+    /// either file is missing (framework not yet installed) or unparseable
+    /// (logged, not fatal); builds the audit logger under `~/.trusty-mpm/logs`.
+    /// Test: `new_reads_default_when_optimizer_file_missing`,
+    /// `new_overseer_is_disabled_when_file_missing`.
     pub fn new() -> Self {
         let optimizer = load_optimizer_config();
         Self {
@@ -124,6 +164,8 @@ impl DaemonState {
             trusty_addrs: Mutex::new(None),
             optimizer: Arc::new(parking_lot::RwLock::new(optimizer)),
             projects: Arc::new(RwLock::new(HashMap::new())),
+            overseer: load_overseer(),
+            audit: Arc::new(AuditLogger::new(&logs_dir())),
         }
     }
 
@@ -398,6 +440,29 @@ impl DaemonState {
         Ok(())
     }
 
+    // ---- overseer -------------------------------------------------------
+
+    /// The session overseer for evaluating hook events.
+    ///
+    /// Why: the hook relay consults the overseer on tool-use events; handing
+    /// out the shared `Arc` keeps every call site using the one configured
+    /// strategy.
+    /// What: returns a clone of the `Arc<dyn Overseer>`.
+    /// Test: `overseer_is_accessible`.
+    pub fn overseer(&self) -> Arc<dyn Overseer> {
+        Arc::clone(&self.overseer)
+    }
+
+    /// The overseer audit logger.
+    ///
+    /// Why: the hook relay logs every overseer decision; sharing the `Arc`
+    /// keeps all decisions flowing into the one dated JSONL file.
+    /// What: returns a clone of the `Arc<AuditLogger>`.
+    /// Test: `audit_logger_is_accessible`.
+    pub fn audit(&self) -> Arc<AuditLogger> {
+        Arc::clone(&self.audit)
+    }
+
     // ---- hook events ----------------------------------------------------
 
     /// Append a hook event to the bounded history ring buffer.
@@ -637,6 +702,33 @@ mod tests {
         assert_eq!(
             state.optimizer_config().default_level,
             trusty_mpm_core::compress::CompressionLevel::Trim
+        );
+    }
+
+    #[test]
+    fn new_overseer_is_disabled_when_file_missing() {
+        // With no framework installed (overseer.toml absent), the overseer
+        // must be present but disabled — oversight is opt-in.
+        let state = DaemonState::new();
+        assert!(!state.overseer().is_enabled());
+    }
+
+    #[test]
+    fn overseer_is_accessible() {
+        let state = DaemonState::new();
+        // The shared overseer can be cloned out and queried.
+        let overseer = state.overseer();
+        assert!(!overseer.is_enabled());
+    }
+
+    #[test]
+    fn audit_logger_is_accessible() {
+        let state = DaemonState::new();
+        // The audit logger resolves a dated JSONL path under `logs/overseer`.
+        let audit = state.audit();
+        assert_eq!(
+            audit.path().extension().and_then(|e| e.to_str()),
+            Some("jsonl")
         );
     }
 

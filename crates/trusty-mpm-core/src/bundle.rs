@@ -14,6 +14,12 @@
 /// Default token-optimizer policy installed to `hooks/optimizer.toml`.
 pub const OPTIMIZER_TOML: &str = include_str!("../assets/hooks/optimizer.toml");
 
+/// Default session-overseer policy installed to `hooks/overseer.toml`.
+///
+/// Overseer oversight is opt-in: the shipped policy has `enabled = false`, so
+/// installing it is inert until an operator flips the flag.
+pub const OVERSEER_TOML: &str = include_str!("../assets/hooks/overseer.toml");
+
 /// Framework launch instructions installed to `instructions/INSTRUCTIONS.md`.
 ///
 /// This is the framework-owned artifact: `trusty-mpm install` overwrites it on
@@ -78,6 +84,11 @@ pub const ALL: &[BundledArtifact] = &[
         install: InstallPolicy::Overwrite,
     },
     BundledArtifact {
+        rel_path: "hooks/overseer.toml",
+        contents: OVERSEER_TOML,
+        install: InstallPolicy::Overwrite,
+    },
+    BundledArtifact {
         rel_path: "instructions/INSTRUCTIONS.md",
         contents: FRAMEWORK_INSTRUCTIONS,
         install: InstallPolicy::Overwrite,
@@ -108,6 +119,7 @@ mod tests {
         // Every embedded artifact must carry real content — an empty
         // `include_str!` target would mean a missing or truncated asset file.
         assert!(!OPTIMIZER_TOML.trim().is_empty());
+        assert!(!OVERSEER_TOML.trim().is_empty());
         assert!(!FRAMEWORK_INSTRUCTIONS.trim().is_empty());
         assert!(!CLAUDE_STUB.trim().is_empty());
         assert!(!EXAMPLE_AGENT.trim().is_empty());
@@ -152,15 +164,39 @@ mod tests {
 
     #[test]
     fn bundle_table_is_complete() {
-        // `ALL` must enumerate all five artifacts with unique, non-empty paths.
-        assert_eq!(ALL.len(), 5);
+        // `ALL` must enumerate every artifact with unique, non-empty paths.
+        assert_eq!(ALL.len(), 6);
         let mut paths: Vec<&str> = ALL.iter().map(|a| a.rel_path).collect();
         paths.sort_unstable();
         paths.dedup();
-        assert_eq!(paths.len(), 5, "artifact paths must be unique");
+        assert_eq!(paths.len(), 6, "artifact paths must be unique");
         for artifact in ALL {
             assert!(!artifact.rel_path.is_empty());
             assert!(!artifact.contents.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn overseer_toml_is_parseable() {
+        // The shipped overseer policy must be valid TOML and ship disabled —
+        // oversight is opt-in, so installing it must not silently enable it.
+        let parsed: toml::Value = toml::from_str(OVERSEER_TOML).expect("valid TOML");
+        assert_eq!(
+            parsed
+                .get("overseer")
+                .and_then(|o| o.get("enabled"))
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn overseer_toml_is_in_bundle() {
+        // `ALL` must include the overseer policy so `trusty-mpm install`
+        // deploys it.
+        assert!(
+            ALL.iter().any(|a| a.rel_path == "hooks/overseer.toml"),
+            "overseer.toml must be a bundled artifact"
+        );
     }
 }

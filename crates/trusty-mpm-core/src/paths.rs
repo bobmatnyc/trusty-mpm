@@ -86,6 +86,17 @@ impl FrameworkPaths {
         self.hooks.join("optimizer.toml")
     }
 
+    /// Path of the session-overseer policy file (`hooks/overseer.toml`).
+    ///
+    /// Why: the daemon reads this at startup to build its `OverseerConfig`;
+    /// keeping the path next to [`optimizer_config`](Self::optimizer_config)
+    /// means both framework hook policies resolve consistently.
+    /// What: `hooks/overseer.toml` under the framework root.
+    /// Test: `overseer_config_path_is_under_hooks`.
+    pub fn overseer_config(&self) -> PathBuf {
+        self.hooks.join("overseer.toml")
+    }
+
     /// Path of the framework launch instructions (`instructions/INSTRUCTIONS.md`).
     ///
     /// Why: launchers point new Claude Code sessions at this file; it is the
@@ -160,6 +171,15 @@ mod tests {
         assert_eq!(
             paths.optimizer_config(),
             PathBuf::from("/base/.trusty-mpm/framework/hooks/optimizer.toml")
+        );
+    }
+
+    #[test]
+    fn overseer_config_path_is_under_hooks() {
+        let paths = FrameworkPaths::under("/base");
+        assert_eq!(
+            paths.overseer_config(),
+            PathBuf::from("/base/.trusty-mpm/framework/hooks/overseer.toml")
         );
     }
 
