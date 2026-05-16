@@ -18,10 +18,12 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use serde_json::Value;
 use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
 use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
 use trusty_mpm_core::tmux::TmuxTarget;
 
+use crate::optimizer::OptimizerConfig;
 use crate::state::DaemonState;
 use crate::tmux::TmuxDriver;
 
@@ -35,11 +37,13 @@ pub fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/sessions", get(list_sessions).post(register_session))
+        .route("/sessions/dead", axum::routing::delete(reap_sessions))
         .route("/sessions/{id}", axum::routing::delete(remove_session))
         .route("/sessions/{id}/events", get(session_events))
         .route("/events", get(recent_events))
         .route("/hooks", post(ingest_hook))
         .route("/breakers", get(breakers))
+        .route("/optimizer", get(get_optimizer).put(put_optimizer))
         .with_state(state)
 }
 
@@ -82,19 +86,14 @@ async fn register_session(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RegisterSession>,
 ) -> Json<serde_json::Value> {
-    let session = Session {
-        id: SessionId::new(),
-        workdir: body.workdir.clone(),
-        status: SessionStatus::Starting,
-        control: ControlModel::Tmux,
-        active_delegations: 0,
-    };
+    let session = Session::new(SessionId::new(), body.workdir.clone(), ControlModel::Tmux);
     let id = session.id;
+    let tmux_name = session.tmux_name.clone();
     state.register_session(session);
 
     // Best-effort: launch the session inside tmux. Any failure is logged and
-    // the session stays registered in the `Starting` state.
-    let tmux_name = format!("trusty-mpm-{}", id.0);
+    // the session stays registered in the `Starting` state. The session is
+    // hosted under a friendly, deterministic name derived from its UUID.
     match TmuxDriver::discover() {
         Ok(driver) => {
             if let Err(e) = driver.create_session(&tmux_name, Some(&body.workdir)) {
@@ -127,6 +126,25 @@ async fn remove_session(
         Some(_) => Ok(Json(serde_json::json!({ "removed": id }))),
         None => Err(StatusCode::NOT_FOUND),
     }
+}
+
+/// `DELETE /sessions/dead` — reap registry entries with no live tmux session.
+///
+/// Why: dead sessions accumulate forever otherwise; an operator (or a periodic
+/// task) needs a way to prune the registry down to what tmux actually hosts.
+/// What: discovers tmux, calls [`DaemonState::reap_dead_sessions`], and returns
+/// `{ "removed": <count> }`. If tmux is unavailable nothing is reaped (returns
+/// `0`) — reaping against an empty list would wrongly delete every session.
+/// Test: `reap_dead_sessions` in `state.rs` covers the core logic.
+async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    let removed = match TmuxDriver::discover() {
+        Ok(driver) => state.reap_dead_sessions(&driver),
+        Err(_) => {
+            tracing::info!("tmux unavailable; skipping dead-session reap");
+            0
+        }
+    };
+    Json(serde_json::json!({ "removed": removed }))
 }
 
 /// `GET /sessions/:id/events` — recent hook events for one session.
@@ -180,8 +198,51 @@ async fn ingest_hook(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let session = parse_id(&post.session_id)?;
     let event = HookEvent::from_wire(&post.event).ok_or(StatusCode::BAD_REQUEST)?;
-    state.push_hook_event(HookEventRecord::now(session, event, post.payload));
+
+    // For PostToolUse events, compress the tool output before it enters the
+    // ring buffer (and hence the dashboard / compacted history).
+    let mut payload = post.payload;
+    if event == HookEvent::PostToolUse {
+        let tool_name = payload
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let cfg = state.optimizer_config();
+        crate::optimizer::optimize_tool_output(&cfg, &tool_name, &mut payload);
+    }
+
+    state.push_hook_event(HookEventRecord::now(session, event, payload));
     Ok(Json(serde_json::json!({ "accepted": post.event })))
+}
+
+/// `GET /optimizer` — current token-use optimizer configuration.
+///
+/// Why: the CLI and dashboard surface the active compression tuning.
+/// What: returns `{ "optimizer": <OptimizerConfig> }`.
+/// Test: `get_optimizer_returns_default`.
+async fn get_optimizer(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "optimizer": state.optimizer_config() }))
+}
+
+/// Request body for `PUT /optimizer`.
+#[derive(serde::Deserialize)]
+struct PutOptimizer {
+    /// The new optimizer configuration to apply.
+    optimizer: OptimizerConfig,
+}
+
+/// `PUT /optimizer` — replace the token-use optimizer configuration.
+///
+/// Why: operators re-tune compression at runtime without restarting.
+/// What: stores the supplied `OptimizerConfig`, returns `{ "ok": true }`.
+/// Test: `put_optimizer_updates_level`.
+async fn put_optimizer(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<PutOptimizer>,
+) -> Json<serde_json::Value> {
+    state.set_optimizer_config(body.optimizer);
+    Json(serde_json::json!({ "ok": true }))
 }
 
 /// Parse a UUID string into a `SessionId`, mapping failure to `400`.
@@ -199,13 +260,9 @@ mod tests {
     fn state_with_session() -> (Arc<DaemonState>, SessionId) {
         let state = DaemonState::shared();
         let id = SessionId::new();
-        state.register_session(Session {
-            id,
-            workdir: "/tmp/p".into(),
-            status: SessionStatus::Active,
-            control: ControlModel::Tmux,
-            active_delegations: 0,
-        });
+        let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        session.status = SessionStatus::Active;
+        state.register_session(session);
         (state, id)
     }
 
@@ -269,6 +326,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_session_has_friendly_tmux_name() {
+        // A registered session must carry a `tmpm-<adj>-<noun>` tmux name
+        // derived from its UUID, not the legacy `trusty-mpm-<uuid>` form.
+        let state = DaemonState::shared();
+        let Json(body) = register_session(
+            State(Arc::clone(&state)),
+            Json(RegisterSession {
+                workdir: "/tmp/friendly".into(),
+            }),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let listed = state.list_sessions();
+        let session = listed
+            .iter()
+            .find(|s| s.id.0.to_string() == id)
+            .expect("session registered");
+        assert!(
+            session.tmux_name.starts_with("tmpm-"),
+            "friendly name: {}",
+            session.tmux_name
+        );
+        assert!(session.tmux_name.len() <= 25);
+    }
+
+    #[tokio::test]
+    async fn reap_sessions_returns_removed_count() {
+        // `DELETE /sessions/dead` always returns a well-formed `{ "removed": N }`
+        // body. The exact count depends on whether tmux is installed: with tmux
+        // the lone test session (no live tmux session named `tmpm-*`) is reaped
+        // (1); without tmux nothing is reaped (0). Either way the registry must
+        // not contain a session that is missing from tmux afterwards.
+        let (state, _) = state_with_session();
+        let Json(body) = reap_sessions(State(Arc::clone(&state))).await;
+        let removed = body["removed"].as_u64().expect("removed is a number");
+        assert!(removed <= 1, "at most the one test session is reaped");
+        assert_eq!(state.list_sessions().len() as u64, 1 - removed);
+    }
+
+    #[tokio::test]
     async fn register_session_returns_id_even_without_tmux() {
         // Graceful-degradation invariant: tmux is unavailable in CI, yet
         // `POST /sessions` must still return a JSON body carrying an `id`, and
@@ -300,5 +397,32 @@ mod tests {
         };
         let err = ingest_hook(State(state), Json(post)).await.unwrap_err();
         assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_optimizer_returns_default() {
+        let state = DaemonState::shared();
+        let Json(body) = get_optimizer(State(state)).await;
+        assert_eq!(body["optimizer"]["default_level"], "trim");
+        assert_eq!(body["optimizer"]["suppress_redundant_reads"], true);
+    }
+
+    #[tokio::test]
+    async fn put_optimizer_updates_level() {
+        let state = DaemonState::shared();
+        let cfg = OptimizerConfig {
+            default_level: trusty_mpm_core::compress::CompressionLevel::Caveman,
+            ..OptimizerConfig::default()
+        };
+        let Json(body) = put_optimizer(
+            State(Arc::clone(&state)),
+            Json(PutOptimizer { optimizer: cfg }),
+        )
+        .await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(
+            state.optimizer_config().default_level,
+            trusty_mpm_core::compress::CompressionLevel::Caveman
+        );
     }
 }

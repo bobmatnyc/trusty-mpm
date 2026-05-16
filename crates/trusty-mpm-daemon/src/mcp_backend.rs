@@ -180,6 +180,18 @@ impl OrchestratorBackend for StateBackend {
             }
         }
 
+        // Compress PostToolUse output before it enters the ring buffer.
+        let mut payload = payload;
+        if parsed == HookEvent::PostToolUse {
+            let tool_name = payload
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let cfg = self.state.optimizer_config();
+            crate::optimizer::optimize_tool_output(&cfg, &tool_name, &mut payload);
+        }
+
         self.state
             .push_hook_event(HookEventRecord::now(id, parsed, payload));
         Ok(json!({ "received": event, "session_id": session_id }))
@@ -194,13 +206,9 @@ mod tests {
     fn state_with_session() -> (Arc<DaemonState>, SessionId) {
         let state = DaemonState::shared();
         let id = SessionId::new();
-        state.register_session(Session {
-            id,
-            workdir: "/tmp/p".into(),
-            status: SessionStatus::Active,
-            control: ControlModel::Tmux,
-            active_delegations: 0,
-        });
+        let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        session.status = SessionStatus::Active;
+        state.register_session(session);
         (state, id)
     }
 

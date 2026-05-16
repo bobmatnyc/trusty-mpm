@@ -12,6 +12,7 @@
 pub mod api;
 pub mod discover;
 pub mod mcp_backend;
+pub mod optimizer;
 pub mod state;
 pub mod tmux;
 pub mod watcher;
@@ -53,11 +54,38 @@ pub async fn run_http(state: Arc<DaemonState>, addr: SocketAddr) -> anyhow::Resu
     let fw = watcher::FileWatcher::new(Arc::clone(&state));
     tokio::spawn(fw.spawn());
 
+    // Spawn the periodic dead-session reaper so registry entries for tmux
+    // sessions that have exited do not accumulate forever.
+    tokio::spawn(reap_loop(Arc::clone(&state)));
+
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("daemon listening; press Ctrl-C to stop");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Interval between dead-session reap sweeps.
+const REAP_INTERVAL_SECS: u64 = 60;
+
+/// Periodically prune registry entries whose tmux session has exited.
+///
+/// Why: without housekeeping, dead sessions accumulate in `DaemonState`
+/// forever; a slow background sweep keeps the registry honest.
+/// What: every [`REAP_INTERVAL_SECS`] seconds, discovers tmux and calls
+/// [`DaemonState::reap_dead_sessions`]; logs how many entries were reaped.
+/// Test: the reaping rule is unit-tested via `DaemonState::reap_against`.
+async fn reap_loop(state: Arc<DaemonState>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(REAP_INTERVAL_SECS));
+    loop {
+        tick.tick().await;
+        if let Ok(driver) = tmux::TmuxDriver::discover() {
+            let removed = state.reap_dead_sessions(&driver);
+            if removed > 0 {
+                info!("reaped {removed} dead session(s)");
+            }
+        }
+    }
 }
 
 /// Run the MCP server over stdio so a Claude Code session can call the

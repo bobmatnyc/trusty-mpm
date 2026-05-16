@@ -6,6 +6,8 @@
 //! exchanged over IPC.
 //! Test: `cargo test -p trusty-mpm-core` round-trips a `Session` through JSON.
 
+use std::time::SystemTime;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -65,6 +67,52 @@ pub struct Session {
     pub control: ControlModel,
     /// Number of active agent delegations within the session.
     pub active_delegations: u32,
+    /// Friendly tmux session name (`tmpm-<adjective>-<noun>`).
+    ///
+    /// Why: the daemon's reaper compares this against the live tmux session
+    /// list, and the dashboard shows it instead of the raw UUID.
+    #[serde(default)]
+    pub tmux_name: String,
+    /// When the session was registered with the daemon.
+    #[serde(default = "SystemTime::now")]
+    pub created_at: SystemTime,
+    /// When the session was last observed alive (heartbeat / activity).
+    #[serde(default = "SystemTime::now")]
+    pub last_seen: SystemTime,
+}
+
+impl Session {
+    /// Build a freshly-registered session with derived metadata.
+    ///
+    /// Why: every call site that creates a `Session` needs the same defaults —
+    /// a friendly tmux name derived from the id and `created_at`/`last_seen`
+    /// stamped to now; centralizing it prevents drift.
+    /// What: derives `tmux_name` via [`crate::names::name_from_uuid`] and stamps
+    /// both timestamps to the current time.
+    /// Test: `new_derives_tmux_name`.
+    pub fn new(id: SessionId, workdir: impl Into<String>, control: ControlModel) -> Self {
+        let now = SystemTime::now();
+        Self {
+            id,
+            workdir: workdir.into(),
+            status: SessionStatus::Starting,
+            control,
+            active_delegations: 0,
+            tmux_name: crate::names::name_from_uuid(&id.0),
+            created_at: now,
+            last_seen: now,
+        }
+    }
+
+    /// Mark the session as observed alive right now.
+    ///
+    /// Why: the reaper and dashboard use `last_seen` to distinguish active from
+    /// stale sessions; heartbeats and activity must refresh it.
+    /// What: sets `last_seen` to the current time.
+    /// Test: `touch_advances_last_seen`.
+    pub fn touch(&mut self) {
+        self.last_seen = SystemTime::now();
+    }
 }
 
 #[cfg(test)]
@@ -73,16 +121,31 @@ mod tests {
 
     #[test]
     fn session_json_roundtrip() {
-        let session = Session {
-            id: SessionId::new(),
-            workdir: "/tmp/project".into(),
-            status: SessionStatus::Active,
-            control: ControlModel::Tmux,
-            active_delegations: 2,
-        };
+        let mut session = Session::new(SessionId::new(), "/tmp/project", ControlModel::Tmux);
+        session.status = SessionStatus::Active;
+        session.active_delegations = 2;
         let json = serde_json::to_string(&session).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, session.id);
         assert_eq!(back.active_delegations, 2);
+        assert_eq!(back.tmux_name, session.tmux_name);
+    }
+
+    #[test]
+    fn new_derives_tmux_name() {
+        let id = SessionId::new();
+        let session = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        assert_eq!(session.tmux_name, crate::names::name_from_uuid(&id.0));
+        assert!(session.tmux_name.starts_with("tmpm-"));
+        assert_eq!(session.status, SessionStatus::Starting);
+    }
+
+    #[test]
+    fn touch_advances_last_seen() {
+        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let before = session.last_seen;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        session.touch();
+        assert!(session.last_seen >= before);
     }
 }

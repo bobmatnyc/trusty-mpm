@@ -23,6 +23,9 @@ use trusty_mpm_core::hook::HookEventRecord;
 use trusty_mpm_core::memory::{MemoryConfig, MemoryPressure, MemoryUsage};
 use trusty_mpm_core::session::{Session, SessionId};
 
+use crate::optimizer::OptimizerConfig;
+use crate::tmux::TmuxDriver;
+
 /// How many recent hook events the daemon retains for the dashboard feed.
 ///
 /// Why: the live event feed needs scrollback, but an unbounded log would leak
@@ -54,6 +57,9 @@ pub struct DaemonState {
     pub circuit_config: CircuitConfig,
     /// Discovered trusty sidecar service addresses, set once at startup.
     trusty_addrs: Mutex<Option<crate::discover::TrustyAddrs>>,
+    /// Token-use optimizer config; read on every PostToolUse, updatable at
+    /// runtime via the HTTP API, hence behind an `RwLock`.
+    optimizer: Arc<parking_lot::RwLock<OptimizerConfig>>,
 }
 
 impl Default for DaemonState {
@@ -74,6 +80,7 @@ impl DaemonState {
             memory_config: MemoryConfig::default(),
             circuit_config: CircuitConfig::default(),
             trusty_addrs: Mutex::new(None),
+            optimizer: Arc::new(parking_lot::RwLock::new(OptimizerConfig::default())),
         }
     }
 
@@ -103,6 +110,46 @@ impl DaemonState {
     /// Look up one session by id.
     pub fn session(&self, id: SessionId) -> Option<Session> {
         self.sessions.get(&id).map(|e| e.value().clone())
+    }
+
+    /// Drop registry entries whose tmux session no longer exists.
+    ///
+    /// Why: sessions accumulate forever otherwise — a dead tmux session leaves a
+    /// stale registry entry behind. The daemon's housekeeping loop calls this
+    /// periodically, and `DELETE /sessions/dead` calls it on demand.
+    /// What: discovers the live tmux session names via `driver.list_sessions()`,
+    /// then removes any session whose `tmux_name` is absent from that set;
+    /// returns the number reaped. A failed tmux listing reaps nothing (returns
+    /// `0`) rather than wrongly deleting every session.
+    /// Test: `reap_dead_sessions`.
+    pub fn reap_dead_sessions(&self, driver: &TmuxDriver) -> usize {
+        let live: std::collections::HashSet<String> = match driver.list_sessions() {
+            Ok(sessions) => sessions.into_iter().map(|s| s.name).collect(),
+            Err(e) => {
+                tracing::warn!("reap skipped — tmux list-sessions failed: {e}");
+                return 0;
+            }
+        };
+        self.reap_against(&live)
+    }
+
+    /// Remove every session whose `tmux_name` is not in `live`.
+    ///
+    /// Why: separating the set-difference logic from the tmux call makes the
+    /// reaping rule unit-testable without spawning a tmux process.
+    /// What: collects the dead ids, then removes each; returns the count.
+    /// Test: `reap_dead_sessions`.
+    fn reap_against(&self, live: &std::collections::HashSet<String>) -> usize {
+        let dead: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|e| !live.contains(&e.value().tmux_name))
+            .map(|e| *e.key())
+            .collect();
+        for id in &dead {
+            self.remove_session(*id);
+        }
+        dead.len()
     }
 
     // ---- delegations ----------------------------------------------------
@@ -202,6 +249,29 @@ impl DaemonState {
         self.trusty_addrs.lock().clone()
     }
 
+    // ---- token-use optimizer -------------------------------------------
+
+    /// Snapshot the current optimizer configuration.
+    ///
+    /// Why: the PostToolUse hook path reads this on every event; cloning a
+    /// small struct under a short read lock keeps the hot path lock-free
+    /// during compression itself.
+    /// What: returns a clone of the stored `OptimizerConfig`.
+    /// Test: `get_optimizer_returns_default`.
+    pub fn optimizer_config(&self) -> OptimizerConfig {
+        self.optimizer.read().clone()
+    }
+
+    /// Replace the optimizer configuration.
+    ///
+    /// Why: the `PUT /optimizer` endpoint and the CLI re-tune compression at
+    /// runtime without restarting the daemon.
+    /// What: overwrites the stored `OptimizerConfig` under a write lock.
+    /// Test: `put_optimizer_updates_level`.
+    pub fn set_optimizer_config(&self, config: OptimizerConfig) {
+        *self.optimizer.write() = config;
+    }
+
     // ---- hook events ----------------------------------------------------
 
     /// Append a hook event to the bounded history ring buffer.
@@ -242,13 +312,9 @@ mod tests {
     use trusty_mpm_core::session::{ControlModel, SessionStatus};
 
     fn sample_session() -> Session {
-        Session {
-            id: SessionId::new(),
-            workdir: "/tmp/p".into(),
-            status: SessionStatus::Active,
-            control: ControlModel::Tmux,
-            active_delegations: 0,
-        }
+        let mut s = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        s.status = SessionStatus::Active;
+        s
     }
 
     #[test]
@@ -304,6 +370,47 @@ mod tests {
         let got = state.trusty_addrs().expect("addrs stored");
         assert_eq!(got.memory, "127.0.0.1:3038".parse().unwrap());
         assert_eq!(got.search, "127.0.0.1:7878".parse().unwrap());
+    }
+
+    #[test]
+    fn reap_dead_sessions() {
+        // Three registered sessions; tmux reports only two of them alive.
+        // `reap_against` (the testable core of `reap_dead_sessions`) must drop
+        // exactly the one whose tmux_name is absent from the live set.
+        let state = DaemonState::new();
+        let alive_a = sample_session();
+        let alive_b = sample_session();
+        let dead = sample_session();
+        let (id_a, id_b, id_dead) = (alive_a.id, alive_b.id, dead.id);
+        state.register_session(alive_a.clone());
+        state.register_session(alive_b.clone());
+        state.register_session(dead);
+        assert_eq!(state.list_sessions().len(), 3);
+
+        let live: std::collections::HashSet<String> =
+            [alive_a.tmux_name.clone(), alive_b.tmux_name.clone()]
+                .into_iter()
+                .collect();
+        let removed = state.reap_against(&live);
+
+        assert_eq!(removed, 1);
+        assert!(state.session(id_a).is_some());
+        assert!(state.session(id_b).is_some());
+        assert!(state.session(id_dead).is_none());
+
+        // Reaping again is idempotent — nothing left to remove.
+        assert_eq!(state.reap_against(&live), 0);
+    }
+
+    #[test]
+    fn reap_against_empty_live_removes_all() {
+        // An empty live set (e.g. tmux server fully stopped) drops every entry.
+        let state = DaemonState::new();
+        state.register_session(sample_session());
+        state.register_session(sample_session());
+        let removed = state.reap_against(&std::collections::HashSet::new());
+        assert_eq!(removed, 2);
+        assert!(state.list_sessions().is_empty());
     }
 
     #[test]

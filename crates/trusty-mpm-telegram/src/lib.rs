@@ -208,13 +208,9 @@ mod tests {
     async fn handle_sessions_lists_one_session() {
         use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
         let (state, url) = spawn_test_daemon().await;
-        state.register_session(Session {
-            id: SessionId::new(),
-            workdir: "/tmp/proj".into(),
-            status: SessionStatus::Active,
-            control: ControlModel::Tmux,
-            active_delegations: 0,
-        });
+        let mut session = Session::new(SessionId::new(), "/tmp/proj", ControlModel::Tmux);
+        session.status = SessionStatus::Active;
+        state.register_session(session);
         let reply = handle_command(BotCommand::Sessions, &url).await;
         assert!(reply.contains("/tmp/proj"));
         assert_ne!(reply, "No active sessions.");
@@ -232,13 +228,9 @@ mod tests {
         use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
         let (state, url) = spawn_test_daemon().await;
         let id = SessionId::new();
-        state.register_session(Session {
-            id,
-            workdir: "/tmp/proj".into(),
-            status: SessionStatus::Active,
-            control: ControlModel::Tmux,
-            active_delegations: 0,
-        });
+        let mut session = Session::new(id, "/tmp/proj", ControlModel::Tmux);
+        session.status = SessionStatus::Active;
+        state.register_session(session);
         let reply = handle_command(
             BotCommand::Status {
                 session_id: id.0.to_string(),

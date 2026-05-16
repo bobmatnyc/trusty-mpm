@@ -80,6 +80,51 @@ enum Command {
         #[arg(long)]
         mcp: bool,
     },
+    /// Inspect or configure the token-use optimizer.
+    Optimizer {
+        /// Optimizer action to perform.
+        #[command(subcommand)]
+        action: OptimizerAction,
+    },
+    /// Manage the daemon's session registry.
+    Sessions {
+        /// Session-registry action to perform.
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
+}
+
+/// Actions for the `sessions` subcommand.
+#[derive(Debug, Subcommand)]
+enum SessionsAction {
+    /// Reap registry entries whose tmux session has exited.
+    Clean,
+}
+
+/// Actions for the `optimizer` subcommand.
+#[derive(Debug, Subcommand)]
+enum OptimizerAction {
+    /// Show current optimizer configuration.
+    Status,
+    /// Set the default compression level.
+    Set {
+        /// Compression level: off, trim, summarise, caveman.
+        #[arg(value_enum)]
+        level: CliCompressionLevel,
+    },
+}
+
+/// CLI-friendly compression level (mirrors `CompressionLevel`).
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CliCompressionLevel {
+    /// No compression.
+    Off,
+    /// Trim large outputs.
+    Trim,
+    /// Trim + strip ANSI + collapse blanks.
+    Summarise,
+    /// Drop all content, keep a one-line summary.
+    Caveman,
 }
 
 /// One session row as returned by `GET /sessions`.
@@ -141,7 +186,85 @@ async fn main() -> anyhow::Result<()> {
                 trusty_mpm_daemon::run_http(state, addr).await
             }
         }
+        Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
+        Command::Sessions { action } => sessions(&client, &cli.url, action).await,
     }
+}
+
+/// `sessions` subcommand — manage the daemon's session registry.
+///
+/// Why: dead tmux sessions leave stale registry entries; operators need a
+/// shell command to prune them without hand-crafting an HTTP request.
+/// What: `Clean` issues `DELETE /sessions/dead` and prints how many entries
+/// the daemon reaped.
+/// Test: `cli_parses_sessions_clean`.
+async fn sessions(
+    client: &reqwest::Client,
+    url: &str,
+    action: SessionsAction,
+) -> anyhow::Result<()> {
+    match action {
+        SessionsAction::Clean => {
+            let body: serde_json::Value = client
+                .delete(format!("{url}/sessions/dead"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let removed = body.get("removed").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("reaped {removed} dead session(s)");
+        }
+    }
+    Ok(())
+}
+
+/// Inspect or configure the daemon's token-use optimizer.
+///
+/// Why: operators tune compression aggressiveness without restarting; this
+/// drives the daemon's `GET`/`PUT /optimizer` endpoints.
+/// What: `Status` prints the current config; `Set` updates the default level.
+/// Test: `cli_parses_optimizer_status`, `cli_parses_optimizer_set`.
+async fn optimizer(
+    client: &reqwest::Client,
+    url: &str,
+    action: OptimizerAction,
+) -> anyhow::Result<()> {
+    match action {
+        OptimizerAction::Status => {
+            let body: serde_json::Value = client
+                .get(format!("{url}/optimizer"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&body["optimizer"])?);
+        }
+        OptimizerAction::Set { level } => {
+            use trusty_mpm_core::compress::CompressionLevel;
+            let cl = match level {
+                CliCompressionLevel::Off => CompressionLevel::Off,
+                CliCompressionLevel::Trim => CompressionLevel::Trim,
+                CliCompressionLevel::Summarise => CompressionLevel::Summarise,
+                CliCompressionLevel::Caveman => CompressionLevel::Caveman,
+            };
+            let body = serde_json::json!({
+                "optimizer": {
+                    "default_level": cl,
+                    "tool_overrides": {},
+                    "suppress_redundant_reads": true,
+                }
+            });
+            client
+                .put(format!("{url}/optimizer"))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?;
+            println!("optimizer level set to {level:?}");
+        }
+    }
+    Ok(())
 }
 
 /// Render a `SessionId` newtype JSON value into a short, human id.
@@ -416,6 +539,23 @@ mod tests {
             Command::Daemon { mcp, .. } => assert!(mcp),
             other => panic!("expected Daemon, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_parses_sessions_clean() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "sessions", "clean"]).unwrap();
+        match cli.command {
+            Command::Sessions { action } => {
+                assert!(matches!(action, SessionsAction::Clean));
+            }
+            other => panic!("expected Sessions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_sessions_requires_action() {
+        // `sessions` with no action is an error — `clean` is mandatory.
+        assert!(Cli::try_parse_from(["trusty-mpm", "sessions"]).is_err());
     }
 
     #[test]
