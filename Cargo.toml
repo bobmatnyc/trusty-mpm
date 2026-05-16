@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/trusty-mpm-core",
+    "crates/trusty-mpm-mcp",
     "crates/trusty-mpm-daemon",
     "crates/trusty-mpm-cli",
     "crates/trusty-mpm-tui",
@@ -11,20 +12,28 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Elastic-2.0"
 repository = "https://github.com/bobmatnyc/trusty-mpm"
 homepage = "https://github.com/bobmatnyc/trusty-mpm"
 authors = ["Bob Matsuoka"]
 
 [workspace.dependencies]
 # Internal crates
-trusty-mpm-core = { path = "crates/trusty-mpm-core", version = "0.1.0" }
+trusty-mpm-core = { path = "crates/trusty-mpm-core" }
+trusty-mpm-mcp = { path = "crates/trusty-mpm-mcp" }
+
+# trusty-common shared crates (path reference to sibling checkout).
+# trusty-mcp-core gives us JSON-RPC 2.0 / MCP envelopes + the stdio loop;
+# trusty-common provides shared utilities. Path deps keep trusty-mpm building
+# against local trusty-common changes without a publish cycle.
+trusty-common = { path = "../trusty-common/crates/trusty-common" }
+trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
 
 # Async runtime / HTTP
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync", "time"] }
 async-trait = "0.1"
-axum = "0.8"
+axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
@@ -61,6 +70,7 @@ dirs = "5"
 walkdir = "2"
 regex = "1"
 gray_matter = "0.2"
+notify = "6"
 
 # Testing
 tempfile = "3"
