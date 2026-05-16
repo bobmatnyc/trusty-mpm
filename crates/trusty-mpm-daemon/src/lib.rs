@@ -13,6 +13,7 @@ pub mod api;
 pub mod audit;
 pub mod discover;
 pub mod mcp_backend;
+pub mod openapi;
 pub mod optimizer;
 pub mod state;
 pub mod tmux;

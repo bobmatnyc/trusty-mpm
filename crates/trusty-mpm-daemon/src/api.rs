@@ -20,8 +20,12 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::Value;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+
 use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
 use trusty_mpm_core::overseer::{OverseerContext, OverseerDecision};
+use trusty_mpm_core::project::ProjectInfo;
 use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
 use trusty_mpm_core::tmux::TmuxTarget;
 
@@ -49,11 +53,21 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/breakers", get(breakers))
         .route("/optimizer", get(get_optimizer))
         .route("/overseer", get(get_overseer))
+        .merge(
+            SwaggerUi::new("/api-docs")
+                .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
+        )
         .with_state(state)
 }
 
 /// Liveness probe — always returns `ok` while the daemon is up.
-async fn health() -> &'static str {
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "config",
+    responses((status = 200, description = "Daemon is alive", body = String))
+)]
+pub async fn health() -> &'static str {
     "ok"
 }
 
@@ -70,7 +84,14 @@ pub struct SessionQuery {
 }
 
 /// `GET /sessions` — snapshot of managed sessions, optionally project-scoped.
-async fn list_sessions(
+#[utoipa::path(
+    get,
+    path = "/sessions",
+    tag = "sessions",
+    params(("project" = Option<String>, Query, description = "Filter by project path")),
+    responses((status = 200, description = "Array of managed sessions", body = [Session]))
+)]
+pub async fn list_sessions(
     State(state): State<Arc<DaemonState>>,
     Query(query): Query<SessionQuery>,
 ) -> Json<serde_json::Value> {
@@ -82,7 +103,13 @@ async fn list_sessions(
 }
 
 /// `GET /events` — recent hook events across all sessions (dashboard feed).
-async fn recent_events(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+#[utoipa::path(
+    get,
+    path = "/events",
+    tag = "events",
+    responses((status = 200, description = "Recent hook events across all sessions"))
+)]
+pub async fn recent_events(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "events": state.recent_hook_events() }))
 }
 
@@ -92,7 +119,7 @@ async fn recent_events(State(state): State<Arc<DaemonState>>) -> Json<serde_json
 /// itself so the dashboard and MCP tools can see it.
 /// What: the working directory the session runs in.
 /// Test: `register_and_remove_session`.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct RegisterSession {
     /// Working directory the session was launched in.
     pub workdir: String,
@@ -100,6 +127,7 @@ pub struct RegisterSession {
     /// associated with that registered project so `session list` can scope to
     /// it.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub project_path: Option<PathBuf>,
 }
 
@@ -111,7 +139,14 @@ pub struct RegisterSession {
 /// session and starts `claude` in it; tmux failures are logged, not fatal —
 /// the session is still registered so the API stays usable without tmux.
 /// Test: `register_and_remove_session` covers the bookkeeping path.
-async fn register_session(
+#[utoipa::path(
+    post,
+    path = "/sessions",
+    tag = "sessions",
+    request_body = RegisterSession,
+    responses((status = 201, description = "Session registered; returns its id and name"))
+)]
+pub async fn register_session(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RegisterSession>,
 ) -> Json<serde_json::Value> {
@@ -147,7 +182,17 @@ async fn register_session(
 }
 
 /// `DELETE /sessions/:id` — deregister a session.
-async fn remove_session(
+#[utoipa::path(
+    delete,
+    path = "/sessions/{id}",
+    tag = "sessions",
+    params(("id" = String, Path, description = "Session UUID")),
+    responses(
+        (status = 200, description = "Session removed"),
+        (status = 404, description = "No session with that id"),
+    )
+)]
+pub async fn remove_session(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -166,7 +211,13 @@ async fn remove_session(
 /// `{ "removed": <count> }`. If tmux is unavailable nothing is reaped (returns
 /// `0`) — reaping against an empty list would wrongly delete every session.
 /// Test: `reap_dead_sessions` in `state.rs` covers the core logic.
-async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+#[utoipa::path(
+    delete,
+    path = "/sessions/dead",
+    tag = "sessions",
+    responses((status = 200, description = "Dead sessions reaped; returns the removed count"))
+)]
+pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     let removed = match TmuxDriver::discover() {
         Ok(driver) => state.reap_dead_sessions(&driver),
         Err(_) => {
@@ -178,7 +229,17 @@ async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
 }
 
 /// `GET /sessions/:id/events` — recent hook events for one session.
-async fn session_events(
+#[utoipa::path(
+    get,
+    path = "/sessions/{id}/events",
+    tag = "events",
+    params(("id" = String, Path, description = "Session UUID")),
+    responses(
+        (status = 200, description = "Recent hook events for the session"),
+        (status = 404, description = "No session with that id"),
+    )
+)]
+pub async fn session_events(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -189,7 +250,13 @@ async fn session_events(
 }
 
 /// `GET /breakers` — every agent's circuit-breaker state.
-async fn breakers(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+#[utoipa::path(
+    get,
+    path = "/breakers",
+    tag = "config",
+    responses((status = 200, description = "Array of per-agent circuit-breaker states"))
+)]
+pub async fn breakers(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     let breakers: Vec<_> = state
         .all_breakers()
         .into_iter()
@@ -204,7 +271,7 @@ async fn breakers(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Val
 /// body documents the contract.
 /// What: session id, the Claude Code event name, and the opaque payload.
 /// Test: `hook_relay_ingests_known_event`.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct HookPost {
     /// Session the event came from (UUID string).
     pub session_id: String,
@@ -212,6 +279,7 @@ pub struct HookPost {
     pub event: String,
     /// Raw event payload (shape varies per event).
     #[serde(default)]
+    #[schema(value_type = Object)]
     pub payload: serde_json::Value,
 }
 
@@ -249,7 +317,18 @@ fn overseer_context(state: &DaemonState, session: SessionId, payload: &Value) ->
 /// Rejects unknown events/ids with `400`.
 /// Test: `hook_relay_ingests_known_event`, `hook_relay_rejects_unknown_event`,
 /// `overseer_blocks_pre_tool_use`.
-async fn ingest_hook(
+#[utoipa::path(
+    post,
+    path = "/hooks",
+    tag = "internal",
+    request_body = HookPost,
+    responses(
+        (status = 200, description = "Hook event accepted"),
+        (status = 400, description = "Unknown event name or malformed session id"),
+        (status = 403, description = "Overseer blocked the event"),
+    )
+)]
+pub async fn ingest_hook(
     State(state): State<Arc<DaemonState>>,
     Json(post): Json<HookPost>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -329,7 +408,13 @@ fn run_overseer(
 /// strategy is in force.
 /// What: returns `{ "overseer": { "enabled": <bool>, "handler": "deterministic" } }`.
 /// Test: `get_overseer_returns_status`.
-async fn get_overseer(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+#[utoipa::path(
+    get,
+    path = "/overseer",
+    tag = "config",
+    responses((status = 200, description = "Overseer enabled flag and handler type"))
+)]
+pub async fn get_overseer(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "overseer": {
             "enabled": state.overseer().is_enabled(),
@@ -345,7 +430,13 @@ async fn get_overseer(State(state): State<Arc<DaemonState>>) -> Json<serde_json:
 /// is read-only introspection of the daemon's in-memory copy of it.
 /// What: returns `{ "optimizer": <OptimizerConfig> }`.
 /// Test: `get_optimizer_returns_default`.
-async fn get_optimizer(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+#[utoipa::path(
+    get,
+    path = "/optimizer",
+    tag = "config",
+    responses((status = 200, description = "Current token-use optimizer configuration"))
+)]
+pub async fn get_optimizer(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "optimizer": state.optimizer_config() }))
 }
 
@@ -355,9 +446,10 @@ async fn get_optimizer(State(state): State<Arc<DaemonState>>) -> Json<serde_json
 /// so sessions started there can be associated with it.
 /// What: the absolute path of the project's working directory.
 /// Test: `register_and_list_projects`.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct RegisterProject {
     /// Absolute path to the project's working directory.
+    #[schema(value_type = String)]
     pub path: PathBuf,
 }
 
@@ -368,7 +460,14 @@ pub struct RegisterProject {
 /// What: delegates to [`DaemonState::register_project`] and returns the
 /// stored info as JSON.
 /// Test: `register_and_list_projects`.
-async fn register_project(
+#[utoipa::path(
+    post,
+    path = "/projects",
+    tag = "projects",
+    request_body = RegisterProject,
+    responses((status = 201, description = "Project registered", body = ProjectInfo))
+)]
+pub async fn register_project(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RegisterProject>,
 ) -> Json<serde_json::Value> {
@@ -377,7 +476,13 @@ async fn register_project(
 }
 
 /// `GET /projects` — snapshot of every registered project.
-async fn list_projects(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+#[utoipa::path(
+    get,
+    path = "/projects",
+    tag = "projects",
+    responses((status = 200, description = "Array of registered projects", body = [ProjectInfo]))
+)]
+pub async fn list_projects(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "projects": state.list_projects() }))
 }
 
@@ -400,7 +505,17 @@ pub struct CurrentProjectQuery {
 /// What: returns the matching `ProjectInfo`, or `404` when `path` is not a
 /// registered project.
 /// Test: `current_project_found_and_missing`.
-async fn current_project(
+#[utoipa::path(
+    get,
+    path = "/projects/current",
+    tag = "projects",
+    params(("path" = String, Query, description = "Directory whose project to resolve")),
+    responses(
+        (status = 200, description = "The project registered for the path", body = ProjectInfo),
+        (status = 404, description = "Path is not a registered project"),
+    )
+)]
+pub async fn current_project(
     State(state): State<Arc<DaemonState>>,
     Query(query): Query<CurrentProjectQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -729,6 +844,43 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["session"], id.0.to_string());
         assert_eq!(events[0]["event"], "PreToolUse");
+    }
+
+    #[tokio::test]
+    async fn openapi_spec_is_valid() {
+        // `GET /api-docs/openapi.json` must return 200 with a document that
+        // carries the `openapi` version key and the daemon's title.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = router(DaemonState::shared());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api-docs/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            spec.get("openapi").is_some(),
+            "spec must have an openapi key"
+        );
+        assert!(
+            spec["info"]["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("trusty-mpm"),
+            "spec title must mention trusty-mpm"
+        );
     }
 
     #[tokio::test]

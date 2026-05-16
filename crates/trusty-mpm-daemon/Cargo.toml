@@ -42,6 +42,8 @@ parking_lot.workspace = true
 dirs.workspace = true
 notify.workspace = true
 walkdir.workspace = true
+utoipa.workspace = true
+utoipa-swagger-ui.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Stable identifier for a managed session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[schema(value_type = String, format = "uuid")]
 pub struct SessionId(pub Uuid);
 
 impl SessionId {
@@ -30,7 +31,7 @@ impl Default for SessionId {
 }
 
 /// Lifecycle state of a managed Claude Code session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum SessionStatus {
     /// Session process is spawning.
     Starting,
@@ -45,7 +46,7 @@ pub enum SessionStatus {
 }
 
 /// Control model used to host a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum ControlModel {
     /// Session runs inside a named tmux session.
     Tmux,
@@ -56,7 +57,7 @@ pub enum ControlModel {
 }
 
 /// A point-in-time snapshot of a session, returned by the daemon API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Session {
     /// Unique session id.
     pub id: SessionId,
@@ -76,9 +77,11 @@ pub struct Session {
     pub tmux_name: String,
     /// When the session was registered with the daemon.
     #[serde(default = "SystemTime::now")]
+    #[schema(value_type = String, format = "date-time")]
     pub created_at: SystemTime,
     /// When the session was last observed alive (heartbeat / activity).
     #[serde(default = "SystemTime::now")]
+    #[schema(value_type = String, format = "date-time")]
     pub last_seen: SystemTime,
     /// The trusty-mpm project this session belongs to, if any.
     ///
@@ -86,6 +89,7 @@ pub struct Session {
     /// project root lets the CLI and dashboard filter sessions per project.
     /// `None` for sessions started outside any registered project.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub project_path: Option<PathBuf>,
 }
 

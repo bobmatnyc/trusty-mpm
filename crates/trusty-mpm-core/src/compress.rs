@@ -30,6 +30,7 @@ pub const TRIM_TAIL_LINES: usize = 10;
     serde::Serialize,
     serde::Deserialize,
     Default,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionLevel {

@@ -20,7 +20,7 @@ pub type ToolOverrides = std::collections::HashMap<String, CompressionLevel>;
 /// What: a default level applied to all tools plus per-tool overrides and a
 /// flag controlling redundant-read suppression.
 /// Test: `optimize_uses_tool_override`, `get_optimizer_returns_default`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct OptimizerConfig {
     /// Default compression level for all tool outputs.
     pub default_level: CompressionLevel,

@@ -73,6 +73,13 @@ gray_matter = "0.2"
 notify = "6"
 sha2 = "0.10"
 
+# OpenAPI / Swagger.
+# utoipa 5 + utoipa-swagger-ui 9 are the versions compatible with axum 0.8
+# (the 4.x/7.x line targets axum 0.7 and its `SwaggerUi: Into<Router>` bound
+# does not satisfy axum 0.8's stateful `Router<S>`).
+utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
 # Testing
 tempfile = "3"
 

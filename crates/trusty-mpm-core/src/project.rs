@@ -21,13 +21,15 @@ use serde::{Deserialize, Serialize};
 /// What: the absolute project path, a human name derived from the directory,
 /// and the registration timestamp.
 /// Test: `name_from_path_uses_dir_name`, `project_json_roundtrip`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ProjectInfo {
     /// Absolute path to the project's working directory.
+    #[schema(value_type = String)]
     pub path: PathBuf,
     /// Human-readable name, derived from the directory name.
     pub name: String,
     /// When the project was first registered with the daemon.
+    #[schema(value_type = String, format = "date-time")]
     pub registered_at: SystemTime,
 }
 
