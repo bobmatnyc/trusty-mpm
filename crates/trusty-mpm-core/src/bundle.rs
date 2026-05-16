@@ -1,0 +1,166 @@
+//! Compile-time embedded framework artifacts.
+//!
+//! Why: `trusty-mpm install` must deploy a working set of default artifacts
+//! (optimizer policy, framework instructions, user instruction stub,
+//! placeholder agent/skill) without depending on files shipped alongside the
+//! binary — embedding them at compile time keeps the installer a single
+//! self-contained executable.
+//! What: exposes each default artifact under `crates/trusty-mpm-core/assets/`
+//! as a `pub const &str` via `include_str!`, plus a [`BundledArtifact`] table
+//! describing the relative install path of each one.
+//! Test: `cargo test -p trusty-mpm-core bundle` asserts every constant is
+//! non-empty and that [`ALL`] enumerates each artifact exactly once.
+
+/// Default token-optimizer policy installed to `hooks/optimizer.toml`.
+pub const OPTIMIZER_TOML: &str = include_str!("../assets/hooks/optimizer.toml");
+
+/// Framework launch instructions installed to `instructions/INSTRUCTIONS.md`.
+///
+/// This is the framework-owned artifact: `trusty-mpm install` overwrites it on
+/// every run so framework upgrades take effect.
+pub const FRAMEWORK_INSTRUCTIONS: &str = include_str!("../assets/instructions/INSTRUCTIONS.md");
+
+/// User-editable instruction stub installed to `instructions/CLAUDE.md`.
+///
+/// This is a one-time seed: the installer writes it only when absent so any
+/// project-specific edits the user makes survive subsequent installs.
+pub const CLAUDE_STUB: &str = include_str!("../assets/instructions/CLAUDE.md");
+
+/// Placeholder agent definition installed to `agents/example-agent.md`.
+pub const EXAMPLE_AGENT: &str = include_str!("../assets/agents/example-agent.md");
+
+/// Placeholder skill definition installed to `skills/example-skill.md`.
+pub const EXAMPLE_SKILL: &str = include_str!("../assets/skills/example-skill.md");
+
+/// One embedded framework artifact and its install location.
+///
+/// Why: the installer iterates a single table rather than hard-coding each
+/// write, so adding a bundled artifact is a one-line change here.
+/// What: a relative path (under `~/.trusty-mpm/framework/`) and the embedded
+/// file contents.
+/// Test: `bundle_table_is_complete`.
+#[derive(Debug, Clone, Copy)]
+pub struct BundledArtifact {
+    /// Path relative to the framework root (e.g. `hooks/optimizer.toml`).
+    pub rel_path: &'static str,
+    /// Embedded file contents.
+    pub contents: &'static str,
+    /// Install policy: how the installer treats a pre-existing file.
+    pub install: InstallPolicy,
+}
+
+/// How the installer writes a [`BundledArtifact`] when the target already exists.
+///
+/// Why: framework-owned files (instructions, policy) must track upgrades, but
+/// user-editable stubs must not be clobbered — one enum makes the distinction
+/// explicit and data-driven.
+/// What: [`Overwrite`](InstallPolicy::Overwrite) always writes the embedded
+/// contents; [`SeedOnce`](InstallPolicy::SeedOnce) writes only when absent.
+/// Test: `claude_stub_is_seed_once`, `framework_instructions_overwrites`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPolicy {
+    /// Always write the embedded contents, replacing any existing file.
+    Overwrite,
+    /// Write the embedded contents only if the target file does not exist.
+    SeedOnce,
+}
+
+/// Every bundled framework artifact, in install order.
+///
+/// Why: gives the installer (and tests) one canonical list to walk.
+/// What: the optimizer policy, framework instructions, the user stub, and the
+/// two placeholder artifacts.
+/// Test: `bundle_table_is_complete`.
+pub const ALL: &[BundledArtifact] = &[
+    BundledArtifact {
+        rel_path: "hooks/optimizer.toml",
+        contents: OPTIMIZER_TOML,
+        install: InstallPolicy::Overwrite,
+    },
+    BundledArtifact {
+        rel_path: "instructions/INSTRUCTIONS.md",
+        contents: FRAMEWORK_INSTRUCTIONS,
+        install: InstallPolicy::Overwrite,
+    },
+    BundledArtifact {
+        rel_path: "instructions/CLAUDE.md",
+        contents: CLAUDE_STUB,
+        install: InstallPolicy::SeedOnce,
+    },
+    BundledArtifact {
+        rel_path: "agents/example-agent.md",
+        contents: EXAMPLE_AGENT,
+        install: InstallPolicy::Overwrite,
+    },
+    BundledArtifact {
+        rel_path: "skills/example-skill.md",
+        contents: EXAMPLE_SKILL,
+        install: InstallPolicy::Overwrite,
+    },
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constants_are_non_empty() {
+        // Every embedded artifact must carry real content — an empty
+        // `include_str!` target would mean a missing or truncated asset file.
+        assert!(!OPTIMIZER_TOML.trim().is_empty());
+        assert!(!FRAMEWORK_INSTRUCTIONS.trim().is_empty());
+        assert!(!CLAUDE_STUB.trim().is_empty());
+        assert!(!EXAMPLE_AGENT.trim().is_empty());
+        assert!(!EXAMPLE_SKILL.trim().is_empty());
+    }
+
+    #[test]
+    fn framework_instructions_and_stub_differ() {
+        // The framework artifact and the user stub are distinct files with
+        // distinct content; conflating them would lose either upgrades or
+        // user edits.
+        assert_ne!(FRAMEWORK_INSTRUCTIONS, CLAUDE_STUB);
+    }
+
+    #[test]
+    fn claude_stub_is_seed_once() {
+        // The user stub must never be overwritten on re-install.
+        let stub = ALL
+            .iter()
+            .find(|a| a.rel_path == "instructions/CLAUDE.md")
+            .expect("CLAUDE.md stub present in bundle");
+        assert_eq!(stub.install, InstallPolicy::SeedOnce);
+    }
+
+    #[test]
+    fn framework_instructions_overwrites() {
+        // The framework instructions must be refreshed on every install.
+        let instr = ALL
+            .iter()
+            .find(|a| a.rel_path == "instructions/INSTRUCTIONS.md")
+            .expect("INSTRUCTIONS.md present in bundle");
+        assert_eq!(instr.install, InstallPolicy::Overwrite);
+    }
+
+    #[test]
+    fn optimizer_toml_is_parseable() {
+        // The shipped policy must be valid TOML or the installer would deploy
+        // a file the daemon then fails to load.
+        let parsed: toml::Value = toml::from_str(OPTIMIZER_TOML).expect("valid TOML");
+        assert!(parsed.get("default").is_some());
+    }
+
+    #[test]
+    fn bundle_table_is_complete() {
+        // `ALL` must enumerate all five artifacts with unique, non-empty paths.
+        assert_eq!(ALL.len(), 5);
+        let mut paths: Vec<&str> = ALL.iter().map(|a| a.rel_path).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), 5, "artifact paths must be unique");
+        for artifact in ALL {
+            assert!(!artifact.rel_path.is_empty());
+            assert!(!artifact.contents.trim().is_empty());
+        }
+    }
+}

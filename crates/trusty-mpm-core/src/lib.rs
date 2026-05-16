@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod artifact;
 pub mod budget;
+pub mod bundle;
 pub mod circuit;
 pub mod compress;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod hook;
 pub mod ipc;
 pub mod memory;
 pub mod names;
+pub mod paths;
 pub mod session;
 pub mod tmux;
 

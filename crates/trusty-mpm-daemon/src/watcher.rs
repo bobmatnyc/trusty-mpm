@@ -19,6 +19,7 @@ use notify::{EventKind, RecursiveMode, Watcher, recommended_watcher};
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
+use trusty_mpm_core::paths::FrameworkPaths;
 use trusty_mpm_core::session::SessionId;
 
 use crate::state::DaemonState;
@@ -133,6 +134,19 @@ impl FileWatcher {
                 debug!("watching {}", root.display());
             }
         }
+
+        // Also watch the framework hooks directory so edits to the
+        // framework-managed `optimizer.toml` policy take effect without a
+        // daemon restart. The directory may not exist yet (framework not
+        // installed); that is fine — watching simply fails and is logged.
+        let hooks = FrameworkPaths::default().hooks;
+        if hooks.is_dir() {
+            if let Err(e) = watcher.watch(&hooks, RecursiveMode::NonRecursive) {
+                warn!("failed to watch hooks dir {}: {e}", hooks.display());
+            } else {
+                debug!("watching framework hooks dir {}", hooks.display());
+            }
+        }
         info!("file watcher started ({} root(s))", self.watched_count());
 
         // Drain change events for the lifetime of the daemon.
@@ -143,14 +157,33 @@ impl FileWatcher {
         }
     }
 
+    /// Returns `true` when a changed path is the framework `optimizer.toml`.
+    ///
+    /// Why: a change to the framework-managed optimizer policy must trigger a
+    /// reload rather than a per-session `FileChanged` event.
+    /// What: compares the changed path's file name against `optimizer.toml`.
+    /// Test: `detects_optimizer_toml_change`.
+    fn is_optimizer_policy(path: &std::path::Path) -> bool {
+        path.file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("optimizer.toml"))
+    }
+
     /// Synthesise and record a `FileChanged` hook event for a changed path.
     ///
     /// Why: routing file changes through the same hook pipeline means the
-    /// dashboard feed, Telegram alerts, and history all treat them uniformly.
-    /// What: attributes the path to a session, then pushes a `FileChanged`
-    /// `HookEventRecord` carrying the path; returns `true` if attributed.
-    /// Test: `synthesises_file_changed_event`.
+    /// dashboard feed, Telegram alerts, and history all treat them uniformly;
+    /// changes to the framework optimizer policy instead reload daemon config.
+    /// What: if the path is the framework `optimizer.toml`, reloads the
+    /// optimizer config and returns `true`. Otherwise attributes the path to a
+    /// session, then pushes a `FileChanged` `HookEventRecord`; returns `true`
+    /// if attributed.
+    /// Test: `synthesises_file_changed_event`, `detects_optimizer_toml_change`.
     pub fn record_change(&self, path: &std::path::Path) -> bool {
+        if Self::is_optimizer_policy(path) {
+            self.state.reload_optimizer_config();
+            debug!("reloaded optimizer config after {} changed", path.display());
+            return true;
+        }
         let Some(session) = self.session_for_path(path) else {
             return false;
         };
@@ -202,6 +235,25 @@ mod tests {
                 .session_for_path(std::path::Path::new("/elsewhere/x"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn detects_optimizer_toml_change() {
+        // A change to a path named `optimizer.toml` is routed to a config
+        // reload (returns true) and does not synthesise a FileChanged event.
+        let state = DaemonState::shared();
+        let watcher = FileWatcher::new(state.clone());
+        assert!(FileWatcher::is_optimizer_policy(std::path::Path::new(
+            "/anywhere/hooks/optimizer.toml"
+        )));
+        assert!(!FileWatcher::is_optimizer_policy(std::path::Path::new(
+            "/anywhere/hooks/other.toml"
+        )));
+        assert!(watcher.record_change(std::path::Path::new(
+            "/x/.trusty-mpm/framework/hooks/optimizer.toml"
+        )));
+        // No FileChanged event was recorded for the policy reload.
+        assert_eq!(state.recent_hook_events().len(), 0);
     }
 
     #[test]

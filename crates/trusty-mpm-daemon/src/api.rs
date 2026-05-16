@@ -23,7 +23,6 @@ use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
 use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
 use trusty_mpm_core::tmux::TmuxTarget;
 
-use crate::optimizer::OptimizerConfig;
 use crate::state::DaemonState;
 use crate::tmux::TmuxDriver;
 
@@ -43,7 +42,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/events", get(recent_events))
         .route("/hooks", post(ingest_hook))
         .route("/breakers", get(breakers))
-        .route("/optimizer", get(get_optimizer).put(put_optimizer))
+        .route("/optimizer", get(get_optimizer))
         .with_state(state)
 }
 
@@ -218,31 +217,13 @@ async fn ingest_hook(
 
 /// `GET /optimizer` — current token-use optimizer configuration.
 ///
-/// Why: the CLI and dashboard surface the active compression tuning.
+/// Why: the CLI and dashboard surface the active compression tuning. The
+/// config is now framework-managed on disk (`optimizer.toml`); this endpoint
+/// is read-only introspection of the daemon's in-memory copy of it.
 /// What: returns `{ "optimizer": <OptimizerConfig> }`.
 /// Test: `get_optimizer_returns_default`.
 async fn get_optimizer(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "optimizer": state.optimizer_config() }))
-}
-
-/// Request body for `PUT /optimizer`.
-#[derive(serde::Deserialize)]
-struct PutOptimizer {
-    /// The new optimizer configuration to apply.
-    optimizer: OptimizerConfig,
-}
-
-/// `PUT /optimizer` — replace the token-use optimizer configuration.
-///
-/// Why: operators re-tune compression at runtime without restarting.
-/// What: stores the supplied `OptimizerConfig`, returns `{ "ok": true }`.
-/// Test: `put_optimizer_updates_level`.
-async fn put_optimizer(
-    State(state): State<Arc<DaemonState>>,
-    Json(body): Json<PutOptimizer>,
-) -> Json<serde_json::Value> {
-    state.set_optimizer_config(body.optimizer);
-    Json(serde_json::json!({ "ok": true }))
 }
 
 /// Parse a UUID string into a `SessionId`, mapping failure to `400`.
@@ -405,24 +386,5 @@ mod tests {
         let Json(body) = get_optimizer(State(state)).await;
         assert_eq!(body["optimizer"]["default_level"], "trim");
         assert_eq!(body["optimizer"]["suppress_redundant_reads"], true);
-    }
-
-    #[tokio::test]
-    async fn put_optimizer_updates_level() {
-        let state = DaemonState::shared();
-        let cfg = OptimizerConfig {
-            default_level: trusty_mpm_core::compress::CompressionLevel::Caveman,
-            ..OptimizerConfig::default()
-        };
-        let Json(body) = put_optimizer(
-            State(Arc::clone(&state)),
-            Json(PutOptimizer { optimizer: cfg }),
-        )
-        .await;
-        assert_eq!(body["ok"], true);
-        assert_eq!(
-            state.optimizer_config().default_level,
-            trusty_mpm_core::compress::CompressionLevel::Caveman
-        );
     }
 }

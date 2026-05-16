@@ -21,6 +21,7 @@ use trusty_mpm_core::agent::Delegation;
 use trusty_mpm_core::circuit::{CircuitBreaker, CircuitConfig};
 use trusty_mpm_core::hook::HookEventRecord;
 use trusty_mpm_core::memory::{MemoryConfig, MemoryPressure, MemoryUsage};
+use trusty_mpm_core::paths::FrameworkPaths;
 use trusty_mpm_core::session::{Session, SessionId};
 
 use crate::optimizer::OptimizerConfig;
@@ -68,9 +69,42 @@ impl Default for DaemonState {
     }
 }
 
+/// Read the optimizer policy from the installed framework, never failing.
+///
+/// Why: daemon startup must not abort because the framework is not installed
+/// or its policy file is malformed; a sensible default keeps the daemon usable.
+/// What: loads `~/.trusty-mpm/framework/hooks/optimizer.toml` via
+/// [`OptimizerConfig::load_from_file`], logging and falling back to
+/// `OptimizerConfig::default()` on any error.
+/// Test: `new_reads_default_when_optimizer_file_missing`,
+/// `reload_optimizer_config_picks_up_file_changes`.
+fn load_optimizer_config() -> OptimizerConfig {
+    let path = FrameworkPaths::default().optimizer_config();
+    match OptimizerConfig::load_from_file(&path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(
+                "failed to load optimizer config from {}: {e}; using defaults",
+                path.display()
+            );
+            OptimizerConfig::default()
+        }
+    }
+}
+
 impl DaemonState {
     /// Construct empty state with default thresholds.
+    ///
+    /// Why: the optimizer policy is framework-managed on disk
+    /// (`~/.trusty-mpm/framework/hooks/optimizer.toml`); the daemon must reflect
+    /// whatever the installed framework declares without an API round-trip.
+    /// What: reads the optimizer config from
+    /// [`FrameworkPaths::optimizer_config`], falling back to
+    /// `OptimizerConfig::default()` when the file is missing (framework not yet
+    /// installed) or unparseable (logged, not fatal).
+    /// Test: `new_reads_default_when_optimizer_file_missing`.
     pub fn new() -> Self {
+        let optimizer = load_optimizer_config();
         Self {
             sessions: DashMap::new(),
             delegations: DashMap::new(),
@@ -80,7 +114,7 @@ impl DaemonState {
             memory_config: MemoryConfig::default(),
             circuit_config: CircuitConfig::default(),
             trusty_addrs: Mutex::new(None),
-            optimizer: Arc::new(parking_lot::RwLock::new(OptimizerConfig::default())),
+            optimizer: Arc::new(parking_lot::RwLock::new(optimizer)),
         }
     }
 
@@ -262,14 +296,31 @@ impl DaemonState {
         self.optimizer.read().clone()
     }
 
-    /// Replace the optimizer configuration.
+    /// Re-read the optimizer policy from the installed framework on disk.
     ///
-    /// Why: the `PUT /optimizer` endpoint and the CLI re-tune compression at
-    /// runtime without restarting the daemon.
-    /// What: overwrites the stored `OptimizerConfig` under a write lock.
-    /// Test: `put_optimizer_updates_level`.
-    pub fn set_optimizer_config(&self, config: OptimizerConfig) {
-        *self.optimizer.write() = config;
+    /// Why: the policy file is framework-managed and edited directly (or reset
+    /// via `trusty-mpm install --force`); the file watcher calls this when
+    /// `optimizer.toml` changes so the running daemon picks up edits without a
+    /// restart.
+    /// What: reloads `~/.trusty-mpm/framework/hooks/optimizer.toml`, replacing
+    /// the in-memory config under a write lock. A missing or malformed file
+    /// falls back to `OptimizerConfig::default()` (logged, not fatal).
+    /// Test: `reload_optimizer_config_picks_up_file_changes`.
+    pub fn reload_optimizer_config(&self) {
+        *self.optimizer.write() = load_optimizer_config();
+    }
+
+    /// Reload the optimizer policy from an explicit file path.
+    ///
+    /// Why: tests must exercise the reload path against a temp file without
+    /// touching the real `~/.trusty-mpm` framework install.
+    /// What: loads `path` via [`OptimizerConfig::load_from_file`] and stores the
+    /// result; a missing file yields `OptimizerConfig::default()`.
+    /// Test: `reload_optimizer_config_picks_up_file_changes`.
+    pub fn reload_optimizer_config_from(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let cfg = OptimizerConfig::load_from_file(path)?;
+        *self.optimizer.write() = cfg;
+        Ok(())
     }
 
     // ---- hook events ----------------------------------------------------
@@ -411,6 +462,46 @@ mod tests {
         let removed = state.reap_against(&std::collections::HashSet::new());
         assert_eq!(removed, 2);
         assert!(state.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn new_reads_default_when_optimizer_file_missing() {
+        // With no framework installed (the optimizer.toml file absent), the
+        // daemon must still construct, falling back to the default policy.
+        let state = DaemonState::new();
+        assert_eq!(
+            state.optimizer_config().default_level,
+            trusty_mpm_core::compress::CompressionLevel::Trim
+        );
+    }
+
+    #[test]
+    fn reload_optimizer_config_picks_up_file_changes() {
+        // Reloading from an explicit temp file must overwrite the in-memory
+        // policy with whatever the file declares.
+        use std::io::Write;
+        let state = DaemonState::new();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("optimizer.toml");
+        let mut file = std::fs::File::create(&path).expect("create file");
+        writeln!(file, "[default]\nlevel = \"caveman\"").expect("write file");
+
+        state
+            .reload_optimizer_config_from(&path)
+            .expect("reload succeeds");
+        assert_eq!(
+            state.optimizer_config().default_level,
+            trusty_mpm_core::compress::CompressionLevel::Caveman
+        );
+
+        // A missing file reloads to the default policy rather than erroring.
+        state
+            .reload_optimizer_config_from(&dir.path().join("absent.toml"))
+            .expect("missing file is not an error");
+        assert_eq!(
+            state.optimizer_config().default_level,
+            trusty_mpm_core::compress::CompressionLevel::Trim
+        );
     }
 
     #[test]

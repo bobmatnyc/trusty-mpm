@@ -71,6 +71,12 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Install the bundled framework artifacts to `~/.trusty-mpm/framework/`.
+    Install {
+        /// Overwrite artifacts that already exist on disk.
+        #[arg(long)]
+        force: bool,
+    },
     /// Run the trusty-mpm daemon.
     Daemon {
         /// Address the daemon HTTP API binds to.
@@ -106,7 +112,7 @@ enum SessionsAction {
 enum OptimizerAction {
     /// Show current optimizer configuration.
     Status,
-    /// Set the default compression level.
+    /// Set the default compression level (rewrites the framework policy file).
     Set {
         /// Compression level: off, trim, summarise, caveman.
         #[arg(value_enum)]
@@ -178,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Telegram { url, token, check } => {
             trusty_mpm_telegram::run(url, token, check).await
         }
+        Command::Install { force } => install(force),
         Command::Daemon { addr, mcp } => {
             let state = trusty_mpm_daemon::DaemonState::shared();
             if mcp {
@@ -189,6 +196,57 @@ async fn main() -> anyhow::Result<()> {
         Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
         Command::Sessions { action } => sessions(&client, &cli.url, action).await,
     }
+}
+
+/// `install` subcommand — deploy the bundled framework artifacts.
+///
+/// Why: a fresh machine has no `~/.trusty-mpm/framework/`; `trusty-mpm install`
+/// writes the compile-time-embedded artifacts (optimizer policy, framework
+/// instructions, placeholder agent/skill) so the daemon has a working policy
+/// and launchers have instructions to point sessions at.
+/// What: resolves [`FrameworkPaths::default`] and delegates to
+/// [`install_to`], which is the testable core.
+/// Test: `install_writes_all_artifacts`, `install_skips_existing_without_force`.
+fn install(force: bool) -> anyhow::Result<()> {
+    let paths = trusty_mpm_core::paths::FrameworkPaths::default();
+    let report = install_to(&paths, force)?;
+    println!(
+        "Installing trusty-mpm framework artifacts to {}",
+        paths.framework.display()
+    );
+    for line in &report {
+        println!("  {line}");
+    }
+    println!("Framework installed. Run `trusty-mpm daemon` to start.");
+    Ok(())
+}
+
+/// Write every bundled artifact under `paths`, returning a per-file report.
+///
+/// Why: separating the filesystem work from argument parsing and stdout makes
+/// the installer unit-testable against a `tempfile::TempDir`.
+/// What: for each [`trusty_mpm_core::bundle::ALL`] artifact, creates parent
+/// directories and writes the file; an existing file is skipped unless `force`.
+/// Returns one human-readable status line per artifact.
+/// Test: `install_writes_all_artifacts`, `install_skips_existing_without_force`.
+fn install_to(
+    paths: &trusty_mpm_core::paths::FrameworkPaths,
+    force: bool,
+) -> anyhow::Result<Vec<String>> {
+    let mut report = Vec::new();
+    for artifact in trusty_mpm_core::bundle::ALL {
+        let dest = paths.framework.join(artifact.rel_path);
+        if dest.exists() && !force {
+            report.push(format!("- {} (exists, skipped)", artifact.rel_path));
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, artifact.contents)?;
+        report.push(format!("\u{2713} {}", artifact.rel_path));
+    }
+    Ok(report)
 }
 
 /// `sessions` subcommand — manage the daemon's session registry.
@@ -219,11 +277,14 @@ async fn sessions(
     Ok(())
 }
 
-/// Inspect or configure the daemon's token-use optimizer.
+/// Inspect or configure the token-use optimizer.
 ///
-/// Why: operators tune compression aggressiveness without restarting; this
-/// drives the daemon's `GET`/`PUT /optimizer` endpoints.
-/// What: `Status` prints the current config; `Set` updates the default level.
+/// Why: the optimizer policy is framework-managed on disk; `Status` reads the
+/// daemon's live view via `GET /optimizer`, while `Set` rewrites the policy
+/// file itself (`~/.trusty-mpm/framework/hooks/optimizer.toml`) — the daemon's
+/// watcher then reloads it.
+/// What: `Status` prints the current config; `Set` writes a new `[default]`
+/// level into the policy file, creating the `hooks/` directory if needed.
 /// Test: `cli_parses_optimizer_status`, `cli_parses_optimizer_set`.
 async fn optimizer(
     client: &reqwest::Client,
@@ -241,27 +302,23 @@ async fn optimizer(
             println!("{}", serde_json::to_string_pretty(&body["optimizer"])?);
         }
         OptimizerAction::Set { level } => {
-            use trusty_mpm_core::compress::CompressionLevel;
-            let cl = match level {
-                CliCompressionLevel::Off => CompressionLevel::Off,
-                CliCompressionLevel::Trim => CompressionLevel::Trim,
-                CliCompressionLevel::Summarise => CompressionLevel::Summarise,
-                CliCompressionLevel::Caveman => CompressionLevel::Caveman,
+            let level_name = match level {
+                CliCompressionLevel::Off => "Off",
+                CliCompressionLevel::Trim => "Trim",
+                CliCompressionLevel::Summarise => "Summarise",
+                CliCompressionLevel::Caveman => "Caveman",
             };
-            let body = serde_json::json!({
-                "optimizer": {
-                    "default_level": cl,
-                    "tool_overrides": {},
-                    "suppress_redundant_reads": true,
-                }
-            });
-            client
-                .put(format!("{url}/optimizer"))
-                .json(&body)
-                .send()
-                .await?
-                .error_for_status()?;
-            println!("optimizer level set to {level:?}");
+            let paths = trusty_mpm_core::paths::FrameworkPaths::default();
+            let path = paths.optimizer_config();
+            std::fs::create_dir_all(&paths.hooks)?;
+            let contents = format!(
+                "# trusty-mpm token optimizer — framework hook configuration\n\
+                 # Edited by: trusty-mpm optimizer set\n\n\
+                 [default]\nlevel = \"{level_name}\"\n\n\
+                 [tools]\n"
+            );
+            std::fs::write(&path, contents)?;
+            println!("optimizer level set to {level_name} ({})", path.display());
         }
     }
     Ok(())
@@ -556,6 +613,59 @@ mod tests {
     fn cli_sessions_requires_action() {
         // `sessions` with no action is an error — `clean` is mandatory.
         assert!(Cli::try_parse_from(["trusty-mpm", "sessions"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_install_no_force() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "install"]).unwrap();
+        match cli.command {
+            Command::Install { force } => assert!(!force),
+            other => panic!("expected Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_install_with_force() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "install", "--force"]).unwrap();
+        match cli.command {
+            Command::Install { force } => assert!(force),
+            other => panic!("expected Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_writes_all_artifacts() {
+        // A fresh install must write every bundled artifact to disk under the
+        // framework root, with matching content.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = trusty_mpm_core::paths::FrameworkPaths::under(dir.path());
+        let report = install_to(&paths, false).unwrap();
+        assert_eq!(report.len(), trusty_mpm_core::bundle::ALL.len());
+        for artifact in trusty_mpm_core::bundle::ALL {
+            let dest = paths.framework.join(artifact.rel_path);
+            assert!(dest.exists(), "missing {}", artifact.rel_path);
+            let written = std::fs::read_to_string(&dest).unwrap();
+            assert_eq!(written, artifact.contents);
+        }
+    }
+
+    #[test]
+    fn install_skips_existing_without_force() {
+        // An existing artifact is left untouched without `--force` and the
+        // report says so; `--force` overwrites it.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = trusty_mpm_core::paths::FrameworkPaths::under(dir.path());
+        let optimizer = paths.optimizer_config();
+        std::fs::create_dir_all(&paths.hooks).unwrap();
+        std::fs::write(&optimizer, "custom").unwrap();
+
+        let report = install_to(&paths, false).unwrap();
+        assert!(report.iter().any(|l| l.contains("skipped")));
+        assert_eq!(std::fs::read_to_string(&optimizer).unwrap(), "custom");
+
+        let forced = install_to(&paths, true).unwrap();
+        assert!(forced.iter().all(|l| !l.contains("skipped")));
+        assert_ne!(std::fs::read_to_string(&optimizer).unwrap(), "custom");
     }
 
     #[test]
