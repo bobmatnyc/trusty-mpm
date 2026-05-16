@@ -8,3 +8,11 @@ Cargo.lock.bak
 *.log
 /data
 /.trusty-mpm
+
+# ML model cache (fastembed)
+.fastembed_cache/
+
+# Claude Code / MPM runtime artifacts (downloaded/generated at runtime)
+.claude-mpm/
+.claude/
+.fastembed_cache/

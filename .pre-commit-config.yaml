@@ -1,0 +1,37 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(.*\.md|.*\.txt|Cargo\.lock)$
+      - id: end-of-file-fixer
+        exclude: ^(.*\.md|.*\.txt|Cargo\.lock)$
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        exclude: Cargo\.lock
+
+  # Commitizen — enforces conventional commit messages.
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v3.13.0
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
+
+# Note: cargo fmt / clippy are run in CI (see .github/workflows/ci.yml)
+# and via `make check`; they are intentionally not in pre-commit because
+# they are slow and require a full cargo build on each commit.
+
+default_stages: [pre-commit]
+fail_fast: false

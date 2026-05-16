@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "ratatui dashboard for monitoring trusty-mpm sessions and agents"
 
+[lib]
+name = "trusty_mpm_tui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "trusty-mpm-tui"
 path = "src/main.rs"

@@ -1,0 +1,17 @@
+# cargo-release configuration
+# https://github.com/crate-ci/cargo-release
+
+# Commit message template; %v = new version, issue reference for changelog.
+commit-message = "chore: release v{{version}}"
+
+# Tag on the workspace version, not per-crate.
+tag-name = "v{{version}}"
+
+# Publish all workspace crates in dependency order.
+publish = true
+
+# Push the tag to origin.
+push = true
+
+# Run pre-release checks.
+pre-release-hook = ["make", "check"]

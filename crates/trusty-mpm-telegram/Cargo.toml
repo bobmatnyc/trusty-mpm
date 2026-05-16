@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Telegram bot for remote management of the trusty-mpm daemon"
 
+[lib]
+name = "trusty_mpm_telegram"
+path = "src/lib.rs"
+
 [[bin]]
 name = "trusty-mpm-telegram"
 path = "src/main.rs"

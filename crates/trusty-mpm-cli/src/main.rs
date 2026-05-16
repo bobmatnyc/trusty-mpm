@@ -1,11 +1,17 @@
-//! trusty-mpm CLI client.
+//! trusty-mpm — the single unified binary.
 //!
-//! Why: Users and scripts need a thin, fast client that talks to the daemon
-//! over HTTP instead of orchestrating Claude Code directly.
-//! What: parses subcommands and drives the daemon's HTTP API with a blocking
-//! `reqwest` client — status, session start/stop, and the event feed.
+//! Why: `cargo install trusty-mpm` should install exactly one binary that
+//! covers every mode — the resident daemon, the MCP server, the ratatui
+//! dashboard, the Telegram bot, and the thin HTTP CLI. One binary keeps the
+//! install story simple and the modes discoverable via `--help`.
+//! What: parses subcommands and routes to the embedded library crates —
+//! `trusty_mpm_daemon`, `trusty_mpm_tui`, `trusty_mpm_telegram` — or, for the
+//! thin CLI subcommands, drives the daemon's HTTP API with an async `reqwest`
+//! client.
 //! Test: `cargo run -p trusty-mpm-cli -- status` prints daemon/session state;
-//! handler logic is covered by `cargo test -p trusty-mpm-cli`.
+//! handler and parsing logic are covered by `cargo test -p trusty-mpm-cli`.
+
+use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
@@ -15,9 +21,9 @@ const DEFAULT_URL: &str = "http://127.0.0.1:7880";
 
 /// trusty-mpm command-line interface.
 #[derive(Debug, Parser)]
-#[command(name = "trusty-mpm", version, about = "trusty-mpm CLI")]
+#[command(name = "trusty-mpm", version, about = "trusty-mpm — unified binary")]
 struct Cli {
-    /// Base URL of the trusty-mpm daemon.
+    /// Base URL of the trusty-mpm daemon (used by the thin CLI subcommands).
     #[arg(long, env = "TRUSTY_MPM_URL", default_value = DEFAULT_URL, global = true)]
     url: String,
 
@@ -44,6 +50,36 @@ enum Command {
     },
     /// Show the recent hook-event feed.
     Events,
+    /// Launch the ratatui multi-session TUI dashboard.
+    Tui {
+        /// Base URL of the trusty-mpm daemon.
+        #[arg(long, env = "TRUSTY_MPM_URL", default_value = DEFAULT_URL)]
+        url: String,
+        /// Poll interval in milliseconds.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+    },
+    /// Run the Telegram remote-management bot.
+    Telegram {
+        /// Base URL of the trusty-mpm daemon.
+        #[arg(long, env = "TRUSTY_MPM_URL", default_value = DEFAULT_URL)]
+        url: String,
+        /// Telegram bot token (read from the environment in production).
+        #[arg(long, env = "TELEGRAM_BOT_TOKEN")]
+        token: Option<String>,
+        /// Validate configuration and exit without connecting to Telegram.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Run the trusty-mpm daemon.
+    Daemon {
+        /// Address the daemon HTTP API binds to.
+        #[arg(long, env = "TRUSTY_MPM_ADDR", default_value = "127.0.0.1:7880")]
+        addr: SocketAddr,
+        /// Run as an MCP server over stdio instead of the HTTP daemon.
+        #[arg(long)]
+        mcp: bool,
+    },
 }
 
 /// One session row as returned by `GET /sessions`.
@@ -71,14 +107,40 @@ struct EventRow {
     at: String,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let client = reqwest::blocking::Client::new();
+
+    // Long-running modes need tracing on stderr (the daemon's MCP mode speaks
+    // JSON-RPC on stdout, so all logs must stay off stdout).
+    if matches!(cli.command, Command::Daemon { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
+    let client = reqwest::Client::new();
     match cli.command {
-        Command::Status => status(&client, &cli.url),
-        Command::Start { workdir } => start(&client, &cli.url, workdir),
-        Command::Stop { id } => stop(&client, &cli.url, &id),
-        Command::Events => events(&client, &cli.url),
+        Command::Status => status(&client, &cli.url).await,
+        Command::Start { workdir } => start(&client, &cli.url, workdir).await,
+        Command::Stop { id } => stop(&client, &cli.url, &id).await,
+        Command::Events => events(&client, &cli.url).await,
+        Command::Tui { url, interval_ms } => trusty_mpm_tui::run(url, interval_ms).await,
+        Command::Telegram { url, token, check } => {
+            trusty_mpm_telegram::run(url, token, check).await
+        }
+        Command::Daemon { addr, mcp } => {
+            let state = trusty_mpm_daemon::DaemonState::shared();
+            if mcp {
+                trusty_mpm_daemon::run_mcp(state).await
+            } else {
+                trusty_mpm_daemon::run_http(state, addr).await
+            }
+        }
     }
 }
 
@@ -88,7 +150,7 @@ fn main() -> anyhow::Result<()> {
 /// only the first 8 characters so rows stay compact.
 /// What: extracts the inner UUID string and truncates it, falling back to a
 /// placeholder if the shape is unexpected.
-/// Test: covered indirectly by `status`/`events` integration runs.
+/// Test: covered by the `short_id_*` unit tests below.
 fn short_id(value: &serde_json::Value) -> String {
     value
         .get("0")
@@ -102,12 +164,11 @@ fn short_id(value: &serde_json::Value) -> String {
 /// Why: the first thing an operator runs to see if the daemon is alive.
 /// What: `GET /health` then `GET /sessions`, printing one line per session.
 /// Test: run against a live daemon; "daemon: unreachable" when it is down.
-fn status(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<()> {
-    let healthy = client
-        .get(format!("{url}/health"))
-        .send()
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+async fn status(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
+    let healthy = match client.get(format!("{url}/health")).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    };
     if !healthy {
         println!("daemon: unreachable");
         return Ok(());
@@ -120,9 +181,11 @@ fn status(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<()> {
     }
     let body: Body = client
         .get(format!("{url}/sessions"))
-        .send()?
+        .send()
+        .await?
         .error_for_status()?
-        .json()?;
+        .json()
+        .await?;
     for s in &body.sessions {
         let status = s.status.as_str().unwrap_or("unknown");
         println!(
@@ -141,11 +204,7 @@ fn status(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<()> {
 /// Why: launches a managed session without the operator touching the API.
 /// What: `POST /sessions { "workdir": ... }`, defaulting to the current dir.
 /// Test: run `trusty-mpm start`; prints `started session {id}`.
-fn start(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    workdir: Option<String>,
-) -> anyhow::Result<()> {
+async fn start(client: &reqwest::Client, url: &str, workdir: Option<String>) -> anyhow::Result<()> {
     let workdir = match workdir {
         Some(w) => w,
         None => std::env::current_dir()?.to_string_lossy().into_owned(),
@@ -157,9 +216,11 @@ fn start(
     let body: Body = client
         .post(format!("{url}/sessions"))
         .json(&serde_json::json!({ "workdir": workdir }))
-        .send()?
+        .send()
+        .await?
         .error_for_status()?
-        .json()?;
+        .json()
+        .await?;
     let id = body
         .id
         .get("0")
@@ -174,8 +235,8 @@ fn start(
 /// Why: lets an operator tear a session down from the shell.
 /// What: `DELETE /sessions/{id}`; a `404` prints `not found`.
 /// Test: stop a known id then an unknown one to see both branches.
-fn stop(client: &reqwest::blocking::Client, url: &str, id: &str) -> anyhow::Result<()> {
-    let resp = client.delete(format!("{url}/sessions/{id}")).send()?;
+async fn stop(client: &reqwest::Client, url: &str, id: &str) -> anyhow::Result<()> {
+    let resp = client.delete(format!("{url}/sessions/{id}")).send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         println!("not found");
     } else {
@@ -190,16 +251,18 @@ fn stop(client: &reqwest::blocking::Client, url: &str, id: &str) -> anyhow::Resu
 /// Why: gives operators a quick tail of daemon activity without the TUI.
 /// What: `GET /events`, printing `{timestamp} {session_short} {event}`.
 /// Test: run against a daemon that has ingested hook events.
-fn events(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<()> {
+async fn events(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     #[derive(Deserialize)]
     struct Body {
         events: Vec<EventRow>,
     }
     let body: Body = client
         .get(format!("{url}/events"))
-        .send()?
+        .send()
+        .await?
         .error_for_status()?
-        .json()?;
+        .json()
+        .await?;
     for e in &body.events {
         println!("{} {} {}", e.at, short_id(&e.session), e.event);
     }
@@ -287,5 +350,80 @@ mod tests {
     fn cli_rejects_no_subcommand() {
         // A subcommand is mandatory; bare invocation must error.
         assert!(Cli::try_parse_from(["trusty-mpm"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_tui_defaults() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "tui"]).unwrap();
+        match cli.command {
+            Command::Tui { url, interval_ms } => {
+                assert_eq!(url, DEFAULT_URL);
+                assert_eq!(interval_ms, 1000);
+            }
+            other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_tui_with_interval() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "tui", "--interval-ms", "500"]).unwrap();
+        match cli.command {
+            Command::Tui { interval_ms, .. } => assert_eq!(interval_ms, 500),
+            other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_telegram_with_check() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "telegram", "--check"]).unwrap();
+        match cli.command {
+            Command::Telegram { check, token, .. } => {
+                assert!(check);
+                assert_eq!(token, None);
+            }
+            other => panic!("expected Telegram, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_telegram_with_token() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "telegram", "--token", "secret"]).unwrap();
+        match cli.command {
+            Command::Telegram { token, check, .. } => {
+                assert_eq!(token.as_deref(), Some("secret"));
+                assert!(!check);
+            }
+            other => panic!("expected Telegram, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_defaults() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "daemon"]).unwrap();
+        match cli.command {
+            Command::Daemon { addr, mcp } => {
+                assert_eq!(addr.to_string(), "127.0.0.1:7880");
+                assert!(!mcp);
+            }
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_mcp() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "daemon", "--mcp"]).unwrap();
+        match cli.command {
+            Command::Daemon { mcp, .. } => assert!(mcp),
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_custom_addr() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "daemon", "--addr", "0.0.0.0:9000"]).unwrap();
+        match cli.command {
+            Command::Daemon { addr, .. } => assert_eq!(addr.to_string(), "0.0.0.0:9000"),
+            other => panic!("expected Daemon, got {other:?}"),
+        }
     }
 }

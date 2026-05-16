@@ -11,8 +11,16 @@ name = "trusty-mpm"
 path = "src/main.rs"
 
 [dependencies]
+# Internal crates — the unified binary embeds every mode (daemon, TUI, Telegram).
 trusty-mpm-core.workspace = true
-reqwest = { version = "0.12", features = ["blocking", "json"], default-features = false }
+trusty-mpm-daemon = { path = "../trusty-mpm-daemon" }
+trusty-mpm-tui = { path = "../trusty-mpm-tui" }
+trusty-mpm-telegram = { path = "../trusty-mpm-telegram" }
+
+tokio.workspace = true
+# Async (not blocking) reqwest: `#[tokio::main]` covers every subcommand, so the
+# blocking client is no longer needed.
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

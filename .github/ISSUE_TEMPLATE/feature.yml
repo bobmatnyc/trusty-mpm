@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a new feature
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Affected layer
+      multiple: true
+      options:
+        - API (daemon HTTP)
+        - CLI
+        - TUI (ratatui)
+        - Web UI / Tauri
+        - Core types
+        - MCP server
+        - Telegram bot
+        - CI / workflow
+    validations:
+      required: true

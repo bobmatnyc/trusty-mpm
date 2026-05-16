@@ -15,3 +15,65 @@ pub mod mcp_backend;
 pub mod state;
 pub mod tmux;
 pub mod watcher;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use tracing::info;
+
+pub use state::DaemonState;
+
+/// Run the resident HTTP daemon: API, hook relay, dashboard feed.
+///
+/// Why: the HTTP boot sequence is shared by both the standalone `trusty-mpmd`
+/// shim and the unified `trusty-mpm daemon` subcommand; living in the library
+/// keeps a single source of truth.
+/// What: announces tmux availability, discovers the trusty sidecars, spawns the
+/// file watcher, then serves the axum router until the socket closes.
+/// Test: `cargo run -p trusty-mpm-cli -- daemon` logs "trusty-mpm daemon
+/// starting" and `curl localhost:7880/health` returns `ok`.
+pub async fn run_http(state: Arc<DaemonState>, addr: SocketAddr) -> anyhow::Result<()> {
+    info!("trusty-mpm daemon starting on {addr}");
+    if tmux::TmuxDriver::is_available() {
+        info!("tmux control model available");
+    } else {
+        info!("tmux not found — sessions will need the PTY or SDK control model");
+    }
+
+    // Discover the trusty sidecar addresses and record them in shared state.
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let addrs = discover::discover_all(&home).await;
+    info!(
+        "trusty-memory at {}, trusty-search at {}",
+        addrs.memory, addrs.search
+    );
+    state.set_trusty_addrs(addrs);
+
+    // Spawn the multi-session file watcher as a background task.
+    let fw = watcher::FileWatcher::new(Arc::clone(&state));
+    tokio::spawn(fw.spawn());
+
+    let app = api::router(state);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("daemon listening; press Ctrl-C to stop");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Run the MCP server over stdio so a Claude Code session can call the
+/// orchestration tools (`session_list`, `agent_delegate`, ...).
+///
+/// Why: shared by `trusty-mpmd mcp` and `trusty-mpm daemon --mcp`.
+/// What: wraps [`DaemonState`] in a [`mcp_backend::StateBackend`] and pumps the
+/// trusty-mcp-core stdio JSON-RPC loop.
+/// Test: pipe a JSON-RPC `initialize` request to the process and observe a
+/// well-formed response on stdout.
+pub async fn run_mcp(state: Arc<DaemonState>) -> anyhow::Result<()> {
+    info!("trusty-mpm MCP server starting on stdio");
+    let backend = mcp_backend::StateBackend::new(state);
+    trusty_mcp_core::run_stdio_loop(move |req| {
+        let backend = backend.clone();
+        async move { trusty_mpm_mcp::dispatch(&backend, req).await }
+    })
+    .await
+}
