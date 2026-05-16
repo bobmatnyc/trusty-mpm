@@ -20,8 +20,10 @@ use axum::{
 };
 use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
 use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
+use trusty_mpm_core::tmux::TmuxTarget;
 
 use crate::state::DaemonState;
+use crate::tmux::TmuxDriver;
 
 /// Build the daemon's HTTP router with shared state injected.
 ///
@@ -69,19 +71,49 @@ pub struct RegisterSession {
 }
 
 /// `POST /sessions` — register a new managed session, returning its id.
+///
+/// Why: registering a session should also stand up its tmux host so the
+/// operator gets a live Claude Code session, not just a bookkeeping entry.
+/// What: builds the `Session`, then best-effort launches a detached tmux
+/// session and starts `claude` in it; tmux failures are logged, not fatal —
+/// the session is still registered so the API stays usable without tmux.
+/// Test: `register_and_remove_session` covers the bookkeeping path.
 async fn register_session(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RegisterSession>,
 ) -> Json<serde_json::Value> {
     let session = Session {
         id: SessionId::new(),
-        workdir: body.workdir,
+        workdir: body.workdir.clone(),
         status: SessionStatus::Starting,
         control: ControlModel::Tmux,
         active_delegations: 0,
     };
     let id = session.id;
     state.register_session(session);
+
+    // Best-effort: launch the session inside tmux. Any failure is logged and
+    // the session stays registered in the `Starting` state.
+    let tmux_name = format!("trusty-mpm-{}", id.0);
+    match TmuxDriver::discover() {
+        Ok(driver) => {
+            if let Err(e) = driver.create_session(&tmux_name, Some(&body.workdir)) {
+                tracing::warn!("tmux create_session failed: {e}");
+            } else {
+                let target = TmuxTarget::session(&tmux_name);
+                if let Err(e) = driver.send_line(&target, "claude") {
+                    tracing::warn!("tmux send_line failed: {e}");
+                } else if let Some(mut sess) = state.session(id) {
+                    sess.status = SessionStatus::Active;
+                    state.register_session(sess);
+                }
+            }
+        }
+        Err(_) => {
+            tracing::info!("tmux unavailable; session {id:?} registered without tmux launch");
+        }
+    }
+
     Json(serde_json::json!({ "id": id }))
 }
 

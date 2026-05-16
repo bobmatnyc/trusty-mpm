@@ -73,15 +73,26 @@ async fn run_loop<B: ratatui::backend::Backend>(
 ) -> anyhow::Result<()> {
     let mut state = DashboardState::default();
     loop {
-        // Refresh from the daemon: probe health first, then pull sessions.
+        // Refresh from the daemon: probe health first, then pull every panel's
+        // data — sessions, the hook-event feed, and circuit breakers.
         state.daemon_reachable = client.is_healthy().await;
         if state.daemon_reachable {
             match client.sessions().await {
                 Ok(sessions) => state.sessions = sessions,
                 Err(_) => state.daemon_reachable = false,
             }
+            match client.events().await {
+                Ok(events) => state.events = events,
+                Err(_) => state.daemon_reachable = false,
+            }
+            match client.breakers().await {
+                Ok(breakers) => state.breakers = breakers,
+                Err(_) => state.daemon_reachable = false,
+            }
         } else {
             state.sessions.clear();
+            state.events.clear();
+            state.breakers.clear();
         }
         terminal.draw(|f| dashboard::render(f, &state))?;
 

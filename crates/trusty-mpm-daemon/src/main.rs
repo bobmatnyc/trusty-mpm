@@ -10,6 +10,7 @@
 //! `curl localhost:7880/health` returns `ok`; unit tests live in the submodules.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tracing::info;
@@ -68,13 +69,26 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Run the resident HTTP daemon: API, hook relay, dashboard feed.
-async fn run_http(state: std::sync::Arc<DaemonState>, addr: SocketAddr) -> anyhow::Result<()> {
+async fn run_http(state: Arc<DaemonState>, addr: SocketAddr) -> anyhow::Result<()> {
     info!("trusty-mpm daemon starting on {addr}");
     if tmux::TmuxDriver::is_available() {
         info!("tmux control model available");
     } else {
         info!("tmux not found — sessions will need the PTY or SDK control model");
     }
+
+    // Discover the trusty sidecar addresses and record them in shared state.
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let addrs = crate::discover::discover_all(&home).await;
+    info!(
+        "trusty-memory at {}, trusty-search at {}",
+        addrs.memory, addrs.search
+    );
+    state.set_trusty_addrs(addrs);
+
+    // Spawn the multi-session file watcher as a background task.
+    let fw = watcher::FileWatcher::new(Arc::clone(&state));
+    tokio::spawn(fw.spawn());
 
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -85,7 +99,7 @@ async fn run_http(state: std::sync::Arc<DaemonState>, addr: SocketAddr) -> anyho
 
 /// Run the MCP server over stdio so a Claude Code session can call the
 /// orchestration tools (`session_list`, `agent_delegate`, ...).
-async fn run_mcp(state: std::sync::Arc<DaemonState>) -> anyhow::Result<()> {
+async fn run_mcp(state: Arc<DaemonState>) -> anyhow::Result<()> {
     info!("trusty-mpm MCP server starting on stdio");
     let backend = StateBackend::new(state);
     trusty_mcp_core::run_stdio_loop(move |req| {

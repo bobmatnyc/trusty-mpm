@@ -13,11 +13,6 @@
 //! Test: `cargo test -p trusty-mpm-daemon discover` exercises file-present,
 //! file-absent, malformed-file, and env-override cases without hitting the
 //! network.
-//!
-//! NOTE: `discover_all` and `TrustyAddrs` are stubs for daemon startup wiring
-//! that will be consumed once `DaemonState` carries `TrustyAddrs` (tracked
-//! separately). The dead-code allowance below is intentional.
-#![allow(dead_code)]
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -117,6 +112,7 @@ pub async fn discover_all(home: &Path) -> TrustyAddrs {
 /// Why: lets callers log or monitor the file without re-deriving the path.
 /// What: joins `data_dir` with the well-known filename `http_addr`.
 /// Test: assert the returned path ends with `.trusty-memory/http_addr`.
+#[allow(dead_code)] // Diagnostic helper for operators monitoring the port file.
 pub fn addr_file(data_dir: &Path) -> PathBuf {
     data_dir.join(HTTP_ADDR_FILE)
 }

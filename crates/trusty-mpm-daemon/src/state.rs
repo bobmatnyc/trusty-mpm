@@ -52,6 +52,8 @@ pub struct DaemonState {
     pub memory_config: MemoryConfig,
     /// Circuit-breaker tuning applied to newly-seen agents.
     pub circuit_config: CircuitConfig,
+    /// Discovered trusty sidecar service addresses, set once at startup.
+    trusty_addrs: Mutex<Option<crate::discover::TrustyAddrs>>,
 }
 
 impl Default for DaemonState {
@@ -71,6 +73,7 @@ impl DaemonState {
             hook_history: Mutex::new(VecDeque::with_capacity(HOOK_HISTORY_LIMIT)),
             memory_config: MemoryConfig::default(),
             circuit_config: CircuitConfig::default(),
+            trusty_addrs: Mutex::new(None),
         }
     }
 
@@ -175,6 +178,30 @@ impl DaemonState {
         self.memory.get(&session).map(|e| *e.value())
     }
 
+    // ---- trusty sidecar discovery --------------------------------------
+
+    /// Record the trusty sidecar addresses discovered at daemon startup.
+    ///
+    /// Why: discovery runs once when the HTTP daemon boots; the resolved
+    /// addresses must be visible to request handlers that proxy to the
+    /// trusty-memory / trusty-search sidecars.
+    /// What: stores the `TrustyAddrs` snapshot under the mutex.
+    /// Test: `trusty_addrs_round_trip`.
+    pub fn set_trusty_addrs(&self, addrs: crate::discover::TrustyAddrs) {
+        *self.trusty_addrs.lock() = Some(addrs);
+    }
+
+    /// Read the discovered trusty sidecar addresses, if discovery has run.
+    ///
+    /// Why: handlers need the resolved addresses; `None` means discovery has
+    /// not completed (e.g. in MCP mode, which skips it).
+    /// What: returns a clone of the stored `TrustyAddrs`.
+    /// Test: `trusty_addrs_round_trip`.
+    #[allow(dead_code)] // Read by sidecar-proxy handlers landing in a follow-up.
+    pub fn trusty_addrs(&self) -> Option<crate::discover::TrustyAddrs> {
+        self.trusty_addrs.lock().clone()
+    }
+
     // ---- hook events ----------------------------------------------------
 
     /// Append a hook event to the bounded history ring buffer.
@@ -263,6 +290,20 @@ mod tests {
         );
         assert_eq!(pressure, MemoryPressure::Compact);
         assert!(state.memory_for(id).is_some());
+    }
+
+    #[test]
+    fn trusty_addrs_round_trip() {
+        let state = DaemonState::new();
+        assert!(state.trusty_addrs().is_none());
+        let addrs = crate::discover::TrustyAddrs {
+            memory: "127.0.0.1:3038".parse().unwrap(),
+            search: "127.0.0.1:7878".parse().unwrap(),
+        };
+        state.set_trusty_addrs(addrs);
+        let got = state.trusty_addrs().expect("addrs stored");
+        assert_eq!(got.memory, "127.0.0.1:3038".parse().unwrap());
+        assert_eq!(got.search, "127.0.0.1:7878".parse().unwrap());
     }
 
     #[test]

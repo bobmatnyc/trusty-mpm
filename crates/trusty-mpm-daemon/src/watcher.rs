@@ -11,15 +11,13 @@
 //! Test: `cargo test -p trusty-mpm-daemon` checks watch-root bookkeeping and
 //! the path-to-event conversion without needing real filesystem events.
 
-// The dashboard file panel that consumes this watcher lands in a follow-up
-// issue; until then the watcher is exercised only by its own tests.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use notify::{EventKind, RecursiveMode, Watcher, recommended_watcher};
 use parking_lot::Mutex;
+use tracing::{debug, info, warn};
 use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
 use trusty_mpm_core::session::SessionId;
 
@@ -61,6 +59,7 @@ impl FileWatcher {
     }
 
     /// Stop watching a session's directory (called on session teardown).
+    #[allow(dead_code)] // Wired in the session-teardown milestone.
     pub fn unwatch_session(&self, session: SessionId) -> Option<PathBuf> {
         self.roots.lock().remove(&session)
     }
@@ -84,6 +83,64 @@ impl FileWatcher {
             .filter(|(_, root)| path.starts_with(root))
             .max_by_key(|(_, root)| root.as_os_str().len())
             .map(|(session, _)| *session)
+    }
+
+    /// Run the filesystem watcher loop until the daemon shuts down.
+    ///
+    /// Why: the daemon spawns this as a background task so file changes across
+    /// every session's workdir flow into the shared hook feed.
+    /// What: registers a `notify` watcher for each known session workdir, then
+    /// drains filesystem events from a channel, attributing each changed path
+    /// to a session via [`record_change`](Self::record_change).
+    /// Test: bookkeeping and path attribution are unit-tested directly; this
+    /// async glue is exercised by `cargo run`.
+    pub async fn spawn(self) {
+        // Seed watch roots from the sessions known at startup.
+        for session in self.state.list_sessions() {
+            let root = PathBuf::from(&session.workdir);
+            if root.is_dir() {
+                self.watch_session(session.id, root);
+            }
+        }
+
+        // notify's callback is synchronous; bridge it onto a tokio channel.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+        let mut watcher = match recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res
+                && matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                )
+            {
+                for path in event.paths {
+                    let _ = tx.send(path);
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("file watcher unavailable: {e}");
+                return;
+            }
+        };
+
+        // Register every seeded watch root with the notify watcher.
+        let roots: Vec<PathBuf> = self.roots.lock().values().cloned().collect();
+        for root in &roots {
+            if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+                warn!("failed to watch {}: {e}", root.display());
+            } else {
+                debug!("watching {}", root.display());
+            }
+        }
+        info!("file watcher started ({} root(s))", self.watched_count());
+
+        // Drain change events for the lifetime of the daemon.
+        while let Some(path) = rx.recv().await {
+            if self.record_change(&path) {
+                debug!("recorded file change: {}", path.display());
+            }
+        }
     }
 
     /// Synthesise and record a `FileChanged` hook event for a changed path.
