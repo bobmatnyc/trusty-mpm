@@ -12,16 +12,18 @@
 //! Test: `cargo test -p trusty-mpm-daemon` exercises registration, the hook
 //! ring-buffer bound, and memory-pressure classification.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use trusty_mpm_core::agent::Delegation;
 use trusty_mpm_core::circuit::{CircuitBreaker, CircuitConfig};
 use trusty_mpm_core::hook::HookEventRecord;
 use trusty_mpm_core::memory::{MemoryConfig, MemoryPressure, MemoryUsage};
 use trusty_mpm_core::paths::FrameworkPaths;
+use trusty_mpm_core::project::ProjectInfo;
 use trusty_mpm_core::session::{Session, SessionId};
 
 use crate::optimizer::OptimizerConfig;
@@ -61,6 +63,12 @@ pub struct DaemonState {
     /// Token-use optimizer config; read on every PostToolUse, updatable at
     /// runtime via the HTTP API, hence behind an `RwLock`.
     optimizer: Arc<parking_lot::RwLock<OptimizerConfig>>,
+    /// Registered projects, keyed by their absolute working-directory path.
+    ///
+    /// Why: sessions are grouped by project; the `project` subcommands and the
+    /// dashboard read this registry. An `RwLock<HashMap>` suits a low-churn
+    /// registry that is read far more often than written.
+    projects: Arc<RwLock<HashMap<PathBuf, ProjectInfo>>>,
 }
 
 impl Default for DaemonState {
@@ -115,6 +123,7 @@ impl DaemonState {
             circuit_config: CircuitConfig::default(),
             trusty_addrs: Mutex::new(None),
             optimizer: Arc::new(parking_lot::RwLock::new(optimizer)),
+            projects: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -144,6 +153,38 @@ impl DaemonState {
     /// Look up one session by id.
     pub fn session(&self, id: SessionId) -> Option<Session> {
         self.sessions.get(&id).map(|e| e.value().clone())
+    }
+
+    /// Snapshot the sessions belonging to one project.
+    ///
+    /// Why: `GET /sessions?project=<path>` and `trusty-mpm session list`
+    /// scope the listing to the caller's project.
+    /// What: returns every session whose `project_path` equals `path`.
+    /// Test: `list_sessions_for_project_filters`.
+    pub fn list_sessions_for_project(&self, path: &std::path::Path) -> Vec<Session> {
+        self.sessions
+            .iter()
+            .filter(|e| e.value().project_path.as_deref() == Some(path))
+            .map(|e| e.value().clone())
+            .collect()
+    }
+
+    /// Look up one session by id or by friendly tmux name.
+    ///
+    /// Why: the `session stop` / `session info` subcommands accept either a
+    /// UUID or the friendly `tmpm-<adj>-<noun>` name the daemon prints on
+    /// start; resolving both keeps the CLI ergonomic.
+    /// What: tries to parse `key` as a UUID first; on failure scans the
+    /// registry for a session whose `tmux_name` matches.
+    /// Test: `find_session_by_id_or_name`.
+    pub fn find_session(&self, key: &str) -> Option<Session> {
+        if let Ok(uuid) = uuid::Uuid::parse_str(key) {
+            return self.session(SessionId(uuid));
+        }
+        self.sessions
+            .iter()
+            .find(|e| e.value().tmux_name == key)
+            .map(|e| e.value().clone())
     }
 
     /// Drop registry entries whose tmux session no longer exists.
@@ -184,6 +225,40 @@ impl DaemonState {
             self.remove_session(*id);
         }
         dead.len()
+    }
+
+    // ---- projects -------------------------------------------------------
+
+    /// Register a project by its working-directory path.
+    ///
+    /// Why: `trusty-mpm project init` and `POST /projects` need to record a
+    /// directory as a managed project so sessions can be associated with it.
+    /// What: builds a [`ProjectInfo`] from `path`, inserting (or replacing) it
+    /// in the registry keyed by the path; returns the stored info.
+    /// Test: `register_and_list_projects`.
+    pub fn register_project(&self, path: PathBuf) -> ProjectInfo {
+        let info = ProjectInfo::new(path.clone());
+        self.projects.write().insert(path, info.clone());
+        info
+    }
+
+    /// Snapshot every registered project.
+    ///
+    /// Why: `trusty-mpm project list` and `GET /projects` need the full set.
+    /// What: clones each [`ProjectInfo`] out from under a short read lock.
+    /// Test: `register_and_list_projects`.
+    pub fn list_projects(&self) -> Vec<ProjectInfo> {
+        self.projects.read().values().cloned().collect()
+    }
+
+    /// Look up one registered project by its path.
+    ///
+    /// Why: `GET /projects/current` resolves the project for the caller's cwd.
+    /// What: returns a clone of the stored [`ProjectInfo`], or `None` if the
+    /// path is not registered.
+    /// Test: `project_lookup_by_path`.
+    pub fn project(&self, path: &std::path::Path) -> Option<ProjectInfo> {
+        self.projects.read().get(path).cloned()
     }
 
     // ---- delegations ----------------------------------------------------
@@ -378,6 +453,67 @@ mod tests {
         assert!(state.session(id).is_some());
         assert!(state.remove_session(id).is_some());
         assert!(state.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn register_and_list_projects() {
+        let state = DaemonState::new();
+        assert!(state.list_projects().is_empty());
+        let info = state.register_project(PathBuf::from("/work/demo"));
+        assert_eq!(info.name, "demo");
+        assert_eq!(state.list_projects().len(), 1);
+        // Re-registering the same path replaces rather than duplicates.
+        state.register_project(PathBuf::from("/work/demo"));
+        assert_eq!(state.list_projects().len(), 1);
+        state.register_project(PathBuf::from("/work/other"));
+        assert_eq!(state.list_projects().len(), 2);
+    }
+
+    #[test]
+    fn project_lookup_by_path() {
+        let state = DaemonState::new();
+        state.register_project(PathBuf::from("/work/demo"));
+        assert!(state.project(std::path::Path::new("/work/demo")).is_some());
+        assert!(
+            state
+                .project(std::path::Path::new("/work/missing"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn list_sessions_for_project_filters() {
+        let state = DaemonState::new();
+        let mut in_proj = sample_session();
+        in_proj.project_path = Some(PathBuf::from("/work/demo"));
+        let mut other_proj = sample_session();
+        other_proj.project_path = Some(PathBuf::from("/work/other"));
+        let no_proj = sample_session();
+        state.register_session(in_proj.clone());
+        state.register_session(other_proj);
+        state.register_session(no_proj);
+
+        let listed = state.list_sessions_for_project(std::path::Path::new("/work/demo"));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, in_proj.id);
+    }
+
+    #[test]
+    fn find_session_by_id_or_name() {
+        let state = DaemonState::new();
+        let s = sample_session();
+        let id = s.id;
+        let name = s.tmux_name.clone();
+        state.register_session(s);
+
+        assert!(state.find_session(&id.0.to_string()).is_some());
+        assert!(state.find_session(&name).is_some());
+        assert!(state.find_session("tmpm-no-such-name").is_none());
+        assert!(
+            state
+                .find_session(&SessionId::new().0.to_string())
+                .is_none()
+        );
     }
 
     #[test]

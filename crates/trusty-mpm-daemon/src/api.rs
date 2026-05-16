@@ -10,11 +10,12 @@
 //! Test: `cargo test -p trusty-mpm-daemon` drives the handlers directly with an
 //! in-memory state (no socket bind needed).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -39,6 +40,8 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/sessions/dead", axum::routing::delete(reap_sessions))
         .route("/sessions/{id}", axum::routing::delete(remove_session))
         .route("/sessions/{id}/events", get(session_events))
+        .route("/projects", get(list_projects).post(register_project))
+        .route("/projects/current", get(current_project))
         .route("/events", get(recent_events))
         .route("/hooks", post(ingest_hook))
         .route("/breakers", get(breakers))
@@ -51,9 +54,28 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// `GET /sessions` — snapshot of every managed session.
-async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "sessions": state.list_sessions() }))
+/// Query parameters for `GET /sessions`.
+///
+/// Why: `trusty-mpm session list` scopes the listing to one project; an
+/// optional `?project=<path>` filter keeps the endpoint usable both ways.
+/// What: an optional project path; when absent, all sessions are returned.
+/// Test: `list_sessions_filters_by_project`.
+#[derive(serde::Deserialize, Default)]
+pub struct SessionQuery {
+    /// Optional project path to filter sessions by.
+    pub project: Option<PathBuf>,
+}
+
+/// `GET /sessions` — snapshot of managed sessions, optionally project-scoped.
+async fn list_sessions(
+    State(state): State<Arc<DaemonState>>,
+    Query(query): Query<SessionQuery>,
+) -> Json<serde_json::Value> {
+    let sessions = match query.project {
+        Some(path) => state.list_sessions_for_project(&path),
+        None => state.list_sessions(),
+    };
+    Json(serde_json::json!({ "sessions": sessions }))
 }
 
 /// `GET /events` — recent hook events across all sessions (dashboard feed).
@@ -71,6 +93,11 @@ async fn recent_events(State(state): State<Arc<DaemonState>>) -> Json<serde_json
 pub struct RegisterSession {
     /// Working directory the session was launched in.
     pub workdir: String,
+    /// Optional project this session belongs to. When present, the session is
+    /// associated with that registered project so `session list` can scope to
+    /// it.
+    #[serde(default)]
+    pub project_path: Option<PathBuf>,
 }
 
 /// `POST /sessions` — register a new managed session, returning its id.
@@ -85,7 +112,8 @@ async fn register_session(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RegisterSession>,
 ) -> Json<serde_json::Value> {
-    let session = Session::new(SessionId::new(), body.workdir.clone(), ControlModel::Tmux);
+    let mut session = Session::new(SessionId::new(), body.workdir.clone(), ControlModel::Tmux);
+    session.project_path = body.project_path.clone();
     let id = session.id;
     let tmux_name = session.tmux_name.clone();
     state.register_session(session);
@@ -112,7 +140,7 @@ async fn register_session(
         }
     }
 
-    Json(serde_json::json!({ "id": id }))
+    Json(serde_json::json!({ "id": id, "name": tmux_name }))
 }
 
 /// `DELETE /sessions/:id` — deregister a session.
@@ -226,6 +254,67 @@ async fn get_optimizer(State(state): State<Arc<DaemonState>>) -> Json<serde_json
     Json(serde_json::json!({ "optimizer": state.optimizer_config() }))
 }
 
+/// JSON body for registering a project via `POST /projects`.
+///
+/// Why: `trusty-mpm project init` announces a working directory to the daemon
+/// so sessions started there can be associated with it.
+/// What: the absolute path of the project's working directory.
+/// Test: `register_and_list_projects`.
+#[derive(serde::Deserialize)]
+pub struct RegisterProject {
+    /// Absolute path to the project's working directory.
+    pub path: PathBuf,
+}
+
+/// `POST /projects` — register a project, returning its `ProjectInfo`.
+///
+/// Why: the daemon owns the project registry; `project init` posts the
+/// resolved directory here.
+/// What: delegates to [`DaemonState::register_project`] and returns the
+/// stored info as JSON.
+/// Test: `register_and_list_projects`.
+async fn register_project(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<RegisterProject>,
+) -> Json<serde_json::Value> {
+    let info = state.register_project(body.path);
+    Json(serde_json::json!(info))
+}
+
+/// `GET /projects` — snapshot of every registered project.
+async fn list_projects(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "projects": state.list_projects() }))
+}
+
+/// Query parameters for `GET /projects/current`.
+///
+/// Why: the daemon cannot see the caller's cwd; the CLI passes the resolved
+/// path so the daemon can look the project up.
+/// What: the path to resolve a project for.
+/// Test: `current_project_found_and_missing`.
+#[derive(serde::Deserialize)]
+pub struct CurrentProjectQuery {
+    /// Path whose registered project should be returned.
+    pub path: PathBuf,
+}
+
+/// `GET /projects/current?path=<dir>` — the project registered for `path`.
+///
+/// Why: `trusty-mpm project info` shows the current directory's project; the
+/// daemon resolves the path against its registry.
+/// What: returns the matching `ProjectInfo`, or `404` when `path` is not a
+/// registered project.
+/// Test: `current_project_found_and_missing`.
+async fn current_project(
+    State(state): State<Arc<DaemonState>>,
+    Query(query): Query<CurrentProjectQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match state.project(&query.path) {
+        Some(info) => Ok(Json(serde_json::json!(info))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 /// Parse a UUID string into a `SessionId`, mapping failure to `400`.
 fn parse_id(raw: &str) -> Result<SessionId, StatusCode> {
     uuid::Uuid::parse_str(raw)
@@ -255,8 +344,116 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_returns_state() {
         let (state, _) = state_with_session();
-        let Json(body) = list_sessions(State(state)).await;
+        let Json(body) = list_sessions(State(state), Query(SessionQuery::default())).await;
         assert_eq!(body["sessions"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_and_list_projects() {
+        // `POST /projects` registers a project; `GET /projects` lists it.
+        let state = DaemonState::shared();
+        let Json(info) = register_project(
+            State(Arc::clone(&state)),
+            Json(RegisterProject {
+                path: "/work/demo".into(),
+            }),
+        )
+        .await;
+        assert_eq!(info["name"], "demo");
+        assert_eq!(info["path"], "/work/demo");
+
+        let Json(body) = list_projects(State(state)).await;
+        assert_eq!(body["projects"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn current_project_found_and_missing() {
+        // `GET /projects/current` returns the project for a registered path
+        // and `404` for an unregistered one.
+        let state = DaemonState::shared();
+        let _ = register_project(
+            State(Arc::clone(&state)),
+            Json(RegisterProject {
+                path: "/work/demo".into(),
+            }),
+        )
+        .await;
+
+        let ok = current_project(
+            State(Arc::clone(&state)),
+            Query(CurrentProjectQuery {
+                path: "/work/demo".into(),
+            }),
+        )
+        .await;
+        assert!(ok.is_ok());
+
+        let err = current_project(
+            State(state),
+            Query(CurrentProjectQuery {
+                path: "/work/missing".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn register_session_associates_project() {
+        // A `POST /sessions` body carrying `project_path` must associate the
+        // new session with that project.
+        let state = DaemonState::shared();
+        let Json(body) = register_session(
+            State(Arc::clone(&state)),
+            Json(RegisterSession {
+                workdir: "/work/demo".into(),
+                project_path: Some("/work/demo".into()),
+            }),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let listed = state.list_sessions();
+        let session = listed
+            .iter()
+            .find(|s| s.id.0.to_string() == id)
+            .expect("session registered");
+        assert_eq!(session.project_path, Some(PathBuf::from("/work/demo")));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_filters_by_project() {
+        // `GET /sessions?project=<path>` returns only sessions of that project.
+        let state = DaemonState::shared();
+        let _ = register_session(
+            State(Arc::clone(&state)),
+            Json(RegisterSession {
+                workdir: "/work/demo".into(),
+                project_path: Some("/work/demo".into()),
+            }),
+        )
+        .await;
+        let _ = register_session(
+            State(Arc::clone(&state)),
+            Json(RegisterSession {
+                workdir: "/work/other".into(),
+                project_path: Some("/work/other".into()),
+            }),
+        )
+        .await;
+
+        let Json(all) =
+            list_sessions(State(Arc::clone(&state)), Query(SessionQuery::default())).await;
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
+
+        let Json(scoped) = list_sessions(
+            State(state),
+            Query(SessionQuery {
+                project: Some("/work/demo".into()),
+            }),
+        )
+        .await;
+        assert_eq!(scoped["sessions"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -291,6 +488,7 @@ mod tests {
             State(state.clone()),
             Json(RegisterSession {
                 workdir: "/tmp/new".into(),
+                project_path: None,
             }),
         )
         .await;
@@ -315,6 +513,7 @@ mod tests {
             State(Arc::clone(&state)),
             Json(RegisterSession {
                 workdir: "/tmp/friendly".into(),
+                project_path: None,
             }),
         )
         .await;
@@ -356,6 +555,7 @@ mod tests {
             State(Arc::clone(&state)),
             Json(RegisterSession {
                 workdir: "/tmp/no-tmux".into(),
+                project_path: None,
             }),
         )
         .await;

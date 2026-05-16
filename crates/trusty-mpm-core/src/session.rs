@@ -6,6 +6,7 @@
 //! exchanged over IPC.
 //! Test: `cargo test -p trusty-mpm-core` round-trips a `Session` through JSON.
 
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,13 @@ pub struct Session {
     /// When the session was last observed alive (heartbeat / activity).
     #[serde(default = "SystemTime::now")]
     pub last_seen: SystemTime,
+    /// The trusty-mpm project this session belongs to, if any.
+    ///
+    /// Why: a session is started inside a registered project; recording the
+    /// project root lets the CLI and dashboard filter sessions per project.
+    /// `None` for sessions started outside any registered project.
+    #[serde(default)]
+    pub project_path: Option<PathBuf>,
 }
 
 impl Session {
@@ -101,6 +109,7 @@ impl Session {
             tmux_name: crate::names::name_from_uuid(&id.0),
             created_at: now,
             last_seen: now,
+            project_path: None,
         }
     }
 
@@ -138,6 +147,24 @@ mod tests {
         assert_eq!(session.tmux_name, crate::names::name_from_uuid(&id.0));
         assert!(session.tmux_name.starts_with("tmpm-"));
         assert_eq!(session.status, SessionStatus::Starting);
+    }
+
+    #[test]
+    fn new_has_no_project_by_default() {
+        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        assert_eq!(session.project_path, None);
+    }
+
+    #[test]
+    fn project_path_survives_json_roundtrip() {
+        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        session.project_path = Some(std::path::PathBuf::from("/work/proj"));
+        let json = serde_json::to_string(&session).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.project_path,
+            Some(std::path::PathBuf::from("/work/proj"))
+        );
     }
 
     #[test]

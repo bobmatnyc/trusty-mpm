@@ -21,6 +21,7 @@ pub mod ipc;
 pub mod memory;
 pub mod names;
 pub mod paths;
+pub mod project;
 pub mod session;
 pub mod tmux;
 

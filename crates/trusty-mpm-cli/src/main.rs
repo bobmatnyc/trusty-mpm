@@ -37,16 +37,17 @@ struct Cli {
 enum Command {
     /// Show daemon and session status.
     Status,
-    /// Start a new session.
-    Start {
-        /// Working directory for the new session (defaults to the cwd).
-        #[arg(long)]
-        workdir: Option<String>,
+    /// Define and manage projects (registered working directories).
+    Project {
+        /// Project action to perform.
+        #[command(subcommand)]
+        action: ProjectAction,
     },
-    /// Stop a running session.
-    Stop {
-        /// Session id to stop.
-        id: String,
+    /// Define and manage Claude Code sessions within a project.
+    Session {
+        /// Session action to perform.
+        #[command(subcommand)]
+        action: SessionAction,
     },
     /// Show the recent hook-event feed.
     Events,
@@ -92,19 +93,58 @@ enum Command {
         #[command(subcommand)]
         action: OptimizerAction,
     },
-    /// Manage the daemon's session registry.
-    Sessions {
-        /// Session-registry action to perform.
-        #[command(subcommand)]
-        action: SessionsAction,
+}
+
+/// Actions for the `project` subcommand.
+#[derive(Debug, Subcommand)]
+enum ProjectAction {
+    /// Register a working directory as a trusty-mpm project.
+    Init {
+        /// Directory to register (defaults to the cwd).
+        #[arg(long)]
+        dir: Option<String>,
+    },
+    /// List all registered projects with their status.
+    List,
+    /// Show the current project's registered info and config.
+    Info {
+        /// Project directory (defaults to the cwd).
+        #[arg(long)]
+        dir: Option<String>,
     },
 }
 
-/// Actions for the `sessions` subcommand.
+/// Actions for the `session` subcommand.
 #[derive(Debug, Subcommand)]
-enum SessionsAction {
-    /// Reap registry entries whose tmux session has exited.
-    Clean,
+enum SessionAction {
+    /// Start a new Claude Code session in the current/specified project.
+    Start {
+        /// Project directory for the new session (defaults to the cwd).
+        #[arg(long)]
+        dir: Option<String>,
+    },
+    /// Stop a session by id or friendly name.
+    Stop {
+        /// Session id or friendly name (e.g. `tmpm-quiet-falcon`).
+        id_or_name: String,
+    },
+    /// List sessions for the current project.
+    List {
+        /// Project directory (defaults to the cwd).
+        #[arg(long)]
+        dir: Option<String>,
+    },
+    /// Reap dead sessions for the current project.
+    Clean {
+        /// Project directory (defaults to the cwd).
+        #[arg(long)]
+        dir: Option<String>,
+    },
+    /// Show detailed info for a specific session.
+    Info {
+        /// Session id or friendly name.
+        id_or_name: String,
+    },
 }
 
 /// Actions for the `optimizer` subcommand.
@@ -147,6 +187,15 @@ struct SessionRow {
     active_delegations: u32,
 }
 
+/// One project row as returned by `GET /projects`.
+#[derive(Debug, Deserialize)]
+struct ProjectRow {
+    /// Absolute project path.
+    path: std::path::PathBuf,
+    /// Human-readable project name.
+    name: String,
+}
+
 /// One event row as returned by `GET /events`.
 #[derive(Debug, Deserialize)]
 struct EventRow {
@@ -177,8 +226,8 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     match cli.command {
         Command::Status => status(&client, &cli.url).await,
-        Command::Start { workdir } => start(&client, &cli.url, workdir).await,
-        Command::Stop { id } => stop(&client, &cli.url, &id).await,
+        Command::Project { action } => project(&client, &cli.url, action).await,
+        Command::Session { action } => session(&client, &cli.url, action).await,
         Command::Events => events(&client, &cli.url).await,
         Command::Tui { url, interval_ms } => trusty_mpm_tui::run(url, interval_ms).await,
         Command::Telegram { url, token, check } => {
@@ -194,7 +243,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
-        Command::Sessions { action } => sessions(&client, &cli.url, action).await,
     }
 }
 
@@ -249,20 +297,192 @@ fn install_to(
     Ok(report)
 }
 
-/// `sessions` subcommand — manage the daemon's session registry.
+/// Resolve a `--dir` option to an absolute path, defaulting to the cwd.
 ///
-/// Why: dead tmux sessions leave stale registry entries; operators need a
-/// shell command to prune them without hand-crafting an HTTP request.
-/// What: `Clean` issues `DELETE /sessions/dead` and prints how many entries
-/// the daemon reaped.
-/// Test: `cli_parses_sessions_clean`.
-async fn sessions(
-    client: &reqwest::Client,
-    url: &str,
-    action: SessionsAction,
-) -> anyhow::Result<()> {
+/// Why: `project` and `session` subcommands all accept an optional directory;
+/// centralizing the "default to cwd" rule keeps the handlers uniform.
+/// What: returns `dir` as a `PathBuf` when given, otherwise the process cwd.
+/// Test: covered indirectly by the project/session handler integration tests.
+fn resolve_dir(dir: Option<String>) -> anyhow::Result<std::path::PathBuf> {
+    match dir {
+        Some(d) => Ok(std::path::PathBuf::from(d)),
+        None => Ok(std::env::current_dir()?),
+    }
+}
+
+/// `project` subcommand — define and manage trusty-mpm projects.
+///
+/// Why: a project is a registered working directory; operators need shell
+/// commands to register one, list all, and inspect the current one without
+/// hand-crafting HTTP requests.
+/// What: `Init` registers the directory (`POST /projects`) and scaffolds a
+/// local `.trusty-mpm/`; `List` prints `GET /projects`; `Info` prints the
+/// current directory's project via `GET /projects/current`.
+/// Test: `cli_parses_project_init`, `cli_parses_project_list`,
+/// `cli_parses_project_info`, `project_init_scaffolds_dotdir`.
+async fn project(client: &reqwest::Client, url: &str, action: ProjectAction) -> anyhow::Result<()> {
     match action {
-        SessionsAction::Clean => {
+        ProjectAction::Init { dir } => {
+            let path = resolve_dir(dir)?;
+            let body: serde_json::Value = client
+                .post(format!("{url}/projects"))
+                .json(&serde_json::json!({ "path": path }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let report = scaffold_project_dir(&path)?;
+            for line in &report {
+                println!("  {line}");
+            }
+            let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("registered project '{name}' at {}", path.display());
+        }
+        ProjectAction::List => {
+            #[derive(Deserialize)]
+            struct Body {
+                projects: Vec<ProjectRow>,
+            }
+            let body: Body = client
+                .get(format!("{url}/projects"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if body.projects.is_empty() {
+                println!("no projects registered");
+            }
+            for p in &body.projects {
+                println!("{} {}", p.name, p.path.display());
+            }
+        }
+        ProjectAction::Info { dir } => {
+            let path = resolve_dir(dir)?;
+            let resp = client
+                .get(format!("{url}/projects/current"))
+                .query(&[("path", path.to_string_lossy().as_ref())])
+                .send()
+                .await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                println!("{} is not a registered project", path.display());
+            } else {
+                let body: serde_json::Value = resp.error_for_status()?.json().await?;
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scaffold `<project>/.trusty-mpm/` with a config skeleton and `sessions/`.
+///
+/// Why: `project init` must give the operator an editable, version-controllable
+/// project config; doing it in a testable helper keeps it covered without a
+/// live daemon.
+/// What: creates `.trusty-mpm/sessions/` and writes `config.toml` (only when
+/// absent — never clobbering an edited config); returns a per-path report.
+/// Test: `project_init_scaffolds_dotdir`, `project_init_keeps_existing_config`.
+fn scaffold_project_dir(project: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let mut report = Vec::new();
+    let dotdir = project.join(".trusty-mpm");
+    let sessions = dotdir.join("sessions");
+    std::fs::create_dir_all(&sessions)?;
+    report.push(format!("\u{2713} {}", sessions.display()));
+
+    let config = dotdir.join("config.toml");
+    if config.exists() {
+        report.push(format!("- {} (exists, skipped)", config.display()));
+    } else {
+        let name = trusty_mpm_core::project::name_from_path(project);
+        let contents = format!(
+            "# trusty-mpm project configuration\n\
+             # Generated by: trusty-mpm project init\n\n\
+             [project]\nname = \"{name}\"\n\n\
+             [agents]\n\
+             # Additional agent sources for this project\n\
+             # sources = [\"https://example.com/agents\"]\n\n\
+             [skills]\n\
+             # Additional skill sources for this project\n\
+             # sources = []\n"
+        );
+        std::fs::write(&config, contents)?;
+        report.push(format!("\u{2713} {}", config.display()));
+    }
+    Ok(report)
+}
+
+/// `session` subcommand — define and manage sessions within a project.
+///
+/// Why: a session is a Claude Code instance; operators start, stop, list,
+/// reap, and inspect them per project from the shell.
+/// What: `Start` posts `POST /sessions` with the project path; `Stop` and
+/// `Info` resolve a session by id or friendly name; `List` and `Clean` scope
+/// to the project directory.
+/// Test: `cli_parses_session_start`, `cli_parses_session_stop`,
+/// `cli_parses_session_list`, `cli_parses_session_clean`,
+/// `cli_parses_session_info`.
+async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> anyhow::Result<()> {
+    match action {
+        SessionAction::Start { dir } => {
+            let path = resolve_dir(dir)?;
+            #[derive(Deserialize)]
+            struct Body {
+                #[serde(default)]
+                name: String,
+            }
+            let body: Body = client
+                .post(format!("{url}/sessions"))
+                .json(&serde_json::json!({
+                    "workdir": path,
+                    "project_path": path,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            // The daemon returns the friendly `tmpm-<adj>-<noun>` session name.
+            println!("started session {}", body.name);
+        }
+        SessionAction::Stop { id_or_name } => {
+            let resp = client
+                .delete(format!("{url}/sessions/{id_or_name}"))
+                .send()
+                .await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                println!("not found");
+            } else {
+                resp.error_for_status()?;
+                println!("stopped {id_or_name}");
+            }
+        }
+        SessionAction::List { dir } => {
+            let path = resolve_dir(dir)?;
+            #[derive(Deserialize)]
+            struct Body {
+                sessions: Vec<SessionRow>,
+            }
+            let body: Body = client
+                .get(format!("{url}/sessions"))
+                .query(&[("project", path.to_string_lossy().as_ref())])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if body.sessions.is_empty() {
+                println!("no sessions for {}", path.display());
+            }
+            for s in &body.sessions {
+                let status = s.status.as_str().unwrap_or("unknown");
+                println!("{} {} {}", short_id(&s.id), status, s.workdir);
+            }
+        }
+        SessionAction::Clean { dir } => {
+            // `dir` is accepted for symmetry; the daemon reaps globally.
+            let _ = resolve_dir(dir)?;
             let body: serde_json::Value = client
                 .delete(format!("{url}/sessions/dead"))
                 .send()
@@ -272,6 +492,33 @@ async fn sessions(
                 .await?;
             let removed = body.get("removed").and_then(|v| v.as_u64()).unwrap_or(0);
             println!("reaped {removed} dead session(s)");
+        }
+        SessionAction::Info { id_or_name } => {
+            #[derive(Deserialize)]
+            struct Body {
+                sessions: Vec<serde_json::Value>,
+            }
+            let body: Body = client
+                .get(format!("{url}/sessions"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let found = body.sessions.iter().find(|s| {
+                let id_match = s
+                    .get("id")
+                    .and_then(|v| v.get("0"))
+                    .and_then(|v| v.as_str())
+                    == Some(id_or_name.as_str());
+                let name_match =
+                    s.get("tmux_name").and_then(|v| v.as_str()) == Some(id_or_name.as_str());
+                id_match || name_match
+            });
+            match found {
+                Some(s) => println!("{}", serde_json::to_string_pretty(s)?),
+                None => println!("session '{id_or_name}' not found"),
+            }
         }
     }
     Ok(())
@@ -379,53 +626,6 @@ async fn status(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `start` subcommand — register a new session with the daemon.
-///
-/// Why: launches a managed session without the operator touching the API.
-/// What: `POST /sessions { "workdir": ... }`, defaulting to the current dir.
-/// Test: run `trusty-mpm start`; prints `started session {id}`.
-async fn start(client: &reqwest::Client, url: &str, workdir: Option<String>) -> anyhow::Result<()> {
-    let workdir = match workdir {
-        Some(w) => w,
-        None => std::env::current_dir()?.to_string_lossy().into_owned(),
-    };
-    #[derive(Deserialize)]
-    struct Body {
-        id: serde_json::Value,
-    }
-    let body: Body = client
-        .post(format!("{url}/sessions"))
-        .json(&serde_json::json!({ "workdir": workdir }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let id = body
-        .id
-        .get("0")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<unknown>");
-    println!("started session {id}");
-    Ok(())
-}
-
-/// `stop` subcommand — deregister a session by id.
-///
-/// Why: lets an operator tear a session down from the shell.
-/// What: `DELETE /sessions/{id}`; a `404` prints `not found`.
-/// Test: stop a known id then an unknown one to see both branches.
-async fn stop(client: &reqwest::Client, url: &str, id: &str) -> anyhow::Result<()> {
-    let resp = client.delete(format!("{url}/sessions/{id}")).send().await?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        println!("not found");
-    } else {
-        resp.error_for_status()?;
-        println!("stopped {id}");
-    }
-    Ok(())
-}
-
 /// `events` subcommand — print the recent hook-event feed.
 ///
 /// Why: gives operators a quick tail of daemon activity without the TUI.
@@ -488,29 +688,127 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_start_no_args() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "start"]).unwrap();
+    fn cli_parses_project_init() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "project", "init"]).unwrap();
         match cli.command {
-            Command::Start { workdir } => assert_eq!(workdir, None),
-            other => panic!("expected Start, got {other:?}"),
+            Command::Project {
+                action: ProjectAction::Init { dir },
+            } => assert_eq!(dir, None),
+            other => panic!("expected project init, got {other:?}"),
         }
     }
 
     #[test]
-    fn cli_parses_start_with_workdir() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "start", "--workdir", "/tmp"]).unwrap();
+    fn cli_parses_project_init_with_dir() {
+        let cli =
+            Cli::try_parse_from(["trusty-mpm", "project", "init", "--dir", "/work/p"]).unwrap();
         match cli.command {
-            Command::Start { workdir } => assert_eq!(workdir.as_deref(), Some("/tmp")),
-            other => panic!("expected Start, got {other:?}"),
+            Command::Project {
+                action: ProjectAction::Init { dir },
+            } => assert_eq!(dir.as_deref(), Some("/work/p")),
+            other => panic!("expected project init, got {other:?}"),
         }
     }
 
     #[test]
-    fn cli_parses_stop() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "stop", "abc-123"]).unwrap();
+    fn cli_parses_project_list() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "project", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Project {
+                action: ProjectAction::List
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_project_info() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "project", "info"]).unwrap();
         match cli.command {
-            Command::Stop { id } => assert_eq!(id, "abc-123"),
-            other => panic!("expected Stop, got {other:?}"),
+            Command::Project {
+                action: ProjectAction::Info { dir },
+            } => assert_eq!(dir, None),
+            other => panic!("expected project info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_project_requires_action() {
+        // `project` with no action is an error.
+        assert!(Cli::try_parse_from(["trusty-mpm", "project"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_session_start() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "start"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Start { dir },
+            } => assert_eq!(dir, None),
+            other => panic!("expected session start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_start_with_dir() {
+        let cli =
+            Cli::try_parse_from(["trusty-mpm", "session", "start", "--dir", "/work/p"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Start { dir },
+            } => assert_eq!(dir.as_deref(), Some("/work/p")),
+            other => panic!("expected session start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_stop() {
+        let cli =
+            Cli::try_parse_from(["trusty-mpm", "session", "stop", "tmpm-quiet-falcon"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Stop { id_or_name },
+            } => assert_eq!(id_or_name, "tmpm-quiet-falcon"),
+            other => panic!("expected session stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_session_stop_requires_arg() {
+        // `session stop` without an id-or-name is an error.
+        assert!(Cli::try_parse_from(["trusty-mpm", "session", "stop"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_session_list() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "list"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::List { dir },
+            } => assert_eq!(dir, None),
+            other => panic!("expected session list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_clean() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "clean"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Clean { dir },
+            } => assert_eq!(dir, None),
+            other => panic!("expected session clean, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_info() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "info", "abc-123"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Info { id_or_name },
+            } => assert_eq!(id_or_name, "abc-123"),
+            other => panic!("expected session info, got {other:?}"),
         }
     }
 
@@ -599,20 +897,40 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_sessions_clean() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "sessions", "clean"]).unwrap();
-        match cli.command {
-            Command::Sessions { action } => {
-                assert!(matches!(action, SessionsAction::Clean));
-            }
-            other => panic!("expected Sessions, got {other:?}"),
-        }
+    fn project_init_scaffolds_dotdir() {
+        // `project init` must create `.trusty-mpm/{config.toml,sessions/}`
+        // with a config skeleton naming the project after its directory.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("my-app");
+        std::fs::create_dir_all(&project).unwrap();
+        let report = scaffold_project_dir(&project).unwrap();
+        assert_eq!(report.len(), 2);
+
+        let config = project.join(".trusty-mpm/config.toml");
+        let sessions = project.join(".trusty-mpm/sessions");
+        assert!(config.exists());
+        assert!(sessions.is_dir());
+        let contents = std::fs::read_to_string(&config).unwrap();
+        assert!(contents.contains("name = \"my-app\""));
+        assert!(contents.contains("[agents]"));
+        assert!(contents.contains("[skills]"));
     }
 
     #[test]
-    fn cli_sessions_requires_action() {
-        // `sessions` with no action is an error — `clean` is mandatory.
-        assert!(Cli::try_parse_from(["trusty-mpm", "sessions"]).is_err());
+    fn project_init_keeps_existing_config() {
+        // Re-running `project init` must never clobber an edited config.toml.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_path_buf();
+        scaffold_project_dir(&project).unwrap();
+        let config = project.join(".trusty-mpm/config.toml");
+        std::fs::write(&config, "# edited by hand").unwrap();
+
+        let report = scaffold_project_dir(&project).unwrap();
+        assert!(report.iter().any(|l| l.contains("skipped")));
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "# edited by hand"
+        );
     }
 
     #[test]
