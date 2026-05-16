@@ -38,10 +38,12 @@ and holds persistent connections to the trusty services.
 
 ```
 crates/
-├── trusty-mpm-core      # shared types: artifacts, sessions, IPC protocol
+├── trusty-mpm-core      # shared types: artifacts, sessions, agents, hooks,
+│                        #   memory, circuit breaker, tmux, IPC protocol
+├── trusty-mpm-mcp       # MCP server: orchestration tools for Claude Code
 ├── trusty-mpm-daemon    # trusty-mpmd: the resident daemon
 ├── trusty-mpm-cli       # trusty-mpm: thin CLI client
-├── trusty-mpm-tui       # trusty-mpm-tui: ratatui dashboard
+├── trusty-mpm-tui       # trusty-mpm-tui: ratatui multi-session dashboard
 └── trusty-mpm-telegram  # trusty-mpm-telegram: Telegram remote bot
 docs/research/           # architecture & design research
 ```
@@ -51,10 +53,11 @@ docs/research/           # architecture & design research
 ```sh
 cargo build --workspace
 cargo test  --workspace
-cargo run -p trusty-mpm-daemon      # starts the daemon on 127.0.0.1:7880
+cargo run -p trusty-mpm-daemon          # resident HTTP daemon on 127.0.0.1:7880
+cargo run -p trusty-mpm-daemon -- mcp   # MCP server over stdio for Claude Code
 ```
 
-Toolchain: stable Rust, edition 2021 (pinned via `rust-toolchain.toml`).
+Toolchain: stable Rust, edition 2024 (pinned via `rust-toolchain.toml`).
 
 ## Status
 
@@ -71,10 +74,11 @@ but is operationally independent. See
 ## Research docs
 
 - [`architecture-overview.md`](docs/research/architecture-overview.md) — daemon architecture & component map
-- [`session-control-models.md`](docs/research/session-control-models.md) — tmux vs PTY vs SDK
-- [`artifact-compatibility.md`](docs/research/artifact-compatibility.md) — OOB artifact handling
-- [`dashboard-telegram.md`](docs/research/dashboard-telegram.md) — TUI & Telegram design
-- [`trusty-integration.md`](docs/research/trusty-integration.md) — trusty-memory/search clients
+- [`session-control-models.md`](docs/research/session-control-models.md) — tmux/PTY/SDK + memory protection
+- [`mcp-service.md`](docs/research/mcp-service.md) — MCP server for Claude Code ↔ daemon
+- [`artifact-compatibility.md`](docs/research/artifact-compatibility.md) — OOB artifact handling, 32-event hook vocabulary
+- [`dashboard-telegram.md`](docs/research/dashboard-telegram.md) — multi-session TUI & Telegram design
+- [`trusty-integration.md`](docs/research/trusty-integration.md) — trusty-common crates, memory/search clients
 
 ## License
 
