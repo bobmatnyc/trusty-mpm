@@ -174,6 +174,43 @@ impl DaemonState {
         Arc::new(Self::new())
     }
 
+    /// Construct state whose framework-managed config is read from `paths`.
+    ///
+    /// Why: [`DaemonState::new`] reads the optimizer / overseer policy and the
+    /// audit log location from the real `~/.trusty-mpm` install. End-to-end
+    /// tests must point those reads at a hermetic temp directory instead so a
+    /// test never touches (or depends on) the operator's real framework. This
+    /// constructor takes an explicit [`FrameworkPaths`] — typically built with
+    /// [`FrameworkPaths::under`] against a `tempfile::TempDir`.
+    /// What: loads `optimizer.toml` / `overseer.toml` from `paths.hooks` and
+    /// builds the audit logger under `paths.root/logs`, falling back to safe
+    /// defaults exactly as [`DaemonState::new`] does when a file is absent.
+    /// Test: the `e2e` integration suite (`test_optimizer`, `test_overseer`).
+    pub fn with_paths(paths: &FrameworkPaths) -> Self {
+        let optimizer = match OptimizerConfig::load_from_file(&paths.optimizer_config()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!("failed to load optimizer config: {e}; using defaults");
+                OptimizerConfig::default()
+            }
+        };
+        let overseer_cfg = OverseerConfig::load_from(&paths.overseer_config());
+        Self {
+            sessions: DashMap::new(),
+            delegations: DashMap::new(),
+            breakers: DashMap::new(),
+            memory: DashMap::new(),
+            hook_history: Mutex::new(VecDeque::with_capacity(HOOK_HISTORY_LIMIT)),
+            memory_config: MemoryConfig::default(),
+            circuit_config: CircuitConfig::default(),
+            trusty_addrs: Mutex::new(None),
+            optimizer: Arc::new(parking_lot::RwLock::new(optimizer)),
+            projects: Arc::new(RwLock::new(HashMap::new())),
+            overseer: Arc::new(DeterministicOverseer::new(overseer_cfg)),
+            audit: Arc::new(AuditLogger::new(&paths.root.join("logs"))),
+        }
+    }
+
     // ---- sessions -------------------------------------------------------
 
     /// Register (or replace) a managed session.

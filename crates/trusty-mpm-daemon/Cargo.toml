@@ -47,3 +47,11 @@ utoipa-swagger-ui.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+reqwest.workspace = true
+
+# End-to-end regression suite: spawns a real daemon on a loopback port and
+# drives it over HTTP. Lives in its own test binary so the module tree compiles
+# once and the daemon-spawning harness is shared across every scenario file.
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
