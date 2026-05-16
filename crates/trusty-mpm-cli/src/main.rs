@@ -265,8 +265,48 @@ fn install(force: bool) -> anyhow::Result<()> {
     for line in &report {
         println!("  {line}");
     }
+    println!(
+        "Composing agents into {}",
+        paths.claude_agents_dir().display()
+    );
+    let deploy = trusty_mpm_core::agent_deployer::deploy_agents(
+        &paths.agent_source_dir(),
+        &paths.claude_agents_dir(),
+    )?;
+    for line in deploy_report_lines(&deploy, &paths.agent_source_dir()) {
+        println!("  {line}");
+    }
     println!("Framework installed. Run `trusty-mpm daemon` to start.");
     Ok(())
+}
+
+/// Render per-file status lines for an agent [`DeployResult`].
+///
+/// Why: `install` and `session start` both print agent deploy results; one
+/// formatter keeps the output identical and the call sites small.
+/// What: a `✓ <file> (composed: a → b → c)` line per deployed agent, a
+/// `~ <file> (skipped — user-modified)` line per skipped one, and a `=` line
+/// per unchanged one; the chain comes from the agent's resolved source chain.
+/// Test: covered indirectly by `install_writes_all_artifacts`.
+fn deploy_report_lines(
+    deploy: &trusty_mpm_core::agent_deployer::DeployResult,
+    source_dir: &std::path::Path,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for file in &deploy.deployed {
+        let name = file.trim_end_matches(".md");
+        let chain = trusty_mpm_core::agent_builder::source_chain(name, source_dir)
+            .map(|c| c.join(" \u{2192} "))
+            .unwrap_or_else(|_| name.to_string());
+        lines.push(format!("\u{2713} {file} (composed: {chain})"));
+    }
+    for file in &deploy.skipped {
+        lines.push(format!("~ {file} (skipped \u{2014} user-modified)"));
+    }
+    for file in &deploy.unchanged {
+        lines.push(format!("= {file} (unchanged)"));
+    }
+    lines
 }
 
 /// Write every bundled artifact under `paths`, returning a per-file report.
@@ -427,6 +467,21 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
     match action {
         SessionAction::Start { dir } => {
             let path = resolve_dir(dir)?;
+            // Ensure `~/.claude/agents/` holds up-to-date composed agents
+            // before the session launches; CC reads them at startup.
+            let fw = trusty_mpm_core::paths::FrameworkPaths::default();
+            match trusty_mpm_core::agent_deployer::deploy_agents(
+                &fw.agent_source_dir(),
+                &fw.claude_agents_dir(),
+            ) {
+                Ok(deploy) => println!(
+                    "Agents: {} deployed, {} skipped, {} unchanged",
+                    deploy.deployed.len(),
+                    deploy.skipped.len(),
+                    deploy.unchanged.len(),
+                ),
+                Err(err) => eprintln!("warning: agent deploy failed: {err}"),
+            }
             #[derive(Deserialize)]
             struct Body {
                 #[serde(default)]
@@ -984,6 +1039,42 @@ mod tests {
         let forced = install_to(&paths, true).unwrap();
         assert!(forced.iter().all(|l| !l.contains("skipped")));
         assert_ne!(std::fs::read_to_string(&optimizer).unwrap(), "custom");
+    }
+
+    #[test]
+    fn install_then_deploy_composes_agents() {
+        // Installing the bundled agent sources and then deploying them must
+        // produce composed, inheritance-flattened files in `.claude/agents/`.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = trusty_mpm_core::paths::FrameworkPaths::under(dir.path());
+        install_to(&paths, false).unwrap();
+
+        let result = trusty_mpm_core::agent_deployer::deploy_agents(
+            &paths.agent_source_dir(),
+            &paths.claude_agents_dir(),
+        )
+        .unwrap();
+        // All six bundled agents deploy on a fresh target.
+        assert_eq!(result.deployed.len(), 6);
+        assert!(result.skipped.is_empty());
+
+        // The composed engineer carries inherited base content and no
+        // `extends:` for Claude Code to interpret.
+        let engineer =
+            std::fs::read_to_string(paths.claude_agents_dir().join("engineer.md")).unwrap();
+        assert!(engineer.contains("BASE-AGENT"));
+        assert!(engineer.contains("BASE-ENGINEER"));
+        assert!(engineer.contains("# Engineer"));
+        assert!(!engineer.contains("extends:"));
+
+        // The report formatter renders a composed-chain line.
+        let lines = deploy_report_lines(&result, &paths.agent_source_dir());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("engineer.md") && l.contains("composed:")),
+            "lines = {lines:?}"
+        );
     }
 
     #[test]

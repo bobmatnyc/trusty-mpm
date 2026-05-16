@@ -38,6 +38,8 @@ pub struct FrameworkPaths {
     pub instructions: PathBuf,
     /// `~/.trusty-mpm/registry`
     pub registry: PathBuf,
+    /// `~/.claude/agents` — where Claude Code reads composed agent files.
+    pub claude_agents: PathBuf,
 }
 
 impl FrameworkPaths {
@@ -63,7 +65,8 @@ impl FrameworkPaths {
     /// What: joins `<base>/.trusty-mpm` and derives every subdirectory from it.
     /// Test: `under_nests_subdirectories`.
     pub fn under(base: impl AsRef<Path>) -> Self {
-        let root = base.as_ref().join(FRAMEWORK_DIR_NAME);
+        let base = base.as_ref();
+        let root = base.join(FRAMEWORK_DIR_NAME);
         let framework = root.join("framework");
         Self {
             agents: framework.join("agents"),
@@ -71,6 +74,7 @@ impl FrameworkPaths {
             hooks: framework.join("hooks"),
             instructions: framework.join("instructions"),
             registry: root.join("registry"),
+            claude_agents: base.join(".claude").join("agents"),
             framework,
             root,
         }
@@ -116,6 +120,29 @@ impl FrameworkPaths {
     /// Test: `claude_stub_path_is_under_instructions`.
     pub fn claude_stub(&self) -> PathBuf {
         self.instructions.join("CLAUDE.md")
+    }
+
+    /// Directory holding the trusty-mpm agent *source* files.
+    ///
+    /// Why: the agent build pipeline reads `extends:`-bearing source agents
+    /// from here and composes them before deployment.
+    /// What: `framework/agents` under the framework root — the same directory
+    /// `trusty-mpm install` writes the bundled agent sources into.
+    /// Test: `agent_source_dir_is_framework_agents`.
+    pub fn agent_source_dir(&self) -> PathBuf {
+        self.agents.clone()
+    }
+
+    /// Directory Claude Code reads composed agent files from (`~/.claude/agents`).
+    ///
+    /// Why: the deploy step writes inheritance-flattened agents here so Claude
+    /// Code sees self-contained files with no `extends:` to interpret.
+    /// What: `.claude/agents` under the same base this `FrameworkPaths` was
+    /// resolved against (the user's home for [`default`](Self::default), the
+    /// temp dir for [`under`](Self::under)).
+    /// Test: `claude_agents_dir_is_dotclaude_agents`.
+    pub fn claude_agents_dir(&self) -> PathBuf {
+        self.claude_agents.clone()
     }
 }
 
@@ -200,6 +227,27 @@ mod tests {
         assert_eq!(
             paths.claude_stub(),
             PathBuf::from("/base/.trusty-mpm/framework/instructions/CLAUDE.md")
+        );
+    }
+
+    #[test]
+    fn agent_source_dir_is_framework_agents() {
+        // Agent sources must resolve to `framework/agents` under the root.
+        let paths = FrameworkPaths::under("/base");
+        assert_eq!(
+            paths.agent_source_dir(),
+            PathBuf::from("/base/.trusty-mpm/framework/agents")
+        );
+    }
+
+    #[test]
+    fn claude_agents_dir_is_dotclaude_agents() {
+        // Composed agents must deploy to `.claude/agents` under the base —
+        // sibling to `.trusty-mpm`, not nested within it.
+        let paths = FrameworkPaths::under("/base");
+        assert_eq!(
+            paths.claude_agents_dir(),
+            PathBuf::from("/base/.claude/agents")
         );
     }
 

@@ -71,6 +71,7 @@ walkdir = "2"
 regex = "1"
 gray_matter = "0.2"
 notify = "6"
+sha2 = "0.10"
 
 # Testing
 tempfile = "3"

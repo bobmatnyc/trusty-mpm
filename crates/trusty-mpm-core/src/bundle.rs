@@ -32,8 +32,23 @@ pub const FRAMEWORK_INSTRUCTIONS: &str = include_str!("../assets/instructions/IN
 /// project-specific edits the user makes survive subsequent installs.
 pub const CLAUDE_STUB: &str = include_str!("../assets/instructions/CLAUDE.md");
 
-/// Placeholder agent definition installed to `agents/example-agent.md`.
-pub const EXAMPLE_AGENT: &str = include_str!("../assets/agents/example-agent.md");
+/// Base agent — the root of every trusty-mpm inheritance chain.
+pub const BASE_AGENT: &str = include_str!("../assets/agents/BASE-AGENT.md");
+
+/// Base engineer agent — foundation for all engineer agents.
+pub const BASE_ENGINEER: &str = include_str!("../assets/agents/BASE-ENGINEER.md");
+
+/// Base research agent — foundation for all research agents.
+pub const BASE_RESEARCH: &str = include_str!("../assets/agents/BASE-RESEARCH.md");
+
+/// Base QA agent — foundation for all QA agents.
+pub const BASE_QA: &str = include_str!("../assets/agents/BASE-QA.md");
+
+/// Base ops agent — foundation for all ops agents.
+pub const BASE_OPS: &str = include_str!("../assets/agents/BASE-OPS.md");
+
+/// Concrete general-purpose engineer agent (`extends: base-engineer`).
+pub const ENGINEER_AGENT: &str = include_str!("../assets/agents/engineer.md");
 
 /// Placeholder skill definition installed to `skills/example-skill.md`.
 pub const EXAMPLE_SKILL: &str = include_str!("../assets/skills/example-skill.md");
@@ -99,8 +114,33 @@ pub const ALL: &[BundledArtifact] = &[
         install: InstallPolicy::SeedOnce,
     },
     BundledArtifact {
-        rel_path: "agents/example-agent.md",
-        contents: EXAMPLE_AGENT,
+        rel_path: "agents/BASE-AGENT.md",
+        contents: BASE_AGENT,
+        install: InstallPolicy::Overwrite,
+    },
+    BundledArtifact {
+        rel_path: "agents/BASE-ENGINEER.md",
+        contents: BASE_ENGINEER,
+        install: InstallPolicy::Overwrite,
+    },
+    BundledArtifact {
+        rel_path: "agents/BASE-RESEARCH.md",
+        contents: BASE_RESEARCH,
+        install: InstallPolicy::Overwrite,
+    },
+    BundledArtifact {
+        rel_path: "agents/BASE-QA.md",
+        contents: BASE_QA,
+        install: InstallPolicy::Overwrite,
+    },
+    BundledArtifact {
+        rel_path: "agents/BASE-OPS.md",
+        contents: BASE_OPS,
+        install: InstallPolicy::Overwrite,
+    },
+    BundledArtifact {
+        rel_path: "agents/engineer.md",
+        contents: ENGINEER_AGENT,
         install: InstallPolicy::Overwrite,
     },
     BundledArtifact {
@@ -122,7 +162,12 @@ mod tests {
         assert!(!OVERSEER_TOML.trim().is_empty());
         assert!(!FRAMEWORK_INSTRUCTIONS.trim().is_empty());
         assert!(!CLAUDE_STUB.trim().is_empty());
-        assert!(!EXAMPLE_AGENT.trim().is_empty());
+        assert!(!BASE_AGENT.trim().is_empty());
+        assert!(!BASE_ENGINEER.trim().is_empty());
+        assert!(!BASE_RESEARCH.trim().is_empty());
+        assert!(!BASE_QA.trim().is_empty());
+        assert!(!BASE_OPS.trim().is_empty());
+        assert!(!ENGINEER_AGENT.trim().is_empty());
         assert!(!EXAMPLE_SKILL.trim().is_empty());
     }
 
@@ -165,11 +210,11 @@ mod tests {
     #[test]
     fn bundle_table_is_complete() {
         // `ALL` must enumerate every artifact with unique, non-empty paths.
-        assert_eq!(ALL.len(), 6);
+        assert_eq!(ALL.len(), 11);
         let mut paths: Vec<&str> = ALL.iter().map(|a| a.rel_path).collect();
         paths.sort_unstable();
         paths.dedup();
-        assert_eq!(paths.len(), 6, "artifact paths must be unique");
+        assert_eq!(paths.len(), 11, "artifact paths must be unique");
         for artifact in ALL {
             assert!(!artifact.rel_path.is_empty());
             assert!(!artifact.contents.trim().is_empty());

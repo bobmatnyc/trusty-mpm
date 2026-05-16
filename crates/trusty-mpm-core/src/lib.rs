@@ -10,6 +10,9 @@
 //! claude-mpm frontmatter parser against fixture files.
 
 pub mod agent;
+pub mod agent_builder;
+pub mod agent_deployer;
+pub mod agent_manifest;
 pub mod artifact;
 pub mod budget;
 pub mod bundle;
