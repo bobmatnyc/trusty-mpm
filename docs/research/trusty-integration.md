@@ -1,9 +1,43 @@
-# trusty-memory & trusty-search Integration
+# trusty Integration
+
+trusty-mpm integrates with the trusty ecosystem in two ways: it **builds on the
+shared `trusty-common` workspace crates**, and it **talks to the trusty-memory
+and trusty-search sidecar services** as native Rust HTTP clients.
 
 claude-mpm reaches trusty-memory and trusty-search as MCP servers spawned as
 subprocesses. trusty-mpm replaces this with **native Rust clients** living
 inside the daemon — no subprocess, no MCP round-trip overhead for the daemon's
 own calls.
+
+## trusty-common shared crates
+
+The `trusty-common` workspace (sibling checkout, referenced by path) provides
+crates trusty-mpm reuses instead of reinventing:
+
+| trusty-common crate | What trusty-mpm uses it for |
+|---------------------|------------------------------|
+| `trusty-mcp-core` | JSON-RPC 2.0 / MCP request/response envelopes, standard error codes, the `initialize` payload builder, and `run_stdio_loop` — the foundation of the `trusty-mpm-mcp` server and the `trusty-mpmd mcp` run mode |
+| `trusty-common` | Shared utilities and the provider-agnostic streaming chat (`ChatProvider`) used for the optional LLM status summaries in the dashboard / Telegram bot |
+
+These are added to the workspace `Cargo.toml` as path dependencies:
+
+```toml
+trusty-common   = { path = "../trusty-common/crates/trusty-common" }
+trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+```
+
+Path deps keep trusty-mpm building against local `trusty-common` changes
+without a publish cycle. Reusing `trusty-mcp-core` in particular means the MCP
+wire format, error codes, and stdio loop are identical to trusty-memory and
+trusty-search — there is exactly one implementation of the JSON-RPC envelope in
+the ecosystem, and a fix in one place fixes every server.
+
+### Why not vendor the MCP types
+
+`trusty-mpm-mcp` could have defined its own `Request`/`Response`. It does not —
+that is precisely the drift-prone pattern `trusty-mcp-core` was created to kill.
+trusty-mpm's MCP crate adds only its *tool catalog* and `dispatch` routing on
+top of the shared envelopes.
 
 ## Current state (claude-mpm)
 
@@ -211,3 +245,25 @@ ever embeds a literal port number.
 | Memory enrichment in hooks | `src/claude_mpm/hooks/memory_integration_hook.py`, `src/claude_mpm/hooks/kuzu_enrichment_hook.py` | On `UserPromptSubmit`, calls memory service to prepend relevant context; trusty-mpm re-implements via native `MemoryClient::recall()` |
 | Memory session persistence | `src/claude_mpm/hooks/kuzu_response_hook.py`, `src/claude_mpm/hooks/kuzu_memory_hook.py` | Stores session outcomes and tool results to Kuzu graph; trusty-mpm maps to `MemoryClient::store()` on `Stop` |
 | MCP subprocess transport | `src/claude_mpm/mcp/launcher.py`, `src/claude_mpm/mcp/process_manager.py` | claude-mpm spawns MCP servers as subprocesses; trusty-mpm replaces daemon's own access with direct HTTP via `reqwest` |
+
+## Memory protection ↔ trusty-memory
+
+The memory-protection model (`trusty-mpm-core::memory` — see
+`session-control-models.md`) integrates with trusty-memory at the
+**auto-compaction boundary**:
+
+1. The daemon tracks per-session token usage in `DaemonState` (fed by
+   `TokenUsageUpdate` hook events and the MCP `memory_protect` tool).
+2. `MemoryUsage::pressure()` classifies usage against the configurable
+   thresholds (warn 70% / alert 85% / compact 90%).
+3. At `MemoryPressure::Compact`, **before** triggering Claude Code's
+   compaction, the daemon calls `MemoryClient::store()` to snapshot the
+   important context into trusty-memory's palace.
+4. After compaction the session can `MemoryClient::recall()` that snapshot if
+   it needs the dropped context again.
+
+This makes compaction non-lossy: trusty-memory becomes the durable backing
+store for context that the model's window can no longer hold. The dashboard
+memory gauge and the Telegram memory alert both read the same `pressure()`
+classification, so "the daemon is about to compact session X" is visible
+everywhere at once.
