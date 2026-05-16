@@ -3,8 +3,8 @@
 Cargo.lock.bak
 .DS_Store
 *.swp
-.env
-.env.local
+.env*
+!.env.example
 *.log
 /data
 /.trusty-mpm
