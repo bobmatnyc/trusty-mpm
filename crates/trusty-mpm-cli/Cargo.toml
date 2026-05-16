@@ -1,0 +1,22 @@
+[package]
+name = "trusty-mpm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI client for the trusty-mpm daemon"
+
+[[bin]]
+name = "trusty-mpm"
+path = "src/main.rs"
+
+[dependencies]
+trusty-mpm-core.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
