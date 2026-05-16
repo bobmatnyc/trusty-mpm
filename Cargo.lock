@@ -2870,6 +2870,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2885,6 +2886,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "dirs",
  "gray_matter",
  "serde",
  "serde_json",
@@ -2918,6 +2920,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+ "toml 0.8.23",
  "tower",
  "tower-http",
  "tracing",
