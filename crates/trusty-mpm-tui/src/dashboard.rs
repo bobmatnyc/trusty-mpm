@@ -34,8 +34,69 @@ pub struct DashboardState {
     pub events: Vec<EventRow>,
     /// Per-agent circuit-breaker state reported by the daemon.
     pub breakers: Vec<BreakerRow>,
+    /// Last N lines from the daemon log file (read from disk each tick).
+    pub log_lines: Vec<String>,
     /// Whether the last daemon poll succeeded.
     pub daemon_reachable: bool,
+}
+
+/// Pick the display colour for a session status string.
+///
+/// Why: a colour-coded status cell makes the operator's eye jump to trouble —
+/// centralising the mapping keeps `session_rows` readable and unit-testable.
+/// What: `"active"` → green, `"paused"` → yellow, anything else → gray.
+/// Test: `session_status_colours`.
+fn session_status_color(status: &str) -> Color {
+    match status {
+        "active" => Color::Green,
+        "paused" => Color::Yellow,
+        _ => Color::Gray,
+    }
+}
+
+/// Pick the display colour for a circuit-breaker state string.
+///
+/// Why: an at-a-glance colour for breaker state surfaces open breakers
+/// immediately; centralising the mapping keeps `breaker_rows` testable.
+/// What: `"closed"` → green, `"half_open"` → yellow, `"open"` → red, anything
+/// else → gray.
+/// Test: `breaker_state_colours`.
+fn breaker_state_color(state: &str) -> Color {
+    match state {
+        "closed" => Color::Green,
+        "half_open" => Color::Yellow,
+        "open" => Color::Red,
+        _ => Color::Gray,
+    }
+}
+
+/// Read the last `n` lines from the daemon log file.
+///
+/// Why: surfacing a live log tail in the dashboard saves the operator from
+/// tailing the file in a separate terminal.
+/// What: reads `~/.trusty-mpm/logs/trusty-mpm.log.YYYY-MM-DD` (tracing-appender's
+/// daily roller suffix), falling back to the plain `trusty-mpm.log` name, and
+/// returns the trailing `n` lines — or a placeholder when no file exists.
+/// Test: `read_log_tail_missing_file_returns_placeholder`.
+pub fn read_log_tail(n: usize) -> Vec<String> {
+    // Try dated file first (tracing-appender daily suffix is YYYY-MM-DD).
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let log_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".trusty-mpm")
+        .join("logs");
+    let candidates = [
+        log_dir.join(format!("trusty-mpm.log.{today}")),
+        log_dir.join("trusty-mpm.log"),
+    ];
+    for path in &candidates {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            let start = lines.len().saturating_sub(n);
+            return lines[start..].to_vec();
+        }
+    }
+    vec!["(no log file yet)".to_string()]
 }
 
 /// Build the table rows for the multi-session panel.
@@ -54,10 +115,11 @@ pub fn session_rows(state: &DashboardState) -> Vec<Row<'static>> {
                     .map(|v| v.chars().take(8).collect::<String>())
                     .unwrap_or_else(|| "????????".to_string());
             let status = s.status.as_str().unwrap_or("unknown").to_string();
+            let status_color = session_status_color(&status);
             Row::new(vec![
                 Cell::from(id),
                 Cell::from(s.workdir.clone()),
-                Cell::from(status),
+                Cell::from(status).style(Style::default().fg(status_color)),
                 Cell::from(s.active_delegations.to_string()),
             ])
         })
@@ -75,9 +137,10 @@ pub fn breaker_rows(state: &DashboardState) -> Vec<Row<'static>> {
         .breakers
         .iter()
         .map(|b| {
+            let state_color = breaker_state_color(&b.state);
             Row::new(vec![
                 Cell::from(b.agent.clone()),
-                Cell::from(b.state.clone()),
+                Cell::from(b.state.clone()).style(Style::default().fg(state_color)),
                 Cell::from(b.consecutive_failures.to_string()),
             ])
         })
@@ -118,18 +181,18 @@ pub fn event_lines(state: &DashboardState) -> Vec<String> {
 /// Draw the dashboard frame.
 ///
 /// Why: the single entry point the event loop calls each tick.
-/// What: a three-panel layout — header line; a middle row split 60/40 between
-/// the sessions table and the circuit-breaker table; a bottom recent-events
-/// list.
+/// What: a four-panel layout — header line; a middle row split 60/40 between
+/// the sessions table and the circuit-breaker table; a bottom row split 50/50
+/// between the recent-events list and the daemon log tail.
 /// Test: rendering is exercised by the integration smoke test; row/line content
 /// is unit-tested via `session_rows`, `breaker_rows`, and `event_lines`.
 pub fn render(frame: &mut Frame, state: &DashboardState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(8),
+            Constraint::Length(1),  // header
+            Constraint::Min(6),     // sessions + breakers
+            Constraint::Length(10), // events + log tail
         ])
         .split(frame.area());
 
@@ -178,14 +241,28 @@ pub fn render(frame: &mut Frame, state: &DashboardState) {
     );
     frame.render_widget(breakers, middle[1]);
 
-    // Bottom: the recent hook-event feed.
+    // Bottom row: recent hook-event feed (50%) beside the daemon log tail (50%).
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[2]);
+
     let items: Vec<ListItem> = event_lines(state).into_iter().map(ListItem::new).collect();
     let events = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .title("Recent Events"),
     );
-    frame.render_widget(events, chunks[2]);
+    frame.render_widget(events, bottom[0]);
+
+    let log_items: Vec<ListItem> = state
+        .log_lines
+        .iter()
+        .map(|l| ListItem::new(l.as_str()))
+        .collect();
+    let log_panel =
+        List::new(log_items).block(Block::default().borders(Borders::ALL).title("Daemon Log"));
+    frame.render_widget(log_panel, bottom[1]);
 }
 
 #[cfg(test)]
@@ -322,5 +399,46 @@ mod tests {
     fn event_lines_empty_when_no_events() {
         let state = DashboardState::default();
         assert!(event_lines(&state).is_empty());
+    }
+
+    #[test]
+    fn session_status_colours() {
+        assert_eq!(session_status_color("active"), Color::Green);
+        assert_eq!(session_status_color("paused"), Color::Yellow);
+        assert_eq!(session_status_color("unknown"), Color::Gray);
+        assert_eq!(session_status_color("anything-else"), Color::Gray);
+    }
+
+    #[test]
+    fn breaker_state_colours() {
+        assert_eq!(breaker_state_color("closed"), Color::Green);
+        assert_eq!(breaker_state_color("half_open"), Color::Yellow);
+        assert_eq!(breaker_state_color("open"), Color::Red);
+        assert_eq!(breaker_state_color("weird"), Color::Gray);
+    }
+
+    #[test]
+    fn read_log_tail_missing_file_returns_placeholder() {
+        // Point HOME at an empty temp dir so no log file exists; the function
+        // must degrade to its placeholder line rather than panicking.
+        let tmp = std::env::temp_dir().join(format!("trusty-mpm-tui-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded test scope; restored before returning.
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let lines = read_log_tail(20);
+
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(lines, vec!["(no log file yet)".to_string()]);
     }
 }

@@ -86,6 +86,9 @@ async fn run_loop<B: ratatui::backend::Backend>(
             state.events.clear();
             state.breakers.clear();
         }
+        // The daemon log tail is read straight from disk, independent of the
+        // HTTP poll — it stays useful even when the daemon is unreachable.
+        state.log_lines = dashboard::read_log_tail(20);
         terminal.draw(|f| dashboard::render(f, &state))?;
 
         // Wait for input up to the poll interval; quit on q/Esc.

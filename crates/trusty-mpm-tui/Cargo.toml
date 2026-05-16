@@ -25,3 +25,5 @@ tracing.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 clap.workspace = true
+chrono.workspace = true
+dirs.workspace = true
