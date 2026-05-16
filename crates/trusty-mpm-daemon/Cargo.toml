@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 trusty-mpm-core.workspace = true
+trusty-mpm-mcp.workspace = true
+trusty-mcp-core.workspace = true
+trusty-common.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 async-trait.workspace = true
@@ -32,6 +35,8 @@ chrono.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 dirs.workspace = true
+notify.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

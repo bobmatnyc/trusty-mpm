@@ -2,24 +2,48 @@
 //!
 //! Why: claude-mpm spawns a fresh Python process per hook invocation; a single
 //! long-lived daemon removes that per-call cost and enables shared state.
-//! What: Boots tracing, parses CLI flags, and (in this scaffold) logs startup
-//! then serves a minimal HTTP health endpoint.
-//! Test: `cargo run -p trusty-mpm-daemon` should log "trusty-mpm daemon starting"
-//! and `curl localhost:7880/health` should return `ok`.
+//! What: boots tracing, parses CLI flags, builds the shared [`DaemonState`],
+//! and runs in one of two modes — `http` (the resident API + hook relay) or
+//! `mcp` (an MCP server over stdio so a Claude Code session can speak directly
+//! to the orchestrator).
+//! Test: `cargo run -p trusty-mpm-daemon` logs "trusty-mpm daemon starting" and
+//! `curl localhost:7880/health` returns `ok`; unit tests live in the submodules.
 
 use std::net::SocketAddr;
 
-use axum::{routing::get, Router};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::info;
+
+mod api;
+pub(crate) mod discover;
+mod mcp_backend;
+mod state;
+mod tmux;
+mod watcher;
+
+use mcp_backend::StateBackend;
+use state::DaemonState;
 
 /// trusty-mpm daemon command-line options.
 #[derive(Debug, Parser)]
 #[command(name = "trusty-mpmd", version, about = "trusty-mpm daemon")]
 struct Args {
-    /// Address the daemon HTTP API binds to.
-    #[arg(long, env = "TRUSTY_MPM_ADDR", default_value = "127.0.0.1:7880")]
-    addr: SocketAddr,
+    /// Run mode (defaults to the resident HTTP daemon).
+    #[command(subcommand)]
+    mode: Option<Mode>,
+}
+
+/// Daemon run modes.
+#[derive(Debug, Subcommand)]
+enum Mode {
+    /// Run the resident HTTP API and universal hook relay.
+    Http {
+        /// Address the daemon HTTP API binds to.
+        #[arg(long, env = "TRUSTY_MPM_ADDR", default_value = "127.0.0.1:7880")]
+        addr: SocketAddr,
+    },
+    /// Run as an MCP server over stdio (launched by a Claude Code session).
+    Mcp,
 }
 
 #[tokio::main]
@@ -28,16 +52,45 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // MCP mode speaks JSON-RPC on stdout — keep tracing on stderr.
+        .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();
-    info!("trusty-mpm daemon starting on {}", args.addr);
+    let state = DaemonState::shared();
 
-    let app = Router::new().route("/health", get(|| async { "ok" }));
+    match args.mode.unwrap_or(Mode::Http {
+        addr: "127.0.0.1:7880".parse().expect("valid default addr"),
+    }) {
+        Mode::Http { addr } => run_http(state, addr).await,
+        Mode::Mcp => run_mcp(state).await,
+    }
+}
 
-    let listener = tokio::net::TcpListener::bind(args.addr).await?;
+/// Run the resident HTTP daemon: API, hook relay, dashboard feed.
+async fn run_http(state: std::sync::Arc<DaemonState>, addr: SocketAddr) -> anyhow::Result<()> {
+    info!("trusty-mpm daemon starting on {addr}");
+    if tmux::TmuxDriver::is_available() {
+        info!("tmux control model available");
+    } else {
+        info!("tmux not found — sessions will need the PTY or SDK control model");
+    }
+
+    let app = api::router(state);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("daemon listening; press Ctrl-C to stop");
     axum::serve(listener, app).await?;
-
     Ok(())
+}
+
+/// Run the MCP server over stdio so a Claude Code session can call the
+/// orchestration tools (`session_list`, `agent_delegate`, ...).
+async fn run_mcp(state: std::sync::Arc<DaemonState>) -> anyhow::Result<()> {
+    info!("trusty-mpm MCP server starting on stdio");
+    let backend = StateBackend::new(state);
+    trusty_mcp_core::run_stdio_loop(move |req| {
+        let backend = backend.clone();
+        async move { trusty_mpm_mcp::dispatch(&backend, req).await }
+    })
+    .await
 }
