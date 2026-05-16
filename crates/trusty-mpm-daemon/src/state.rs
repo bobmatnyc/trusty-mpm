@@ -234,6 +234,27 @@ impl DaemonState {
         self.sessions.get(&id).map(|e| e.value().clone())
     }
 
+    /// Mutate an existing session in place under a write lock.
+    ///
+    /// Why: the pause/resume handlers must change a session's `status`,
+    /// `paused_at`, and `pause_summary` atomically without the read-modify-write
+    /// race of `session()` + `register_session()`.
+    /// What: takes a write guard on the session entry and calls `f` if the
+    /// session exists; returns `true` when it ran, `false` for an unknown id.
+    /// Test: `update_session_mutates_existing`, `update_session_missing_is_false`.
+    pub fn update_session<F>(&self, id: &SessionId, f: F) -> bool
+    where
+        F: FnOnce(&mut Session),
+    {
+        match self.sessions.get_mut(id) {
+            Some(mut entry) => {
+                f(entry.value_mut());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Snapshot the sessions belonging to one project.
     ///
     /// Why: `GET /sessions?project=<path>` and `trusty-mpm session list`
@@ -555,6 +576,29 @@ mod tests {
         assert!(state.session(id).is_some());
         assert!(state.remove_session(id).is_some());
         assert!(state.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn update_session_mutates_existing() {
+        let state = DaemonState::new();
+        let s = sample_session();
+        let id = s.id;
+        state.register_session(s);
+        let ran = state.update_session(&id, |session| {
+            session.status = SessionStatus::Paused;
+            session.pause_summary = Some("note".to_string());
+        });
+        assert!(ran);
+        let updated = state.session(id).expect("session exists");
+        assert_eq!(updated.status, SessionStatus::Paused);
+        assert_eq!(updated.pause_summary.as_deref(), Some("note"));
+    }
+
+    #[test]
+    fn update_session_missing_is_false() {
+        let state = DaemonState::new();
+        let ran = state.update_session(&SessionId::new(), |_| {});
+        assert!(!ran);
     }
 
     #[test]

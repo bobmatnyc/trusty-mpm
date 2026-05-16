@@ -46,6 +46,10 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/sessions/dead", axum::routing::delete(reap_sessions))
         .route("/sessions/{id}", axum::routing::delete(remove_session))
         .route("/sessions/{id}/events", get(session_events))
+        .route("/sessions/{id}/pause", post(pause_session))
+        .route("/sessions/{id}/resume", post(resume_session))
+        .route("/sessions/{id}/command", post(send_command))
+        .route("/sessions/{id}/output", get(get_output))
         .route("/projects", get(list_projects).post(register_project))
         .route("/projects/current", get(current_project))
         .route("/events", get(recent_events))
@@ -246,6 +250,273 @@ pub async fn session_events(
     let session = parse_id(&id)?;
     Ok(Json(serde_json::json!({
         "events": state.hook_events_for(session),
+    })))
+}
+
+/// Resolve a `{id}` path param against the session registry.
+///
+/// Why: the pause/resume/command/output endpoints accept either a session UUID
+/// or its friendly `tmpm-<adj>-<noun>` tmux name, exactly like the CLI's
+/// `session stop`. Centralizing the lookup keeps the four handlers uniform.
+/// What: tries `DaemonState::find_session`, which matches a UUID string first
+/// and then scans for a matching `tmux_name`; maps a miss to `404`.
+fn resolve_session(state: &DaemonState, key: &str) -> Result<Session, StatusCode> {
+    state.find_session(key).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Best-effort capture of a session's tmux pane output.
+///
+/// Why: pause/command/output all want recent pane text, but tmux may be absent
+/// (CI) or the session may not be hosted in tmux. None of those is fatal — the
+/// endpoints still succeed, just without captured text.
+/// What: discovers tmux and captures the last `lines` of the session's pane;
+/// any failure is logged and yields an empty string.
+fn capture_pane(session: &Session, lines: u32) -> String {
+    match TmuxDriver::discover() {
+        Ok(driver) => {
+            let target = TmuxTarget::session(&session.tmux_name);
+            match driver.capture(&target, Some(lines)) {
+                Ok(text) => text,
+                Err(e) => {
+                    tracing::warn!("tmux capture failed for {}: {e}", session.tmux_name);
+                    String::new()
+                }
+            }
+        }
+        Err(_) => {
+            tracing::info!(
+                "tmux unavailable; capture for {} skipped",
+                session.tmux_name
+            );
+            String::new()
+        }
+    }
+}
+
+/// JSON body for `POST /sessions/{id}/pause`.
+///
+/// Why: a pause may carry an optional operator note describing where the
+/// session was left off; when absent the daemon derives one from pane output.
+/// What: an optional free-form summary string.
+/// Test: `pause_then_resume_round_trips`.
+#[derive(serde::Deserialize, utoipa::ToSchema, Default)]
+pub struct PauseRequest {
+    /// Optional note about where the session was left off.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+/// `POST /sessions/{id}/pause` — pause a session, saving its state for resume.
+///
+/// Why: an operator stepping away needs the session frozen with a "where I left
+/// off" note that survives a daemon restart.
+/// What: resolves the session by UUID or friendly name, captures the last 50
+/// pane lines, sets `status = Paused` / `paused_at = now` / `pause_summary`
+/// (the request note, or the first 200 chars of captured output), and mirrors
+/// the pause record to disk via `session_store::save_pause`.
+/// Test: `pause_then_resume_round_trips`, `pause_unknown_session_is_404`.
+#[utoipa::path(
+    post,
+    path = "/sessions/{id}/pause",
+    tag = "sessions",
+    params(("id" = String, Path, description = "Session UUID or friendly name")),
+    request_body = PauseRequest,
+    responses(
+        (status = 200, description = "Session paused; returns the pause summary"),
+        (status = 404, description = "No session with that id or name"),
+    )
+)]
+pub async fn pause_session(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PauseRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let session = resolve_session(&state, &id)?;
+    let captured = capture_pane(&session, 50);
+    let summary = body
+        .summary
+        .unwrap_or_else(|| captured.chars().take(200).collect::<String>());
+    let now = std::time::SystemTime::now();
+
+    state.update_session(&session.id, |s| {
+        s.status = SessionStatus::Paused;
+        s.paused_at = Some(now);
+        s.pause_summary = Some(summary.clone());
+    });
+
+    // Persist the pause record so the state survives a daemon restart.
+    if let Some(updated) = state.session(session.id)
+        && let Err(e) = trusty_mpm_core::session_store::save_pause(&updated)
+    {
+        tracing::warn!(
+            "failed to persist pause state for {}: {e}",
+            session.tmux_name
+        );
+    }
+
+    Ok(Json(serde_json::json!({
+        "paused": true,
+        "session_id": session.id,
+        "summary": summary,
+    })))
+}
+
+/// `POST /sessions/{id}/resume` — resume a previously-paused session.
+///
+/// Why: the counterpart to pause; clears the frozen state and the on-disk
+/// pause record so the session is active again.
+/// What: resolves the session, requires `status == Paused` (else `409`), sets
+/// `status = Active` / `paused_at = None` / `pause_summary = None`, and removes
+/// the pause file via `session_store::clear_pause`.
+/// Test: `pause_then_resume_round_trips`, `resume_unpaused_session_is_409`.
+#[utoipa::path(
+    post,
+    path = "/sessions/{id}/resume",
+    tag = "sessions",
+    params(("id" = String, Path, description = "Session UUID or friendly name")),
+    responses(
+        (status = 200, description = "Session resumed"),
+        (status = 404, description = "No session with that id or name"),
+        (status = 409, description = "Session is not paused"),
+    )
+)]
+pub async fn resume_session(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let session = resolve_session(&state, &id)?;
+    if session.status != SessionStatus::Paused {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    state.update_session(&session.id, |s| {
+        s.status = SessionStatus::Active;
+        s.paused_at = None;
+        s.pause_summary = None;
+    });
+
+    if let Err(e) = trusty_mpm_core::session_store::clear_pause(&session.id) {
+        tracing::warn!("failed to clear pause state for {}: {e}", session.tmux_name);
+    }
+
+    Ok(Json(serde_json::json!({ "resumed": true })))
+}
+
+/// JSON body for `POST /sessions/{id}/command`.
+///
+/// Why: feeding a command into a session's tmux pane is how the operator (and
+/// the Telegram bot) drives Claude Code remotely.
+/// What: the command line to type into the pane.
+/// Test: `send_command_returns_output_shape`.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct CommandRequest {
+    /// The command line to send to the session's tmux pane.
+    pub command: String,
+}
+
+/// `POST /sessions/{id}/command` — send a command to a session's tmux pane.
+///
+/// Why: remote control of a running session — type a line, let it run, read
+/// back what happened.
+/// What: resolves the session (`404` if missing, `409` if `Stopped`), sends the
+/// command via `TmuxDriver::send_line`, waits 500ms for output to settle, then
+/// captures the last 100 pane lines. tmux errors are logged, not fatal — the
+/// endpoint still returns `200` with whatever output was captured.
+/// Test: `send_command_returns_output_shape`, `command_to_stopped_session_is_409`.
+#[utoipa::path(
+    post,
+    path = "/sessions/{id}/command",
+    tag = "sessions",
+    params(("id" = String, Path, description = "Session UUID or friendly name")),
+    request_body = CommandRequest,
+    responses(
+        (status = 200, description = "Command sent; returns captured pane output"),
+        (status = 404, description = "No session with that id or name"),
+        (status = 409, description = "Session is stopped"),
+    )
+)]
+pub async fn send_command(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(body): Json<CommandRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let session = resolve_session(&state, &id)?;
+    if session.status == SessionStatus::Stopped {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    // Best-effort: send the command. tmux may be absent in CI.
+    match TmuxDriver::discover() {
+        Ok(driver) => {
+            let target = TmuxTarget::session(&session.tmux_name);
+            if let Err(e) = driver.send_line(&target, &body.command) {
+                tracing::warn!("tmux send_line failed for {}: {e}", session.tmux_name);
+            }
+        }
+        Err(_) => {
+            tracing::info!(
+                "tmux unavailable; command for {} not sent",
+                session.tmux_name
+            );
+        }
+    }
+
+    // Give the pane a moment to render the command's output before capturing.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let output = capture_pane(&session, 100);
+
+    Ok(Json(serde_json::json!({ "sent": true, "output": output })))
+}
+
+/// Query parameters for `GET /sessions/{id}/output`.
+///
+/// Why: the caller chooses how much scrollback to capture; a default keeps the
+/// endpoint usable with no query string.
+/// What: an optional line count, defaulting to 50.
+/// Test: `get_output_returns_output_shape`.
+#[derive(serde::Deserialize)]
+pub struct OutputQuery {
+    /// Number of trailing pane lines to capture (default 50).
+    #[serde(default = "default_output_lines")]
+    pub lines: u32,
+}
+
+/// Default trailing-line count for `GET /sessions/{id}/output`.
+fn default_output_lines() -> u32 {
+    50
+}
+
+/// `GET /sessions/{id}/output` — capture the current tmux pane output.
+///
+/// Why: the dashboard and the Telegram bot show a session's recent output
+/// without sending it a command.
+/// What: resolves the session (`404` if missing), captures the last `?lines=N`
+/// pane lines (default 50), and returns `{ "output": <text>, "lines": N }`.
+/// tmux being unavailable yields an empty `output` rather than an error.
+/// Test: `get_output_returns_output_shape`, `output_unknown_session_is_404`.
+#[utoipa::path(
+    get,
+    path = "/sessions/{id}/output",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Session UUID or friendly name"),
+        ("lines" = Option<u32>, Query, description = "Trailing lines to capture (default 50)"),
+    ),
+    responses(
+        (status = 200, description = "Captured pane output"),
+        (status = 404, description = "No session with that id or name"),
+    )
+)]
+pub async fn get_output(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Query(query): Query<OutputQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let session = resolve_session(&state, &id)?;
+    let output = capture_pane(&session, query.lines);
+    Ok(Json(serde_json::json!({
+        "output": output,
+        "lines": query.lines,
     })))
 }
 
@@ -890,6 +1161,142 @@ mod tests {
         let state = DaemonState::shared();
         let Json(body) = breakers(State(state)).await;
         assert!(body["breakers"].is_array());
+    }
+
+    #[tokio::test]
+    async fn pause_then_resume_round_trips() {
+        // Pausing flips a session to `Paused`; resuming flips it back to
+        // `Active` and clears the pause metadata.
+        let (state, id) = state_with_session();
+        let Json(body) = pause_session(
+            State(Arc::clone(&state)),
+            Path(id.0.to_string()),
+            Json(PauseRequest {
+                summary: Some("mid-task".into()),
+            }),
+        )
+        .await
+        .expect("pause succeeds");
+        assert_eq!(body["paused"], true);
+        assert_eq!(body["summary"], "mid-task");
+
+        let paused = state.session(id).expect("session exists");
+        assert_eq!(paused.status, SessionStatus::Paused);
+        assert_eq!(paused.pause_summary.as_deref(), Some("mid-task"));
+        assert!(paused.paused_at.is_some());
+
+        let Json(resumed) = resume_session(State(Arc::clone(&state)), Path(id.0.to_string()))
+            .await
+            .expect("resume succeeds");
+        assert_eq!(resumed["resumed"], true);
+
+        let active = state.session(id).expect("session exists");
+        assert_eq!(active.status, SessionStatus::Active);
+        assert_eq!(active.paused_at, None);
+        assert_eq!(active.pause_summary, None);
+    }
+
+    #[tokio::test]
+    async fn pause_unknown_session_is_404() {
+        let state = DaemonState::shared();
+        let err = pause_session(
+            State(state),
+            Path(SessionId::new().0.to_string()),
+            Json(PauseRequest::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn resume_unpaused_session_is_409() {
+        // A session that was never paused cannot be resumed.
+        let (state, id) = state_with_session();
+        let err = resume_session(State(state), Path(id.0.to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn send_command_returns_output_shape() {
+        // The command endpoint always returns `{ sent, output }`; tmux errors
+        // are swallowed so the output may simply be empty.
+        let (state, id) = state_with_session();
+        let Json(body) = send_command(
+            State(state),
+            Path(id.0.to_string()),
+            Json(CommandRequest {
+                command: "help".into(),
+            }),
+        )
+        .await
+        .expect("command sent");
+        assert_eq!(body["sent"], true);
+        assert!(body["output"].is_string());
+    }
+
+    #[tokio::test]
+    async fn command_to_stopped_session_is_409() {
+        let state = DaemonState::shared();
+        let id = SessionId::new();
+        let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        session.status = SessionStatus::Stopped;
+        state.register_session(session);
+
+        let err = send_command(
+            State(state),
+            Path(id.0.to_string()),
+            Json(CommandRequest {
+                command: "help".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn get_output_returns_output_shape() {
+        let (state, id) = state_with_session();
+        let Json(body) = get_output(
+            State(state),
+            Path(id.0.to_string()),
+            Query(OutputQuery { lines: 25 }),
+        )
+        .await
+        .expect("output captured");
+        assert!(body["output"].is_string());
+        assert_eq!(body["lines"], 25);
+    }
+
+    #[tokio::test]
+    async fn output_unknown_session_is_404() {
+        let state = DaemonState::shared();
+        let err = get_output(
+            State(state),
+            Path(SessionId::new().0.to_string()),
+            Query(OutputQuery { lines: 50 }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pause_resolves_session_by_friendly_name() {
+        // The pause endpoint accepts a friendly tmux name, not just a UUID.
+        let (state, id) = state_with_session();
+        let name = state.session(id).expect("session").tmux_name;
+        let Json(body) = pause_session(
+            State(Arc::clone(&state)),
+            Path(name),
+            Json(PauseRequest::default()),
+        )
+        .await
+        .expect("pause by name succeeds");
+        assert_eq!(body["paused"], true);
     }
 
     #[tokio::test]

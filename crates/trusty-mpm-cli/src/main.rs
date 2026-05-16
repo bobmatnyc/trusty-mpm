@@ -164,6 +164,34 @@ enum SessionAction {
     },
     /// Show every agent's circuit-breaker state.
     Breakers,
+    /// Pause a running session, saving state for later resume.
+    Pause {
+        /// Session id or friendly name.
+        id_or_name: String,
+        /// Short note about where you left off.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Resume a paused session.
+    Resume {
+        /// Session id or friendly name.
+        id_or_name: String,
+    },
+    /// Send a command to a session's tmux pane.
+    Run {
+        /// Session id or friendly name.
+        id_or_name: String,
+        /// Command to send.
+        command: String,
+    },
+    /// Capture the current output of a session's tmux pane.
+    Output {
+        /// Session id or friendly name.
+        id_or_name: String,
+        /// Number of lines to capture (default 50).
+        #[arg(long, default_value_t = 50)]
+        lines: u32,
+    },
 }
 
 /// Actions for the `overseer` subcommand.
@@ -691,6 +719,75 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
                         .unwrap_or(0);
                     println!("{:<24} {:<12} {}", r.agent, state, failures);
                 }
+            }
+        }
+        SessionAction::Pause { id_or_name, note } => {
+            let resp = client
+                .post(format!("{url}/sessions/{id_or_name}/pause"))
+                .json(&serde_json::json!({ "summary": note }))
+                .send()
+                .await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                println!("session '{id_or_name}' not found");
+            } else {
+                let body: serde_json::Value = resp.error_for_status()?.json().await?;
+                let summary = body.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                println!("paused {id_or_name}: {summary}");
+            }
+        }
+        SessionAction::Resume { id_or_name } => {
+            let resp = client
+                .post(format!("{url}/sessions/{id_or_name}/resume"))
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::NOT_FOUND => {
+                    println!("session '{id_or_name}' not found");
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    println!("session '{id_or_name}' is not paused");
+                }
+                _ => {
+                    resp.error_for_status()?;
+                    println!("resumed {id_or_name}");
+                }
+            }
+        }
+        SessionAction::Run {
+            id_or_name,
+            command,
+        } => {
+            let resp = client
+                .post(format!("{url}/sessions/{id_or_name}/command"))
+                .json(&serde_json::json!({ "command": command }))
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::NOT_FOUND => {
+                    println!("session '{id_or_name}' not found");
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    println!("session '{id_or_name}' is stopped");
+                }
+                _ => {
+                    let body: serde_json::Value = resp.error_for_status()?.json().await?;
+                    let output = body.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                    print!("{output}");
+                }
+            }
+        }
+        SessionAction::Output { id_or_name, lines } => {
+            let resp = client
+                .get(format!("{url}/sessions/{id_or_name}/output"))
+                .query(&[("lines", lines.to_string())])
+                .send()
+                .await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                println!("session '{id_or_name}' not found");
+            } else {
+                let body: serde_json::Value = resp.error_for_status()?.json().await?;
+                let output = body.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                print!("{output}");
             }
         }
     }
@@ -1388,6 +1485,116 @@ mod tests {
                 action: SessionAction::Breakers
             }
         ));
+    }
+
+    #[test]
+    fn cli_parses_session_pause() {
+        let cli =
+            Cli::try_parse_from(["trusty-mpm", "session", "pause", "tmpm-quiet-falcon"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Pause { id_or_name, note },
+            } => {
+                assert_eq!(id_or_name, "tmpm-quiet-falcon");
+                assert_eq!(note, None);
+            }
+            other => panic!("expected session pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_pause_with_note() {
+        let cli = Cli::try_parse_from([
+            "trusty-mpm",
+            "session",
+            "pause",
+            "abc-123",
+            "--note",
+            "stepping away",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Pause { id_or_name, note },
+            } => {
+                assert_eq!(id_or_name, "abc-123");
+                assert_eq!(note.as_deref(), Some("stepping away"));
+            }
+            other => panic!("expected session pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_resume() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "resume", "abc-123"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Resume { id_or_name },
+            } => assert_eq!(id_or_name, "abc-123"),
+            other => panic!("expected session resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_run() {
+        let cli =
+            Cli::try_parse_from(["trusty-mpm", "session", "run", "abc-123", "help me"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action:
+                    SessionAction::Run {
+                        id_or_name,
+                        command,
+                    },
+            } => {
+                assert_eq!(id_or_name, "abc-123");
+                assert_eq!(command, "help me");
+            }
+            other => panic!("expected session run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_output_defaults() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "output", "abc-123"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Output { id_or_name, lines },
+            } => {
+                assert_eq!(id_or_name, "abc-123");
+                assert_eq!(lines, 50);
+            }
+            other => panic!("expected session output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_output_with_lines() {
+        let cli = Cli::try_parse_from([
+            "trusty-mpm",
+            "session",
+            "output",
+            "abc-123",
+            "--lines",
+            "120",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Output { lines, .. },
+            } => assert_eq!(lines, 120),
+            other => panic!("expected session output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_session_pause_requires_arg() {
+        assert!(Cli::try_parse_from(["trusty-mpm", "session", "pause"]).is_err());
+    }
+
+    #[test]
+    fn cli_session_run_requires_command() {
+        assert!(Cli::try_parse_from(["trusty-mpm", "session", "run", "abc-123"]).is_err());
     }
 
     #[test]

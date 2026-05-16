@@ -41,6 +41,8 @@ pub enum SessionStatus {
     AwaitingApproval,
     /// Session has been detached but the process is still alive.
     Detached,
+    /// Session has been paused by the operator; its state is saved for resume.
+    Paused,
     /// Session process has exited.
     Stopped,
 }
@@ -91,6 +93,21 @@ pub struct Session {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub project_path: Option<PathBuf>,
+    /// When the session was paused (`None` if not paused).
+    ///
+    /// Why: the operator pauses a session to step away and resume later; the
+    /// pause timestamp is shown in the dashboard and persisted to disk.
+    /// What: stamped to now on pause, cleared to `None` on resume.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = "date-time")]
+    pub paused_at: Option<SystemTime>,
+    /// A short summary captured when the session was paused.
+    ///
+    /// Why: gives the operator a "where I left off" note when resuming; either
+    /// supplied explicitly or derived from the captured pane output.
+    /// What: free-form text, cleared to `None` on resume.
+    #[serde(default)]
+    pub pause_summary: Option<String>,
 }
 
 impl Session {
@@ -114,6 +131,8 @@ impl Session {
             created_at: now,
             last_seen: now,
             project_path: None,
+            paused_at: None,
+            pause_summary: None,
         }
     }
 
@@ -169,6 +188,26 @@ mod tests {
             back.project_path,
             Some(std::path::PathBuf::from("/work/proj"))
         );
+    }
+
+    #[test]
+    fn new_has_no_pause_state_by_default() {
+        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        assert_eq!(session.paused_at, None);
+        assert_eq!(session.pause_summary, None);
+    }
+
+    #[test]
+    fn pause_state_survives_json_roundtrip() {
+        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        session.status = SessionStatus::Paused;
+        session.paused_at = Some(SystemTime::now());
+        session.pause_summary = Some("mid-task".to_string());
+        let json = serde_json::to_string(&session).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, SessionStatus::Paused);
+        assert!(back.paused_at.is_some());
+        assert_eq!(back.pause_summary.as_deref(), Some("mid-task"));
     }
 
     #[test]

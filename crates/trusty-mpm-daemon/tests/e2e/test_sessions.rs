@@ -135,7 +135,12 @@ async fn list_sessions_empty() {
         .json()
         .await
         .expect("list body");
-    assert!(listed["sessions"].as_array().expect("sessions array").is_empty());
+    assert!(
+        listed["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .is_empty()
+    );
 }
 
 /// A newly-registered session has an empty per-session event feed.
@@ -240,5 +245,8 @@ async fn reap_dead_sessions() {
         .json()
         .await
         .expect("list body");
-    assert_eq!(listed["sessions"].as_array().unwrap().len() as u64, 1 - removed);
+    assert_eq!(
+        listed["sessions"].as_array().unwrap().len() as u64,
+        1 - removed
+    );
 }

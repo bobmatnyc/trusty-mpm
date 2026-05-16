@@ -100,9 +100,7 @@ fn inheritance_chain_resolved() {
     let composed = compose_agent("engineer", src.path()).expect("compose succeeds");
 
     let base = composed.find("BASE-AGENT CONTENT").expect("base present");
-    let mid = composed
-        .find("BASE-ENGINEER CONTENT")
-        .expect("mid present");
+    let mid = composed.find("BASE-ENGINEER CONTENT").expect("mid present");
     let leaf = composed.find("ENGINEER CONTENT").expect("leaf present");
     assert!(base < mid, "base content precedes mid content");
     assert!(mid < leaf, "mid content precedes leaf content");
