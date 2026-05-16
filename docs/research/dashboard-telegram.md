@@ -1,107 +1,125 @@
 # Dashboard & Telegram
 
-Two operator interfaces sit on top of the daemon API: a local ratatui TUI and
-a remote Telegram bot. Both are pure clients — they hold no orchestration
-state and require no LLM for management operations.
+Two operator interfaces sit on top of the daemon HTTP API: a local ratatui TUI
+and a Telegram bot for remote management. Both are thin clients — all state
+lives in the daemon.
 
-## ratatui TUI dashboard
+## Multi-session dashboard (ratatui)
 
-### Goals
+The dashboard is a **superset of the claude-mpm dashboard**: the same metrics,
+but across *N* concurrent sessions instead of one.
 
-At-a-glance visibility into: active sessions, agent delegations, circuit
-breaker status, and trusty-memory/search stats.
+### Panels
 
-### Layout
+| Panel | Shows |
+|-------|-------|
+| **Sessions** | Every active session: id, workdir, status, uptime, token usage, current agent, last activity |
+| **Agents** | Per-session delegation tree: active delegations, model tier, circuit-breaker state per agent |
+| **Files** | Cross-session file monitor — files changed across every watched session workdir |
+| **Event feed** | Live stream of hook events per session (all 32 event types) |
+| **Memory** | Per-session context-window pressure as a gauge/bar (amber at warn, red at alert) |
 
-```
-┌─ trusty-mpm ───────────────────────────── daemon: ●  127.0.0.1:7880 ┐
-│ Sessions                          │ Selected Session               │
-│ ▸ a1b2  /proj/foo   active   d:2  │ id: a1b2c3d4                    │
-│   c3d4  /proj/bar   detached d:0  │ workdir: /proj/foo              │
-│   e5f6  /proj/baz   approval d:1  │ control: tmux                   │
-│                                   │ status: active                 │
-├───────────────────────────────────┤ delegations:                   │
-│ Circuit Breakers                  │  • planner   → opus    running  │
-│  context     ████████░░  82%  ok  │  • engineer  → sonnet  running  │
-│  delegation  ███░░░░░░░  30%  ok  │                                 │
-├───────────────────────────────────┼─────────────────────────────────┤
-│ trusty                            │ Event Log                       │
-│  memory  :3038  ● 1.2k nodes      │ 12:01 PreToolUse  Bash   allow  │
-│  search  :7878  ● 8 indexes       │ 12:01 delegation start planner  │
-└───────────────────────────────────┴─────────────────────────────────┘
- q quit  ↑↓ select  a approve  d deny  s stop  r refresh
-```
+### Why a superset
 
-### Widgets
-
-| Widget | Source | Update |
-|--------|--------|--------|
-| Sessions list | `Request::ListSessions` | poll 1s |
-| Session detail | selected session snapshot | on select / poll |
-| Circuit breakers | daemon breaker gauges | poll 1s |
-| trusty stats | memory/search client health | poll 5s |
-| Event log | daemon event stream (SSE) | streamed |
+claude-mpm's dashboard watches the single session you launched. trusty-mpm runs
+a daemon that may host many sessions at once (a PM session, several worktree
+sessions, scripted SDK runs). The dashboard therefore lists *all* of them, each
+with its own delegation tree and memory gauge — the operator sees the whole
+fleet on one screen.
 
 ### Implementation
 
-- `ratatui` + `crossterm` backend.
-- Single `tokio` task polls the daemon HTTP API; a `mpsc` channel feeds the
-  render loop. Keeps rendering off the network path.
-- Key handling is deterministic: `a`/`d` send `Request::ResolveApproval`,
-  `s` sends `Request::StopSession`. No LLM involved.
+- **`trusty-mpm-tui::client`** — `DaemonClient` polls the daemon HTTP API
+  (`/health`, `/sessions`, later `/events` and `/breakers`).
+- **`trusty-mpm-tui::dashboard`** — pure rendering. `DashboardState` holds the
+  polled rows; `session_rows()` builds the table rows (unit-tested without a
+  terminal); `render()` draws the ratatui frame.
+- **`main`** — terminal setup/teardown wraps `run_loop`, which polls on a timer,
+  redraws, and quits on `q` / `Esc`.
+
+Keeping HTTP and rendering in separate modules means the dashboard logic is
+testable without a daemon or a terminal.
+
+### Agent monitoring
+
+Each session row expands into its delegation tree, reconstructed from the flat
+`Delegation` list using each node's `parent` link (`DelegationId`). Every node
+shows its `ModelTier` (haiku/sonnet/opus, colour-coded) and the agent's
+`CircuitState` (closed/open/half-open) so a tripped breaker is visible at a
+glance.
+
+### File monitoring
+
+The daemon's `FileWatcher` registers one watch root per session workdir. A
+filesystem change is attributed to the session whose root is the *longest*
+matching prefix of the changed path (so nested projects resolve correctly), then
+synthesised into a `FileChanged` hook event. The dashboard's Files panel is
+therefore just another consumer of the same hook feed.
 
 ## Telegram bot
 
-### Goals
-
-Remote management from a phone: start/stop sessions, view status, and
-approve/deny permission requests when a session is blocked.
-
-### Architecture
-
-```
-Telegram ⇄ teloxide dispatcher ⇄ daemon HTTP API
-                  │
-                  └─ command handlers (deterministic)
-                  └─ summarizer (optional LLM)
-```
-
-`teloxide` long-polls (or webhooks) for updates; each command handler maps to
-one or more daemon IPC calls.
+Remote management from a phone: list sessions, check status, approve or deny a
+pending permission request, and receive alerts.
 
 ### Commands
 
-| Command | Daemon call | LLM? |
-|---------|-------------|------|
-| `/status` | `ListSessions` + breaker gauges | no (raw) / optional summary |
-| `/sessions` | `ListSessions` | no |
-| `/start <path>` | `StartSession` | no |
-| `/stop <id>` | `StopSession` | no |
-| `/approve <id>` | `ResolveApproval{approved:true}` | no |
-| `/deny <id>` | `ResolveApproval{approved:false}` | no |
-| `/report` | aggregate state | yes — LLM summary |
+`trusty-mpm-telegram::commands` parses chat text into a typed `BotCommand`:
+
+| Command | Action |
+|---------|--------|
+| `/sessions` | List all managed sessions |
+| `/status <id>` | Detailed status for one session |
+| `/approve <id>` | Approve a session's pending permission request |
+| `/deny <id>` | Deny a session's pending permission request |
+| `/help` | Command list |
+
+Parsing is pure and exhaustively unit-tested (missing argument, extra argument,
+unknown command) so the teloxide dispatch layer stays trivial.
 
 ### Permission approval flow
 
-1. A session hits a permission gate → daemon sets status
-   `AwaitingApproval` and emits an event.
-2. The Telegram bot, subscribed to the event stream, pushes a message with
-   inline buttons: **Approve** / **Deny**.
-3. Operator taps a button → callback → `Request::ResolveApproval`.
-4. Daemon unblocks the session; bot edits the message to show the outcome.
+When a session blocks on a permission request its status becomes
+`AwaitingApproval`. The bot pushes a notification; the operator replies
+`/approve <id>` or `/deny <id>`; the bot forwards the decision to the daemon,
+which resolves the request and unblocks the session. No LLM is involved — the
+flow is fully deterministic.
 
-This is fully deterministic — no model decides the verdict.
+### Alerts and event subscription
 
-## AI Commander pattern
+`trusty-mpm-telegram::alerts` decides *what* to push and *how* to format it:
 
-Management is deterministic; **summarization is optional and LLM-powered**.
+- **`AlertConfig`** — which `HookCategory` values the operator subscribed to,
+  plus a memory-alerts toggle. The `recommended()` default subscribes the
+  `Permission` and `Agent` categories and enables memory alerts.
+- **`should_alert`** — the subscription filter; checks an event's category
+  against the subscribed set. 32 raw events firing per tool call would spam the
+  chat, so the operator opts in by category.
+- **`should_memory_alert`** — only `Alert` and `Compact` pressure levels are
+  worth interrupting the operator; `Warn` stays on the dashboard.
+- **`format_memory_alert` / `format_event_alert`** — short, glanceable message
+  bodies naming the session and the event/pressure level.
 
-- All start/stop/approve/status operations are pure API calls. The system
-  works with the LLM disabled.
-- `/report` (and an optional TUI "summary" pane) sends the current aggregate
-  state to a model and asks for a concise natural-language briefing:
-  *"3 sessions active, planner delegation on /proj/foo running 4 min, context
-  breaker at 82% — consider compaction soon."*
-- The LLM is a **read-only narrator**, never a controller. It cannot start,
-  stop, or approve anything. This keeps the control plane safe and testable
-  while still giving humans a friendly status surface.
+#### Memory protection alerting
+
+When any session crosses the `alert_at` threshold (default 85%) the daemon
+classifies it `MemoryPressure::Alert`; the bot pushes a memory alert naming the
+session and the percentage. At `compact_at` (90%) the daemon auto-compacts and
+the alert reflects the `Compact` level. The TUI shows the same pressure on its
+memory gauge — both read the one `pressure()` classification from
+`trusty-mpm-core::memory`.
+
+## Deterministic control, optional summarization
+
+Both interfaces follow the "AI Commander" principle: **management is
+deterministic** (start/stop/status/approval need no LLM), and an LLM is used
+only optionally to turn the raw daemon state into a human-friendly status
+summary. The provider-agnostic chat in `trusty-common` supplies that
+summarization when enabled.
+
+## Status
+
+Implemented: the multi-session dashboard rendering and HTTP client, the Telegram
+command parser, and the alert filter/formatter — all unit-tested.
+Pending: the live ratatui agent/file/memory panels wired to `/events` and
+`/breakers`, and the teloxide runtime (long-polling dispatch + alert pusher) —
+tracked in the GitHub issues.
