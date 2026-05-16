@@ -78,4 +78,4 @@ but is operationally independent. See
 
 ## License
 
-MIT
+Licensed under the [Elastic License 2.0](LICENSE). Free for non-commercial use; commercial use requires a separate agreement.
