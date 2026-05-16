@@ -1,91 +1,136 @@
 # Session Control Models
 
-trusty-mpm must host Claude Code processes so the daemon can observe output,
-inject input, and detach/reattach. Three models were evaluated.
+trusty-mpm hosts each Claude Code session under one of three control models.
+**tmux is the primary model**; PTY and SDK are fallbacks.
 
-## Option A — tmux sessions
+## 1. tmux (primary)
 
-Spawn Claude Code inside a named tmux session; drive it with
-`tmux send-keys`, `capture-pane`, `attach`, `detach`.
+A named tmux session per Claude Code session. The daemon creates the session
+detached, sends keystrokes to launch and drive Claude Code, and captures pane
+output for the dashboard.
 
-**Pros**
-- Free detach/reattach: a human can `tmux attach -t trusty-mpm-<id>` and see
-  exactly what the daemon sees.
-- Survives daemon restarts — the session keeps running.
-- Trivial multi-session: one tmux session per Claude Code session.
-- No PTY plumbing in Rust; tmux owns the terminal.
-- Scriptable and battle-tested.
+### Why tmux first
 
-**Cons**
-- Hard dependency on the `tmux` binary.
-- Output capture is poll-based (`capture-pane`) rather than a clean stream.
-- Parsing pane text is fragile vs. structured output.
+- **Survivable** — the session outlives the daemon; a daemon restart re-attaches.
+- **Inspectable** — an operator can `tmux attach` to any session directly.
+- **Battle-tested** — `tmux send-keys` / `capture-pane` is the same mechanism
+  `ai-commander` and `open-mpm` already use to drive agent CLIs.
 
-## Option B — daemon-owned PTY
+### Patterns adopted from ai-commander and open-mpm
 
-Daemon allocates a PTY (`openpty`) and runs Claude Code as a direct child;
-crates such as `portable-pty` provide the primitives.
+The design is distilled from `ai-commander`'s `commander-tmux` crate (its
+`TmuxOrchestrator`) and `open-mpm`'s `tm` module:
 
-**Pros**
-- Clean byte stream in and out — no screen-scraping.
-- No external binary dependency.
-- Full control over resize, signals, environment.
+| Operation | tmux command | trusty-mpm |
+|-----------|--------------|------------|
+| Create named session | `new-session -d -s <name> [-c <dir>]` | `TmuxCommand::NewSession` |
+| Probe a session | `has-session -t <name>` | `TmuxCommand::HasSession` |
+| Enumerate sessions | `list-sessions -F <fmt>` | `TmuxCommand::ListSessions` |
+| Send a command line | `send-keys -t <t> -l <text>` then `send-keys -t <t> Enter` | `TmuxDriver::send_line` |
+| Capture output | `capture-pane -t <t> -p [-S -<n>]` | `TmuxCommand::CapturePane` |
+| Destroy a session | `kill-session -t <name>` | `TmuxCommand::KillSession` |
 
-**Cons**
-- Session dies if the daemon dies (no external supervisor).
-- Reattach must be reimplemented (multiplex the PTY to attaching clients).
-- More Rust surface area to get right (raw mode, escape handling).
+Two lessons carried over verbatim:
 
-## Option C — Claude Code SDK / headless mode
+1. **Literal text needs `-l`.** `send-keys` interprets bare words like `Enter`
+   or `C-c` as key names. Command text must be sent with `-l` (literal); the
+   `Enter` to submit it is sent as a *separate* non-literal `send-keys`. This is
+   exactly what `commander-tmux`'s `send_line` does, and `TmuxDriver::send_line`
+   mirrors it.
+2. **"No server running" is an empty list, not an error.** `tmux list-sessions`
+   exits non-zero when there are zero sessions; `TmuxDriver::list_sessions`
+   classifies that stderr string as `Ok(vec![])` — the same special-case
+   `commander-tmux` makes.
 
-Run Claude Code non-interactively (`claude -p` / headless / SDK), exchanging
-structured JSON instead of terminal I/O.
+### Two-layer split
 
-**Pros**
-- Structured I/O — no terminal parsing at all.
-- Best fit for deterministic automation and the Telegram bot.
-- Cleanest hook/event integration.
+- **`trusty-mpm-core::tmux`** — pure: `TmuxTarget`, `TmuxCommand`, and
+  `tmux_argv()` which renders a command to an argv vector. No process spawning,
+  so it is fully unit-testable.
+- **`trusty-mpm-daemon::tmux`** — the `TmuxDriver`: resolves the `tmux` binary
+  once (`which tmux`), executes the rendered argv, and interprets exit status.
+  Tested for binary-discovery degradation and `list-sessions` row parsing
+  without needing tmux installed; live operations are `#[ignore]` integration
+  tests.
 
-**Cons**
-- No interactive attach for a human mid-session.
-- Feature surface differs from the interactive TUI.
-- Long-running interactive flows are awkward.
+Session names are `trusty-mpm-<session-id>` so the dashboard can correlate a
+tmux session with a `SessionId`.
 
-## Comparison
+## 2. PTY (fallback)
 
-| Criterion | tmux | PTY | SDK |
-|-----------|:----:|:---:|:---:|
-| Human attach/detach | ✅ | ⚠️ (build it) | ❌ |
-| Survives daemon restart | ✅ | ❌ | ❌ |
-| Structured I/O | ❌ | ⚠️ | ✅ |
-| External dependency | tmux | none | claude CLI |
-| Implementation cost | low | high | medium |
-| Multi-session | ✅ | ✅ | ✅ |
+When tmux is not on `PATH`, the daemon owns a pseudo-terminal directly. The
+daemon checks availability at startup (`TmuxDriver::is_available`) and logs
+which model is in use. PTY mode loses survivability (the session dies with the
+daemon) but needs no external dependency.
 
-## Recommendation
+## 3. SDK / headless (non-interactive)
 
-**Primary: tmux.** It delivers detach/reattach and restart-survival for
-near-zero implementation cost — the highest-value properties for an operator
-tool. The daemon names sessions `trusty-mpm-<session-id>` and uses
-`send-keys` / `capture-pane`.
+For non-interactive runs the daemon drives Claude Code via its SDK / headless
+mode — no terminal at all. Used for scripted, one-shot delegations where the
+interactive control surface is unnecessary.
 
-**Fallback: PTY.** When `tmux` is unavailable, the daemon allocates its own
-PTY via `portable-pty`. Same `SessionManager` trait, different backend.
+## Choosing a model
 
-**Special-purpose: SDK mode.** Used for headless/automated runs and for
-Telegram-driven one-shot tasks where no human attach is needed.
+```
+tmux on PATH?
+├─ yes → tmux  (default; survivable, inspectable)
+└─ no  → interactive run needed?
+         ├─ yes → PTY  (daemon-owned pseudo-terminal)
+         └─ no  → SDK  (headless, scripted)
+```
 
-This maps directly to `ControlModel::{Tmux, Pty, Sdk}` in
-`trusty-mpm-core::session`. The `SessionManager` trait abstracts the three so
-callers are backend-agnostic.
+`ControlModel` (`Tmux` / `Pty` / `Sdk`) is recorded on every `Session` so the
+dashboard and the MCP `session_status` tool can report it.
 
-## Implementation notes
+## Memory protection
 
-- tmux backend: shell out via `tokio::process::Command`; poll `capture-pane -p`
-  on an interval and diff for new output.
-- PTY backend: `portable-pty` + a reader task feeding a broadcast channel so
-  multiple clients (TUI, Telegram) can observe one session.
-- SDK backend: `tokio::process::Command` with `--output-format stream-json`,
-  parsing line-delimited JSON.
-- All three emit the same internal `SessionEvent` stream so the hook
-  interceptor and dashboard never need to know the backend.
+A session that silently runs into its context limit loses work and produces
+degraded output. trusty-mpm tracks token usage per session and acts at
+configurable thresholds.
+
+### Thresholds
+
+`MemoryConfig` holds three fractions of the context window, validated to be
+strictly ordered and within `(0, 1]`:
+
+| Threshold | Default | Action |
+|-----------|---------|--------|
+| `warn_at` | 0.70 | Non-blocking warning; dashboard gauge turns amber |
+| `alert_at` | 0.85 | Telegram alert pushed to the operator |
+| `compact_at` | 0.90 | Daemon triggers an automatic compaction |
+
+`MemoryUsage { used_tokens, window_tokens }` is classified by
+`MemoryUsage::pressure(&config)` into `MemoryPressure::{Ok, Warn, Alert,
+Compact}` — the single source of truth shared by the daemon, the TUI gauge, and
+the Telegram alert.
+
+### How usage arrives
+
+Two paths feed `DaemonState::record_memory`:
+
+1. **`TokenUsageUpdate` hook events** relayed via `POST /hooks`.
+2. **The MCP `memory_protect` tool** — a session (or subagent) can proactively
+   report its own usage and receive the pressure classification back.
+
+### Acting on pressure
+
+- **Warn** — surfaced only on the dashboard memory gauge.
+- **Alert** — the Telegram bot pushes a memory alert (see `dashboard-telegram.md`).
+- **Compact** — the daemon snapshots important context into **trusty-memory**
+  *before* triggering compaction, so nothing is lost (see `trusty-integration.md`).
+
+### Why centralise the math
+
+Putting the threshold logic in `trusty-mpm-core::memory` means "85%" means the
+same thing everywhere — the daemon's compaction trigger, the TUI gauge, and the
+Telegram alert filter all call the same `pressure()` function. Boundary
+behaviour is unit-tested at exactly `0.70`, `0.85`, and `0.90`.
+
+## Status
+
+Implemented: the `core::tmux` command builder, the daemon's `TmuxDriver`, the
+`ControlModel` enum, and the full memory-protection model
+(`MemoryConfig`/`MemoryUsage`/`MemoryPressure`).
+Pending: the session-start command path that spawns Claude Code into a tmux
+session, PTY hosting, and the trusty-memory pre-compaction snapshot — tracked in
+the GitHub issues.
