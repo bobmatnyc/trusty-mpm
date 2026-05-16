@@ -111,6 +111,18 @@ impl FrameworkPaths {
         self.instructions.join("INSTRUCTIONS.md")
     }
 
+    /// Path of the framework launch instructions — explicit-name alias.
+    ///
+    /// Why: the instruction merge pipeline refers to this file as
+    /// `framework_instructions_path`; providing the alias keeps call sites
+    /// readable without renaming the established [`framework_instructions`]
+    /// accessor.
+    /// What: delegates to [`framework_instructions`](Self::framework_instructions).
+    /// Test: `framework_instructions_path_matches_accessor`.
+    pub fn framework_instructions_path(&self) -> PathBuf {
+        self.framework_instructions()
+    }
+
     /// Path of the user-editable instruction stub (`instructions/CLAUDE.md`).
     ///
     /// Why: the installer seeds this stub once for project-specific notes;
@@ -216,6 +228,16 @@ mod tests {
         assert_eq!(
             paths.framework_instructions(),
             PathBuf::from("/base/.trusty-mpm/framework/instructions/INSTRUCTIONS.md")
+        );
+    }
+
+    #[test]
+    fn framework_instructions_path_matches_accessor() {
+        // The explicit-name alias must resolve identically to the original.
+        let paths = FrameworkPaths::under("/base");
+        assert_eq!(
+            paths.framework_instructions_path(),
+            paths.framework_instructions()
         );
     }
 

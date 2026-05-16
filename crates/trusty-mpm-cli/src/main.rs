@@ -145,6 +145,12 @@ enum SessionAction {
         /// Session id or friendly name.
         id_or_name: String,
     },
+    /// Print the composed launch instructions a session would receive.
+    Instructions {
+        /// Project directory to compose instructions for (defaults to the cwd).
+        #[arg(long)]
+        dir: Option<String>,
+    },
 }
 
 /// Actions for the `optimizer` subcommand.
@@ -482,6 +488,25 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
                 ),
                 Err(err) => eprintln!("warning: agent deploy failed: {err}"),
             }
+
+            // Compose the effective launch instructions (framework + dynamic
+            // delegation authority + project CLAUDE.md) and stash them where
+            // the operator can inspect them. Passing `--system-prompt` to the
+            // actual CC launch command is a future integration step.
+            match compose_session_instructions(&fw, &path) {
+                Ok((output, stash)) => {
+                    if output.claude_md_created {
+                        println!("  Created CLAUDE.md stub in {}", path.display());
+                    }
+                    println!(
+                        "Instructions: {} agents in delegation authority",
+                        output.agent_count
+                    );
+                    println!("  Merged instructions written to {}", stash.display());
+                }
+                Err(err) => eprintln!("warning: instruction pipeline failed: {err}"),
+            }
+
             #[derive(Deserialize)]
             struct Body {
                 #[serde(default)]
@@ -575,8 +600,50 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
                 None => println!("session '{id_or_name}' not found"),
             }
         }
+        SessionAction::Instructions { dir } => {
+            // Pure local computation — no daemon round-trip needed.
+            let path = resolve_dir(dir)?;
+            let fw = trusty_mpm_core::paths::FrameworkPaths::default();
+            let (output, _stash) = compose_session_instructions(&fw, &path)?;
+            print!("{}", output.merged);
+        }
     }
     Ok(())
+}
+
+/// Run the instruction merge pipeline and stash the merged result on disk.
+///
+/// Why: both `session start` and `session instructions` need to compose the
+/// effective launch instructions; centralizing the pipeline call plus the
+/// inspectable-stash write keeps the two call sites consistent.
+/// What: builds a [`PipelineInput`] from `fw` and `project_dir`, runs
+/// [`build_instructions`], writes the merged text to
+/// `<project>/.trusty-mpm/last-instructions.md`, and returns the output along
+/// with the stash path.
+/// Test: covered indirectly by `cli_parses_session_instructions` and the
+/// `instruction_pipeline` unit tests in trusty-mpm-core.
+fn compose_session_instructions(
+    fw: &trusty_mpm_core::paths::FrameworkPaths,
+    project_dir: &std::path::Path,
+) -> anyhow::Result<(
+    trusty_mpm_core::instruction_pipeline::PipelineOutput,
+    std::path::PathBuf,
+)> {
+    use trusty_mpm_core::instruction_pipeline::{PipelineInput, build_instructions};
+
+    let input = PipelineInput {
+        framework_instructions_path: fw.framework_instructions_path(),
+        agents_dir: fw.claude_agents_dir(),
+        claude_md_path: project_dir.join("CLAUDE.md"),
+    };
+    let output = build_instructions(&input)?;
+
+    let stash_dir = project_dir.join(".trusty-mpm");
+    std::fs::create_dir_all(&stash_dir)?;
+    let stash = stash_dir.join("last-instructions.md");
+    std::fs::write(&stash, &output.merged)?;
+
+    Ok((output, stash))
 }
 
 /// Inspect or configure the token-use optimizer.
@@ -864,6 +931,29 @@ mod tests {
                 action: SessionAction::Info { id_or_name },
             } => assert_eq!(id_or_name, "abc-123"),
             other => panic!("expected session info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_instructions() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "instructions"]).unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Instructions { dir },
+            } => assert_eq!(dir, None),
+            other => panic!("expected session instructions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_instructions_with_dir() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "session", "instructions", "--dir", "/tmp"])
+            .unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Instructions { dir },
+            } => assert_eq!(dir.as_deref(), Some("/tmp")),
+            other => panic!("expected session instructions, got {other:?}"),
         }
     }
 
