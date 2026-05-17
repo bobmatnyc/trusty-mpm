@@ -12,6 +12,7 @@
 pub mod api;
 pub mod audit;
 pub mod discover;
+pub mod lock;
 pub mod mcp_backend;
 pub mod openapi;
 pub mod optimizer;
@@ -37,6 +38,24 @@ pub use state::DaemonState;
 /// starting" and `curl localhost:7880/health` returns `ok`.
 pub async fn run_http(state: Arc<DaemonState>, addr: SocketAddr) -> anyhow::Result<()> {
     info!("trusty-mpm daemon starting on {addr}");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_http(state, listener).await
+}
+
+/// Run the daemon's background tasks and HTTP API on an already-bound listener.
+///
+/// Why: the CLI performs auto port selection (binding an ephemeral port when
+/// the configured one is busy) and needs the daemon to serve on that exact
+/// listener; passing a pre-bound `TcpListener` lets it own the bind decision
+/// while the daemon still owns sidecar discovery, the watcher, and the reaper.
+/// What: discovers the trusty sidecars, spawns the file watcher and the
+/// dead-session reaper, then serves the axum router on `listener` until close.
+/// Test: covered indirectly by the e2e suite, which boots the daemon on a
+/// loopback port and drives it over HTTP.
+pub async fn serve_http(
+    state: Arc<DaemonState>,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
     if tmux::TmuxDriver::is_available() {
         info!("tmux control model available");
     } else {
@@ -56,15 +75,31 @@ pub async fn run_http(state: Arc<DaemonState>, addr: SocketAddr) -> anyhow::Resu
     let fw = watcher::FileWatcher::new(Arc::clone(&state));
     tokio::spawn(fw.spawn());
 
-    // Spawn the periodic dead-session reaper so registry entries for tmux
-    // sessions that have exited do not accumulate forever.
+    // Spawn the periodic dead-session reaper.
     tokio::spawn(reap_loop(Arc::clone(&state)));
 
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("daemon listening; press Ctrl-C to stop");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Spawn a background axum server for a secondary listener (e.g. Tailscale).
+///
+/// Why: the CLI binds an extra listener for Tailscale external access but does
+/// not depend on `axum`; the daemon owns the router and the `axum::serve`
+/// call, so the secondary server is spawned here on shared `DaemonState`.
+/// What: builds a router over `state` and spawns an `axum::serve` task on
+/// `listener`, logging if the server exits with an error.
+/// Test: covered indirectly — the primary listener path is exercised by the
+/// e2e suite and the secondary path reuses the same `api::router`.
+pub fn spawn_secondary_listener(state: Arc<DaemonState>, listener: tokio::net::TcpListener) {
+    let app = api::router(state);
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::warn!("secondary listener failed: {e}");
+        }
+    });
 }
 
 /// Interval between dead-session reap sweeps.

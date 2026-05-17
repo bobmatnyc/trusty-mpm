@@ -20,6 +20,7 @@ trusty-mpm-core.workspace = true
 trusty-mpm-daemon = { path = "../trusty-mpm-daemon" }
 trusty-mpm-tui = { path = "../trusty-mpm-tui" }
 trusty-mpm-telegram = { path = "../trusty-mpm-telegram" }
+trusty-mpm-gui = { path = "../trusty-mpm-gui" }
 
 tokio.workspace = true
 # Async (not blocking) reqwest: `#[tokio::main]` covers every subcommand, so the

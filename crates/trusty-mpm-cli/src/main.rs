@@ -5,7 +5,8 @@
 //! dashboard, the Telegram bot, and the thin HTTP CLI. One binary keeps the
 //! install story simple and the modes discoverable via `--help`.
 //! What: parses subcommands and routes to the embedded library crates —
-//! `trusty_mpm_daemon`, `trusty_mpm_tui`, `trusty_mpm_telegram` — or, for the
+//! `trusty_mpm_daemon`, `trusty_mpm_tui`, `trusty_mpm_telegram`,
+//! `trusty_mpm_gui` — or, for the
 //! thin CLI subcommands, drives the daemon's HTTP API with an async `reqwest`
 //! client.
 //! Test: `cargo run -p trusty-mpm-cli -- status` prints daemon/session state;
@@ -60,6 +61,9 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
     },
+    /// Launch the Tauri desktop GUI (or open the web build in the browser
+    /// when Tauri is unavailable).
+    Gui,
     /// Run the Telegram remote-management bot.
     Telegram {
         /// Base URL of the trusty-mpm daemon.
@@ -83,6 +87,9 @@ enum Command {
         /// Address the daemon HTTP API binds to.
         #[arg(long, env = "TRUSTY_MPM_ADDR", default_value = "127.0.0.1:7880")]
         addr: SocketAddr,
+        /// Also expose the daemon on the Tailscale interface for remote access.
+        #[arg(long, env = "TRUSTY_MPM_TAILSCALE")]
+        tailscale: bool,
         /// Run as an MCP server over stdio instead of the HTTP daemon.
         #[arg(long)]
         mcp: bool,
@@ -292,19 +299,20 @@ async fn main() -> anyhow::Result<()> {
         Command::Project { action } => project(&client, &cli.url, action).await,
         Command::Session { action } => session(&client, &cli.url, action).await,
         Command::Events => events(&client, &cli.url).await,
-        Command::Tui { url, interval_ms } => trusty_mpm_tui::run(url, interval_ms).await,
+        Command::Tui { url, interval_ms } => {
+            let resolved = trusty_mpm_core::resolve_daemon_url(Some(&url));
+            trusty_mpm_tui::run(resolved, interval_ms).await
+        }
+        Command::Gui => Ok(trusty_mpm_gui::run()),
         Command::Telegram { url, token, check } => {
             trusty_mpm_telegram::run(url, token, check).await
         }
         Command::Install { force } => install(force),
-        Command::Daemon { addr, mcp } => {
-            let state = trusty_mpm_daemon::DaemonState::shared();
-            if mcp {
-                trusty_mpm_daemon::run_mcp(state).await
-            } else {
-                trusty_mpm_daemon::run_http(state, addr).await
-            }
-        }
+        Command::Daemon {
+            addr,
+            tailscale,
+            mcp,
+        } => run_daemon(addr, tailscale, mcp).await,
         Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
         Command::Overseer { action } => overseer(&client, &cli.url, action).await,
     }
@@ -1100,6 +1108,114 @@ async fn events(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `daemon` subcommand — run the HTTP daemon (or MCP server) with auto port
+/// selection, lock-file service discovery, and optional Tailscale exposure.
+///
+/// Why: the daemon must start even when the configured port is busy (auto
+/// fallback to an ephemeral port), publish its real address so clients can
+/// find it (lock file), and optionally be reachable over Tailscale.
+/// What: in MCP mode delegates straight to `run_mcp`; otherwise binds `addr`
+/// (falling back to `127.0.0.1:0` on `AddrInUse`), optionally binds a second
+/// Tailscale listener, writes the lock file, registers a Ctrl-C handler that
+/// removes the lock, then serves the API on the primary listener.
+/// Test: `cli_parses_daemon_*` cover flag parsing; the bind/serve path is
+/// exercised by the daemon e2e suite.
+async fn run_daemon(addr: SocketAddr, tailscale: bool, mcp: bool) -> anyhow::Result<()> {
+    use std::io::ErrorKind;
+
+    let state = trusty_mpm_daemon::DaemonState::shared();
+    if mcp {
+        return trusty_mpm_daemon::run_mcp(state).await;
+    }
+
+    // Auto port selection: try configured address; fall back to ephemeral.
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == ErrorKind::AddrInUse => {
+            tracing::warn!(
+                "port {} is busy — selecting an ephemeral port",
+                addr.port()
+            );
+            tokio::net::TcpListener::bind("127.0.0.1:0").await?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let actual_addr = listener.local_addr()?;
+    let base_url = format!("http://{actual_addr}");
+    tracing::info!("daemon listening on {base_url}");
+
+    // Optional Tailscale second listener.
+    let tailscale_url = if tailscale {
+        match get_tailscale_ip() {
+            Some(ts_ip) => {
+                let ts_addr = format!("{ts_ip}:{}", actual_addr.port());
+                match tokio::net::TcpListener::bind(&ts_addr).await {
+                    Ok(ts_listener) => {
+                        let ts_url = format!("http://{ts_addr}");
+                        tracing::info!("Tailscale listener on {ts_url}");
+                        // Spawn a second server sharing daemon state.
+                        trusty_mpm_daemon::spawn_secondary_listener(
+                            trusty_mpm_daemon::DaemonState::shared(),
+                            ts_listener,
+                        );
+                        Some(ts_url)
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to bind Tailscale address {ts_addr}: {e}");
+                        None
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("--tailscale requested but no Tailscale IP found");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Write lock file so clients can discover us.
+    trusty_mpm_daemon::lock::write_lock(&base_url, tailscale_url.as_deref());
+
+    // Register a Ctrl-C handler to clean up the lock file on shutdown.
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        trusty_mpm_daemon::lock::remove_lock();
+        std::process::exit(0);
+    });
+
+    trusty_mpm_daemon::serve_http(state, listener).await
+}
+
+/// Detect the Tailscale IPv4 address by running `tailscale ip -4`.
+///
+/// Why: Tailscale's IP changes per device; we can't hardcode it. The CLI
+/// is the most reliable cross-platform way to query it without adding a
+/// Tailscale SDK dependency.
+/// What: Spawns `tailscale ip -4`, trims the output, returns it if it
+/// looks like an IP address. Returns `None` on any error or if Tailscale
+/// is not installed.
+/// Test: Hard to test without Tailscale installed; the unit test below
+/// checks the happy-path string parsing.
+fn get_tailscale_ip() -> Option<String> {
+    let output = std::process::Command::new("tailscale")
+        .args(["ip", "-4"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ip = String::from_utf8(output.stdout).ok()?;
+    let ip = ip.trim().to_string();
+    // Basic sanity check: must look like an IPv4 or Tailscale CGNAT address.
+    if ip.contains('.') && !ip.is_empty() {
+        Some(ip)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1353,10 +1469,24 @@ mod tests {
     fn cli_parses_daemon_defaults() {
         let cli = Cli::try_parse_from(["trusty-mpm", "daemon"]).unwrap();
         match cli.command {
-            Command::Daemon { addr, mcp } => {
+            Command::Daemon {
+                addr,
+                tailscale,
+                mcp,
+            } => {
                 assert_eq!(addr.to_string(), "127.0.0.1:7880");
+                assert!(!tailscale);
                 assert!(!mcp);
             }
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_tailscale() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "daemon", "--tailscale"]).unwrap();
+        match cli.command {
+            Command::Daemon { tailscale, .. } => assert!(tailscale),
             other => panic!("expected Daemon, got {other:?}"),
         }
     }

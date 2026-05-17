@@ -64,6 +64,7 @@ crossterm = "0.28"
 teloxide = { version = "0.13", features = ["macros"] }
 
 # Utilities
+libc = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"

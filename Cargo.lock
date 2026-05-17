@@ -5281,6 +5281,7 @@ dependencies = [
  "tracing-subscriber",
  "trusty-mpm-core",
  "trusty-mpm-daemon",
+ "trusty-mpm-gui",
  "trusty-mpm-telegram",
  "trusty-mpm-tui",
 ]
@@ -5293,6 +5294,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "gray_matter",
+ "libc",
  "serde",
  "serde_json",
  "serde_yaml",

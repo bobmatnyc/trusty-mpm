@@ -19,6 +19,7 @@ pub mod bundle;
 pub mod circuit;
 pub mod compress;
 pub mod delegation_authority;
+pub mod discovery;
 pub mod deterministic_overseer;
 pub mod error;
 pub mod hook;
@@ -35,4 +36,5 @@ pub mod session;
 pub mod session_store;
 pub mod tmux;
 
+pub use discovery::{DEFAULT_DAEMON_URL, lock_file_path, resolve_daemon_url};
 pub use error::{Error, Result};
