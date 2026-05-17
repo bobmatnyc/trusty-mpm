@@ -33,6 +33,14 @@ pub struct SessionRow {
     /// Number of active delegations.
     #[serde(default)]
     pub active_delegations: u32,
+    /// Friendly tmux session name (`tmpm-<adjective>-<noun>`).
+    ///
+    /// Why: session action endpoints (pause/resume/stop/output) resolve their
+    /// `{id}` path segment against this friendly name; the dashboard uses it as
+    /// the action target rather than the raw UUID.
+    /// Test: `session_row_deserializes_tmux_name`.
+    #[serde(default)]
+    pub tmux_name: String,
 }
 
 /// One hook-event row as returned by `GET /events`.
@@ -152,6 +160,77 @@ impl DaemonClient {
         let url = format!("{}/health", self.base);
         matches!(self.http.get(&url).send().await, Ok(r) if r.status().is_success())
     }
+
+    /// Pause a session via `POST /sessions/{id}/pause`.
+    ///
+    /// Why: the dashboard's `p` key pauses the selected session in place.
+    /// What: POSTs `{"summary": null}`, lets the daemon derive the summary, and
+    /// returns the `summary` field from the 200 response.
+    /// Test: `client_pause_constructs_url` covers construction; live HTTP is
+    /// covered by the daemon's session-lifecycle tests.
+    pub async fn pause_session(&self, id: &str) -> anyhow::Result<String> {
+        let url = format!("{}/sessions/{id}/pause", self.base);
+        let body: serde_json::Value = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "summary": serde_json::Value::Null }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// Resume a session via `POST /sessions/{id}/resume`.
+    ///
+    /// Why: the dashboard's `r` key resumes the selected paused session.
+    /// What: POSTs to the resume endpoint and discards the response body.
+    /// Test: live HTTP is covered by the daemon's session-lifecycle tests.
+    pub async fn resume_session(&self, id: &str) -> anyhow::Result<()> {
+        let url = format!("{}/sessions/{id}/resume", self.base);
+        self.http.post(&url).send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    /// Stop a session via `DELETE /sessions/{id}`.
+    ///
+    /// Why: the dashboard's `x` key stops the selected session.
+    /// What: sends a DELETE to the session endpoint and discards the body.
+    /// Test: live HTTP is covered by the daemon's session-lifecycle tests.
+    pub async fn stop_session(&self, id: &str) -> anyhow::Result<()> {
+        let url = format!("{}/sessions/{id}", self.base);
+        self.http.delete(&url).send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    /// Capture recent session output via `GET /sessions/{id}/output`.
+    ///
+    /// Why: the dashboard's `o` key snapshots the selected session's pane.
+    /// What: `GET /sessions/{id}/output?lines={lines}`, returns the `output`
+    /// field from the 200 response.
+    /// Test: live HTTP is covered by the daemon's session-lifecycle tests.
+    pub async fn session_output(&self, id: &str, lines: u32) -> anyhow::Result<String> {
+        let url = format!("{}/sessions/{id}/output", self.base);
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .query(&[("lines", lines.to_string())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +241,43 @@ mod tests {
     fn client_constructs_with_base_url() {
         // Construction must not panic for a well-formed URL.
         let _client = DaemonClient::new("http://127.0.0.1:7880");
+    }
+
+    #[test]
+    fn client_pause_constructs_url() {
+        // Constructing a client for the pause path must not panic; same pattern
+        // as `client_constructs_with_base_url` — exercises the builder, not HTTP.
+        let _client = DaemonClient::new("http://127.0.0.1:7880");
+        // The action methods are async and need a live daemon; here we only
+        // assert the client is usable as their receiver.
+        let client = DaemonClient::new("http://127.0.0.1:7880");
+        assert_eq!(client.base, "http://127.0.0.1:7880");
+    }
+
+    #[test]
+    fn session_row_deserializes_tmux_name() {
+        // `GET /sessions` returns the full `Session`, including `tmux_name`.
+        let json = serde_json::json!({
+            "id": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "workdir": "/tmp/proj",
+            "status": "active",
+            "active_delegations": 1,
+            "tmux_name": "tmpm-quiet-falcon"
+        });
+        let row: SessionRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.tmux_name, "tmpm-quiet-falcon");
+    }
+
+    #[test]
+    fn session_row_defaults_tmux_name_when_absent() {
+        // An older daemon may omit `tmux_name`; it must default to empty.
+        let json = serde_json::json!({
+            "id": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "workdir": "/tmp/proj",
+            "status": "active"
+        });
+        let row: SessionRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.tmux_name, "");
     }
 
     #[test]
