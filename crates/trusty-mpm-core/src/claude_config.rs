@@ -11,6 +11,7 @@
 //! Test: `cargo test -p trusty-mpm-core claude_config` covers path resolution
 //! and the recommendation JSON round-trip.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,131 @@ pub struct ConfigRecommendation {
     pub auto_applicable: bool,
 }
 
+/// A named checkpoint of all Claude Code config files at a moment in time.
+///
+/// Why: every mutating operation (`apply`, `deploy`) must be reversible; a
+/// checkpoint captures the full pre-change config so the operator can undo a
+/// change with a single restore call.
+/// What: a stable `id`, an RFC3339 `created_at`, the `project` root, an optional
+/// human `label`, and a map of relative-path → file content for every config
+/// file that existed (absent files are simply not present in the map).
+/// Test: `config_checkpoint_json_roundtrip`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigCheckpoint {
+    /// Stable identifier, e.g. `checkpoint-20260517-153000-a1b2`.
+    pub id: String,
+    /// RFC3339 timestamp the checkpoint was created at.
+    pub created_at: String,
+    /// Project root at snapshot time.
+    pub project: PathBuf,
+    /// Optional human label, e.g. `before-apply-add-trusty-hooks`.
+    pub label: Option<String>,
+    /// Relative path → file content. An absent file is not present in the map.
+    pub files: HashMap<String, String>,
+}
+
+/// Where checkpoints are stored for a project.
+///
+/// Why: checkpoints live in a fixed, project-local location so listing and
+/// restoring need no extra configuration; isolating the path layout as a unit
+/// type keeps it testable without filesystem access.
+/// What: [`dir`](CheckpointPaths::dir) yields `<project>/.trusty-mpm/checkpoints`
+/// and [`for_id`](CheckpointPaths::for_id) the JSON file for one checkpoint id.
+/// Test: `checkpoint_paths_resolve`.
+pub struct CheckpointPaths;
+
+impl CheckpointPaths {
+    /// The directory holding every checkpoint JSON file for `project`.
+    ///
+    /// Why: the checkpointer creates, lists, and deletes files here.
+    /// What: returns `<project>/.trusty-mpm/checkpoints`.
+    /// Test: `checkpoint_paths_resolve`.
+    pub fn dir(project: &Path) -> PathBuf {
+        project.join(".trusty-mpm").join("checkpoints")
+    }
+
+    /// The JSON file path for one checkpoint `id` under `project`.
+    ///
+    /// Why: each checkpoint is a single self-contained JSON document.
+    /// What: returns `<project>/.trusty-mpm/checkpoints/<id>.json`.
+    /// Test: `checkpoint_paths_resolve`.
+    pub fn for_id(project: &Path, id: &str) -> PathBuf {
+        Self::dir(project).join(format!("{id}.json"))
+    }
+}
+
+/// Which Claude Code settings scope a [`DeploymentProfile`] writes to.
+///
+/// Why: a profile may belong at the user level (every project), the project
+/// level (this repo only), or both; the deployer needs to know which files to
+/// touch.
+/// What: `User`, `Project`, or `Both`.
+/// Test: `deploy_target_json_roundtrip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployTarget {
+    /// Write to `~/.claude/settings.json`.
+    User,
+    /// Write to `<project>/.claude/settings.json`.
+    Project,
+    /// Write to both user- and project-level settings.
+    Both,
+}
+
+/// The hook commands a [`DeploymentProfile`] installs.
+///
+/// Why: oversight profiles wire Claude Code hook events to commands (typically a
+/// `curl` POST to the daemon); grouping them keeps the profile model flat.
+/// What: lists of command strings for `PreToolUse`, `PostToolUse`, and `Stop`.
+/// Test: `hook_config_json_roundtrip`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookConfig {
+    /// Commands run on the `PreToolUse` hook event.
+    pub pre_tool_use: Vec<String>,
+    /// Commands run on the `PostToolUse` hook event.
+    pub post_tool_use: Vec<String>,
+    /// Commands run on the `Stop` hook event.
+    pub stop: Vec<String>,
+}
+
+/// The permission allow/deny lists a [`DeploymentProfile`] installs.
+///
+/// Why: profiles set the tools Claude Code may (or must not) use; a flat pair of
+/// lists mirrors the Claude Code `permissions` block.
+/// What: an `allow` list and a `deny` list of tool matcher strings.
+/// Test: `permission_config_json_roundtrip`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionConfig {
+    /// Tool matchers Claude Code is permitted to use.
+    pub allow: Vec<String>,
+    /// Tool matchers Claude Code must not use.
+    pub deny: Vec<String>,
+}
+
+/// A named, reusable set of Claude Code configuration values.
+///
+/// Why: operators want one-click configuration presets (full oversight, a
+/// read-only review mode, a clean slate) rather than hand-editing JSON; a
+/// profile bundles hooks, permissions, and env vars under a name.
+/// What: a `name`, a `description`, a [`DeployTarget`], optional [`HookConfig`]
+/// and [`PermissionConfig`], and a map of environment variables.
+/// Test: `deployment_profile_json_roundtrip`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentProfile {
+    /// Profile name, e.g. `trusty-mpm-oversight`.
+    pub name: String,
+    /// Human-readable description of what the profile does.
+    pub description: String,
+    /// Which settings scope the profile writes to.
+    pub target: DeployTarget,
+    /// Hook commands to install, or `None` to leave hooks untouched.
+    pub hooks: Option<HookConfig>,
+    /// Permission lists to install, or `None` to leave permissions untouched.
+    pub permissions: Option<PermissionConfig>,
+    /// Environment variables to merge into the `env` block.
+    pub env_vars: HashMap<String, String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +321,93 @@ mod tests {
         let json = serde_json::to_string(&rec).unwrap();
         let back: ConfigRecommendation = serde_json::from_str(&json).unwrap();
         assert_eq!(back, rec);
+    }
+
+    #[test]
+    fn checkpoint_paths_resolve() {
+        let project = Path::new("/work/demo");
+        assert!(
+            CheckpointPaths::dir(project).ends_with(".trusty-mpm/checkpoints"),
+            "checkpoint dir is project-local"
+        );
+        assert!(
+            CheckpointPaths::for_id(project, "checkpoint-x")
+                .ends_with(".trusty-mpm/checkpoints/checkpoint-x.json"),
+            "checkpoint file is <id>.json"
+        );
+    }
+
+    #[test]
+    fn config_checkpoint_json_roundtrip() {
+        let mut files = HashMap::new();
+        files.insert(".claude/settings.json".to_string(), "{}".to_string());
+        let cp = ConfigCheckpoint {
+            id: "checkpoint-20260517-153000-a1b2".into(),
+            created_at: "2026-05-17T15:30:00+00:00".into(),
+            project: PathBuf::from("/work/demo"),
+            label: Some("before-apply".into()),
+            files,
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        let back: ConfigCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cp);
+    }
+
+    #[test]
+    fn deploy_target_json_roundtrip() {
+        for target in [
+            DeployTarget::User,
+            DeployTarget::Project,
+            DeployTarget::Both,
+        ] {
+            let json = serde_json::to_string(&target).unwrap();
+            let back: DeployTarget = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, target);
+        }
+        // Wire form is lowercase.
+        assert_eq!(
+            serde_json::to_string(&DeployTarget::Project).unwrap(),
+            "\"project\""
+        );
+    }
+
+    #[test]
+    fn hook_config_json_roundtrip() {
+        let hooks = HookConfig {
+            pre_tool_use: vec!["curl pre".into()],
+            post_tool_use: vec!["curl post".into()],
+            stop: vec![],
+        };
+        let json = serde_json::to_string(&hooks).unwrap();
+        let back: HookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, hooks);
+    }
+
+    #[test]
+    fn permission_config_json_roundtrip() {
+        let perms = PermissionConfig {
+            allow: vec!["Read".into(), "Glob".into()],
+            deny: vec!["Bash".into()],
+        };
+        let json = serde_json::to_string(&perms).unwrap();
+        let back: PermissionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, perms);
+    }
+
+    #[test]
+    fn deployment_profile_json_roundtrip() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("OPENROUTER_API_KEY".to_string(), "sk-x".to_string());
+        let profile = DeploymentProfile {
+            name: "trusty-mpm-oversight".into(),
+            description: "Full oversight".into(),
+            target: DeployTarget::Both,
+            hooks: Some(HookConfig::default()),
+            permissions: Some(PermissionConfig::default()),
+            env_vars,
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: DeploymentProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, profile);
     }
 }

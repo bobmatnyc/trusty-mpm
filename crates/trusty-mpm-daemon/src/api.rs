@@ -64,6 +64,17 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/claude-config", get(get_claude_config))
         .route("/claude-config/apply", post(apply_claude_config))
         .route("/claude-config/restart", post(restart_claude_code))
+        .route(
+            "/claude-config/checkpoints",
+            get(list_checkpoints).post(create_checkpoint),
+        )
+        .route(
+            "/claude-config/checkpoints/{id}",
+            axum::routing::delete(delete_checkpoint),
+        )
+        .route("/claude-config/restore", post(restore_checkpoint))
+        .route("/claude-config/profiles", get(list_profiles))
+        .route("/claude-config/deploy", post(deploy_profile))
         .merge(
             SwaggerUi::new("/api-docs")
                 .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
@@ -1071,7 +1082,9 @@ pub struct ApplyConfigRequest {
 ///
 /// Why: lets an operator act on a recommendation without hand-editing JSON.
 /// What: re-analyzes the project, finds the recommendation by id, and applies
-/// it via `ClaudeConfigAnalyzer::apply_recommendation`. An unknown id is `404`.
+/// it via `ClaudeConfigAnalyzer::apply_recommendation`, which checkpoints the
+/// config first. Returns `{ applied: true, checkpoint_id }` so the caller can
+/// undo. An unknown id is `404`.
 /// Test: `apply_claude_config_unknown_rec_is_404`.
 #[utoipa::path(
     post,
@@ -1079,7 +1092,7 @@ pub struct ApplyConfigRequest {
     tag = "claude-config",
     request_body = ApplyConfigRequest,
     responses(
-        (status = 200, description = "Recommendation applied"),
+        (status = 200, description = "Recommendation applied; returns checkpoint id"),
         (status = 404, description = "No recommendation with that id"),
         (status = 500, description = "Applying the recommendation failed"),
     )
@@ -1096,13 +1109,262 @@ pub async fn apply_claude_config(
         .iter()
         .find(|r| r.id == body.recommendation_id)
         .ok_or(StatusCode::NOT_FOUND)?;
-    crate::claude_config::ClaudeConfigAnalyzer::apply_recommendation(rec, &paths).map_err(|e| {
+    let checkpoint_id = crate::claude_config::ClaudeConfigAnalyzer::apply_recommendation(
+        rec,
+        &paths,
+        &body.project,
+    )
+    .map_err(|e| {
         tracing::warn!("applying recommendation {} failed: {e}", rec.id);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(
-        serde_json::json!({ "applied": body.recommendation_id }),
-    ))
+    Ok(Json(serde_json::json!({
+        "applied": true,
+        "recommendation_id": body.recommendation_id,
+        "checkpoint_id": checkpoint_id,
+    })))
+}
+
+// ---- checkpoints & deployment profiles ----------------------------------
+
+/// Query parameters for the checkpoint list / delete endpoints.
+///
+/// Why: checkpoints are project-scoped; the project path identifies which
+/// `.trusty-mpm/checkpoints` directory to operate on.
+/// What: the project directory.
+/// Test: `list_checkpoints_returns_array`.
+#[derive(serde::Deserialize)]
+pub struct CheckpointQuery {
+    /// Project directory whose checkpoints to operate on.
+    pub project: PathBuf,
+}
+
+/// `GET /claude-config/checkpoints?project=<path>` — list config checkpoints.
+///
+/// Why: the dashboard offers a restore picker; this feeds it.
+/// What: returns `{ checkpoints: [ConfigCheckpoint, ...] }`, newest first.
+/// Test: `list_checkpoints_returns_array`.
+#[utoipa::path(
+    get,
+    path = "/claude-config/checkpoints",
+    tag = "claude-config",
+    params(("project" = String, Query, description = "Project directory")),
+    responses((status = 200, description = "Config checkpoints, newest first"))
+)]
+pub async fn list_checkpoints(
+    State(_state): State<Arc<DaemonState>>,
+    Query(query): Query<CheckpointQuery>,
+) -> Json<serde_json::Value> {
+    let checkpoints = crate::claude_config::ConfigCheckpointer::list(&query.project)
+        .unwrap_or_else(|e| {
+            tracing::warn!("listing checkpoints failed: {e}");
+            Vec::new()
+        });
+    Json(serde_json::json!({ "checkpoints": checkpoints }))
+}
+
+/// JSON body for `POST /claude-config/checkpoints`.
+///
+/// Why: creating a checkpoint needs the project and an optional human label.
+/// What: the project directory and an optional label.
+/// Test: `create_checkpoint_returns_id`.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct CreateCheckpointRequest {
+    /// Project directory to checkpoint.
+    #[schema(value_type = String)]
+    pub project: PathBuf,
+    /// Optional human-readable label for the checkpoint.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// `POST /claude-config/checkpoints` — create a config checkpoint.
+///
+/// Why: lets the operator take a manual backup before a risky change.
+/// What: snapshots the project's config and returns `{ id }`.
+/// Test: `create_checkpoint_returns_id`.
+#[utoipa::path(
+    post,
+    path = "/claude-config/checkpoints",
+    tag = "claude-config",
+    request_body = CreateCheckpointRequest,
+    responses(
+        (status = 200, description = "Checkpoint created; returns its id"),
+        (status = 500, description = "Creating the checkpoint failed"),
+    )
+)]
+pub async fn create_checkpoint(
+    State(_state): State<Arc<DaemonState>>,
+    Json(body): Json<CreateCheckpointRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use trusty_mpm_core::claude_config::ClaudeConfigReader;
+    let paths = ClaudeConfigReader::paths_for_project(&body.project);
+    let id = crate::claude_config::ConfigCheckpointer::create(
+        &paths,
+        &body.project,
+        body.label.as_deref(),
+    )
+    .map_err(|e| {
+        tracing::warn!("creating checkpoint failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+/// JSON body for `POST /claude-config/restore`.
+///
+/// Why: restoring needs the project and the checkpoint id to revert to.
+/// What: the project directory and the checkpoint id.
+/// Test: `restore_unknown_checkpoint_is_500`.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct RestoreRequest {
+    /// Project directory whose config to restore.
+    #[schema(value_type = String)]
+    pub project: PathBuf,
+    /// Id of the checkpoint to restore.
+    pub checkpoint_id: String,
+}
+
+/// `POST /claude-config/restore` — restore config from a checkpoint.
+///
+/// Why: the undo half of the safety model.
+/// What: rewrites the project's config files to the checkpoint's state. A
+/// missing or malformed checkpoint surfaces as `500`.
+/// Test: `restore_unknown_checkpoint_is_500`.
+#[utoipa::path(
+    post,
+    path = "/claude-config/restore",
+    tag = "claude-config",
+    request_body = RestoreRequest,
+    responses(
+        (status = 200, description = "Config restored from the checkpoint"),
+        (status = 500, description = "Checkpoint missing or restore failed"),
+    )
+)]
+pub async fn restore_checkpoint(
+    State(_state): State<Arc<DaemonState>>,
+    Json(body): Json<RestoreRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    crate::claude_config::ConfigCheckpointer::restore(&body.project, &body.checkpoint_id).map_err(
+        |e| {
+            tracing::warn!("restoring checkpoint {} failed: {e}", body.checkpoint_id);
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+    )?;
+    Ok(Json(serde_json::json!({
+        "restored": true,
+        "checkpoint_id": body.checkpoint_id,
+    })))
+}
+
+/// `DELETE /claude-config/checkpoints/{id}?project=<path>` — delete a checkpoint.
+///
+/// Why: checkpoints accumulate; the operator prunes them here.
+/// What: removes the checkpoint file. A missing checkpoint surfaces as `404`.
+/// Test: `delete_unknown_checkpoint_is_404`.
+#[utoipa::path(
+    delete,
+    path = "/claude-config/checkpoints/{id}",
+    tag = "claude-config",
+    params(
+        ("id" = String, Path, description = "Checkpoint id"),
+        ("project" = String, Query, description = "Project directory"),
+    ),
+    responses(
+        (status = 200, description = "Checkpoint deleted"),
+        (status = 404, description = "No checkpoint with that id"),
+    )
+)]
+pub async fn delete_checkpoint(
+    State(_state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Query(query): Query<CheckpointQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    crate::claude_config::ConfigCheckpointer::delete(&query.project, &id).map_err(|e| {
+        tracing::warn!("deleting checkpoint {id} failed: {e}");
+        StatusCode::NOT_FOUND
+    })?;
+    Ok(Json(serde_json::json!({ "deleted": id })))
+}
+
+/// `GET /claude-config/profiles` — list the built-in deployment profiles.
+///
+/// Why: the dashboard shows the available configuration presets.
+/// What: returns `{ profiles: [DeploymentProfile, ...] }`.
+/// Test: `list_profiles_returns_builtins`.
+#[utoipa::path(
+    get,
+    path = "/claude-config/profiles",
+    tag = "claude-config",
+    responses((status = 200, description = "Built-in deployment profiles"))
+)]
+pub async fn list_profiles(State(_state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    let profiles = crate::claude_config::ProfileDeployer::builtin_profiles();
+    Json(serde_json::json!({ "profiles": profiles }))
+}
+
+/// JSON body for `POST /claude-config/deploy`.
+///
+/// Why: deploying a profile needs the project, the profile name, and an
+/// optional target override.
+/// What: the project directory, the profile name, and an optional deploy
+/// target (`user`, `project`, `both`) overriding the profile's default.
+/// Test: `deploy_profile_returns_checkpoint_id`.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct DeployProfileRequest {
+    /// Project directory to deploy the profile onto.
+    #[schema(value_type = String)]
+    pub project: PathBuf,
+    /// Name of the built-in profile to deploy.
+    pub profile_name: String,
+    /// Optional deploy-target override (`user`, `project`, `both`).
+    #[serde(default)]
+    pub target: Option<trusty_mpm_core::claude_config::DeployTarget>,
+}
+
+/// `POST /claude-config/deploy` — deploy a built-in profile onto a project.
+///
+/// Why: lets the operator apply a configuration preset in one click; the deploy
+/// checkpoints the config first so it is reversible.
+/// What: looks up the named built-in profile (applying an optional `target`
+/// override), deploys it, and returns `{ checkpoint_id }`. An unknown profile
+/// name is `404`.
+/// Test: `deploy_profile_returns_checkpoint_id`, `deploy_unknown_profile_is_404`.
+#[utoipa::path(
+    post,
+    path = "/claude-config/deploy",
+    tag = "claude-config",
+    request_body = DeployProfileRequest,
+    responses(
+        (status = 200, description = "Profile deployed; returns checkpoint id"),
+        (status = 404, description = "No built-in profile with that name"),
+        (status = 500, description = "Deploying the profile failed"),
+    )
+)]
+pub async fn deploy_profile(
+    State(_state): State<Arc<DaemonState>>,
+    Json(body): Json<DeployProfileRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use trusty_mpm_core::claude_config::ClaudeConfigReader;
+    let mut profile = crate::claude_config::ProfileDeployer::builtin_profiles()
+        .into_iter()
+        .find(|p| p.name == body.profile_name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if let Some(target) = body.target {
+        profile.target = target;
+    }
+    let paths = ClaudeConfigReader::paths_for_project(&body.project);
+    let checkpoint_id =
+        crate::claude_config::ProfileDeployer::deploy(&profile, &paths, &body.project).map_err(
+            |e| {
+                tracing::warn!("deploying profile {} failed: {e}", body.profile_name);
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+        )?;
+    Ok(Json(serde_json::json!({
+        "deployed": body.profile_name,
+        "checkpoint_id": checkpoint_id,
+    })))
 }
 
 /// JSON body for `POST /claude-config/restart`.
@@ -1768,6 +2030,127 @@ mod tests {
         .await;
         assert!(body["config"].is_object());
         assert!(body["recommendations"].is_array());
+    }
+
+    #[tokio::test]
+    async fn list_checkpoints_returns_array() {
+        // `GET /claude-config/checkpoints` returns a well-formed array even for
+        // a project with no checkpoints yet.
+        let dir = tempfile::tempdir().unwrap();
+        let state = DaemonState::shared();
+        let Json(body) = list_checkpoints(
+            State(state),
+            Query(CheckpointQuery {
+                project: dir.path().to_path_buf(),
+            }),
+        )
+        .await;
+        assert!(body["checkpoints"].is_array());
+    }
+
+    #[tokio::test]
+    async fn create_checkpoint_returns_id() {
+        // `POST /claude-config/checkpoints` returns an `id` and the checkpoint
+        // is then visible via the list endpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let state = DaemonState::shared();
+        let Json(body) = create_checkpoint(
+            State(Arc::clone(&state)),
+            Json(CreateCheckpointRequest {
+                project: dir.path().to_path_buf(),
+                label: Some("manual".into()),
+            }),
+        )
+        .await
+        .expect("create succeeds");
+        assert!(body["id"].as_str().is_some());
+
+        let Json(listed) = list_checkpoints(
+            State(state),
+            Query(CheckpointQuery {
+                project: dir.path().to_path_buf(),
+            }),
+        )
+        .await;
+        assert_eq!(listed["checkpoints"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_unknown_checkpoint_is_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = DaemonState::shared();
+        let err = restore_checkpoint(
+            State(state),
+            Json(RestoreRequest {
+                project: dir.path().to_path_buf(),
+                checkpoint_id: "no-such-checkpoint".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_checkpoint_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = DaemonState::shared();
+        let err = delete_checkpoint(
+            State(state),
+            Path("no-such-checkpoint".into()),
+            Query(CheckpointQuery {
+                project: dir.path().to_path_buf(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_profiles_returns_builtins() {
+        // `GET /claude-config/profiles` lists the three built-in profiles.
+        let state = DaemonState::shared();
+        let Json(body) = list_profiles(State(state)).await;
+        let profiles = body["profiles"].as_array().expect("profiles array");
+        assert_eq!(profiles.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn deploy_profile_returns_checkpoint_id() {
+        // `POST /claude-config/deploy` deploys a built-in profile and returns a
+        // checkpoint id for undo.
+        let dir = tempfile::tempdir().unwrap();
+        let state = DaemonState::shared();
+        let Json(body) = deploy_profile(
+            State(state),
+            Json(DeployProfileRequest {
+                project: dir.path().to_path_buf(),
+                profile_name: "minimal".into(),
+                target: None,
+            }),
+        )
+        .await
+        .expect("deploy succeeds");
+        assert_eq!(body["deployed"], "minimal");
+        assert!(body["checkpoint_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn deploy_unknown_profile_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = DaemonState::shared();
+        let err = deploy_profile(
+            State(state),
+            Json(DeployProfileRequest {
+                project: dir.path().to_path_buf(),
+                profile_name: "no-such-profile".into(),
+                target: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

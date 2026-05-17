@@ -52,6 +52,12 @@ use utoipa::OpenApi;
         crate::api::get_claude_config,
         crate::api::apply_claude_config,
         crate::api::restart_claude_code,
+        crate::api::list_checkpoints,
+        crate::api::create_checkpoint,
+        crate::api::restore_checkpoint,
+        crate::api::delete_checkpoint,
+        crate::api::list_profiles,
+        crate::api::deploy_profile,
     ),
     components(schemas(
         trusty_mpm_core::session::Session,
@@ -71,6 +77,9 @@ use utoipa::OpenApi;
         crate::api::AdoptRequest,
         crate::api::ApplyConfigRequest,
         crate::api::RestartRequest,
+        crate::api::CreateCheckpointRequest,
+        crate::api::RestoreRequest,
+        crate::api::DeployProfileRequest,
     )),
     tags(
         (name = "sessions", description = "Session lifecycle management"),
