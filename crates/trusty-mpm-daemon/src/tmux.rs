@@ -19,6 +19,7 @@
 
 use std::process::Command;
 
+use trusty_mpm_core::external_session::ExternalSession;
 use trusty_mpm_core::tmux::{TmuxCommand, TmuxTarget, tmux_argv};
 use trusty_mpm_core::{Error, Result};
 
@@ -187,6 +188,21 @@ impl TmuxDriver {
         Ok(())
     }
 
+    /// Send a Ctrl-C interrupt to a session/pane.
+    ///
+    /// Why: restarting Claude Code in place means interrupting the running
+    /// process before relaunching it; `C-c` is the clean stop.
+    /// What: one `send-keys` invocation with the `C-c` key name (non-literal).
+    /// Test: `core::tmux::send_keys_keyname_argv` covers the argv shape.
+    pub fn send_interrupt(&self, target: &TmuxTarget) -> Result<()> {
+        self.run(&TmuxCommand::SendKeys {
+            target: target.clone(),
+            keys: "C-c".to_string(),
+            literal: false,
+        })?;
+        Ok(())
+    }
+
     /// Capture the last `lines` of a pane's output (whole scrollback if `None`).
     pub fn capture(&self, target: &TmuxTarget, lines: Option<u32>) -> Result<String> {
         self.run(&TmuxCommand::CapturePane {
@@ -194,6 +210,143 @@ impl TmuxDriver {
             lines,
         })
     }
+
+    /// List every tmux session, tagged with its [`SessionOrigin`].
+    ///
+    /// Why: the universal-session dashboard manages *all* tmux sessions, not
+    /// just the ones trusty-mpm created; each row must carry its origin so the
+    /// UI can offer to adopt external sessions.
+    /// What: runs `list-sessions` (same as [`list_sessions`](Self::list_sessions))
+    /// and maps each row into an origin-classified [`ExternalSession`]. An empty
+    /// tmux server yields an empty `Vec`.
+    /// Test: classification covered by `core::external_session` tests; the
+    /// listing path is exercised by the `#[ignore]` integration test.
+    pub fn list_all_sessions(&self) -> Result<Vec<ExternalSession>> {
+        Ok(self
+            .list_sessions()?
+            .into_iter()
+            .map(|s| ExternalSession::new(s.name, s.attached, s.created))
+            .collect())
+    }
+
+    /// Capture the current state of any session for monitoring.
+    ///
+    /// Why: trusty-mpm oversees external sessions read-only; the daemon must be
+    /// able to snapshot a session's windows, panes, and recent output without
+    /// modifying it.
+    /// What: runs `list-windows` / `list-panes` / `capture-pane` against `name`
+    /// and bundles the results into a [`SessionSnapshot`]. tmux being absent or
+    /// the session not existing surfaces as an `Err`.
+    /// Test: `#[ignore]` integration test `monitor_session_snapshots_state`.
+    pub fn monitor_session(&self, name: &str, lines: u32) -> Result<SessionSnapshot> {
+        let windows = self.list_windows(name)?;
+        let panes = self.list_panes(name)?;
+        let output = self.capture(&TmuxTarget::session(name), Some(lines))?;
+        Ok(SessionSnapshot {
+            name: name.to_string(),
+            windows,
+            panes,
+            output,
+            captured_at: chrono::Utc::now().timestamp(),
+        })
+    }
+
+    /// Register an external session for oversight without modifying it.
+    ///
+    /// Why: before trusty-mpm watches an externally-created session it records
+    /// the session's current shape; adoption is explicitly *non-destructive* —
+    /// it never kills, renames, or sends keys to the session.
+    /// What: probes the session exists, captures its window/pane lists, and
+    /// returns an [`AdoptedSession`] describing it. An unknown session is an
+    /// `Err`.
+    /// Test: `#[ignore]` integration test `adopt_session_captures_state`.
+    pub fn adopt_session(&self, name: &str) -> Result<AdoptedSession> {
+        let windows = self.list_windows(name)?;
+        let panes = self.list_panes(name)?;
+        let origin = trusty_mpm_core::external_session::SessionOrigin::classify(name);
+        Ok(AdoptedSession {
+            name: name.to_string(),
+            origin,
+            windows,
+            panes,
+            adopted_at: chrono::Utc::now().timestamp(),
+        })
+    }
+
+    /// List the window `index:name` rows for a session.
+    ///
+    /// Why: snapshot and adoption both need a session's window list.
+    /// What: runs `list-windows -F` and returns each row verbatim.
+    /// Test: argv shape covered by `core::tmux::list_windows_argv`.
+    fn list_windows(&self, name: &str) -> Result<Vec<String>> {
+        let raw = self.run(&TmuxCommand::ListWindows {
+            name: name.to_string(),
+        })?;
+        Ok(raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect())
+    }
+
+    /// List the pane `id:active` rows for a session.
+    ///
+    /// Why: snapshot and adoption both need a session's pane list.
+    /// What: runs `list-panes -F` and returns each row verbatim.
+    /// Test: argv shape covered by `core::tmux::list_panes_argv`.
+    fn list_panes(&self, name: &str) -> Result<Vec<String>> {
+        let raw = self.run(&TmuxCommand::ListPanes {
+            name: name.to_string(),
+        })?;
+        Ok(raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect())
+    }
+}
+
+/// A non-destructive registration of an external tmux session.
+///
+/// Why: `POST /tmux/adopt` brings a pre-existing session under trusty-mpm
+/// oversight; the response documents what was adopted without implying any
+/// modification was made.
+/// What: the session name, its classified origin, the window/pane lists at
+/// adoption time, and the adoption epoch.
+/// Test: `adopt_session_captures_state` (integration, `#[ignore]`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AdoptedSession {
+    /// tmux session name.
+    pub name: String,
+    /// Whether the session is a trusty-mpm session or external.
+    pub origin: trusty_mpm_core::external_session::SessionOrigin,
+    /// Window `index:name` rows captured at adoption time.
+    pub windows: Vec<String>,
+    /// Pane `id:active` rows captured at adoption time.
+    pub panes: Vec<String>,
+    /// Unix epoch seconds the session was adopted.
+    pub adopted_at: i64,
+}
+
+/// A point-in-time snapshot of any tmux session's state.
+///
+/// Why: `GET /tmux/sessions/{name}/snapshot` lets the dashboard inspect any
+/// session (internal or external) without attaching to it.
+/// What: the session name, its window/pane lists, the captured pane output,
+/// and the capture epoch.
+/// Test: `monitor_session_snapshots_state` (integration, `#[ignore]`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionSnapshot {
+    /// tmux session name.
+    pub name: String,
+    /// Window `index:name` rows.
+    pub windows: Vec<String>,
+    /// Pane `id:active` rows.
+    pub panes: Vec<String>,
+    /// Captured pane output (last `lines` requested).
+    pub output: String,
+    /// Unix epoch seconds the snapshot was taken.
+    pub captured_at: i64,
 }
 
 #[cfg(test)]

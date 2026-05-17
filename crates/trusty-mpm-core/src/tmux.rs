@@ -83,6 +83,16 @@ pub enum TmuxCommand {
     },
     /// `list-sessions -F <fmt>` — enumerate sessions.
     ListSessions,
+    /// `list-windows -t <name> -F <fmt>` — enumerate a session's windows.
+    ListWindows {
+        /// Session whose windows to list.
+        name: String,
+    },
+    /// `list-panes -t <name> -F <fmt>` — enumerate a session's panes.
+    ListPanes {
+        /// Session whose panes to list.
+        name: String,
+    },
     /// `send-keys -t <target> [-l] <keys>` — inject keystrokes.
     SendKeys {
         /// Target session/pane.
@@ -108,6 +118,12 @@ pub enum TmuxCommand {
 /// the command emitted here.
 /// What: name, creation epoch, attached flag — colon-separated.
 pub const SESSION_LIST_FORMAT: &str = "#{session_name}:#{session_created}:#{session_attached}";
+
+/// tmux `-F` format string for `list-windows` (`index:name`).
+pub const WINDOW_LIST_FORMAT: &str = "#{window_index}:#{window_name}";
+
+/// tmux `-F` format string for `list-panes` (`pane_id:active`).
+pub const PANE_LIST_FORMAT: &str = "#{pane_id}:#{pane_active}";
 
 /// Render a [`TmuxCommand`] into an argv vector suitable for `Command::args`.
 ///
@@ -142,6 +158,24 @@ pub fn tmux_argv(cmd: &TmuxCommand) -> Vec<String> {
                 "list-sessions".into(),
                 "-F".into(),
                 SESSION_LIST_FORMAT.into(),
+            ]
+        }
+        TmuxCommand::ListWindows { name } => {
+            vec![
+                "list-windows".into(),
+                "-t".into(),
+                name.clone(),
+                "-F".into(),
+                WINDOW_LIST_FORMAT.into(),
+            ]
+        }
+        TmuxCommand::ListPanes { name } => {
+            vec![
+                "list-panes".into(),
+                "-t".into(),
+                name.clone(),
+                "-F".into(),
+                PANE_LIST_FORMAT.into(),
             ]
         }
         TmuxCommand::SendKeys {
@@ -248,5 +282,24 @@ mod tests {
     fn list_sessions_uses_canonical_format() {
         let argv = tmux_argv(&TmuxCommand::ListSessions);
         assert_eq!(argv, ["list-sessions", "-F", SESSION_LIST_FORMAT]);
+    }
+
+    #[test]
+    fn list_windows_argv() {
+        let argv = tmux_argv(&TmuxCommand::ListWindows {
+            name: "work".into(),
+        });
+        assert_eq!(
+            argv,
+            ["list-windows", "-t", "work", "-F", WINDOW_LIST_FORMAT]
+        );
+    }
+
+    #[test]
+    fn list_panes_argv() {
+        let argv = tmux_argv(&TmuxCommand::ListPanes {
+            name: "work".into(),
+        });
+        assert_eq!(argv, ["list-panes", "-t", "work", "-F", PANE_LIST_FORMAT]);
     }
 }

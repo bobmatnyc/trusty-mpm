@@ -58,6 +58,12 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/breakers", get(breakers))
         .route("/optimizer", get(get_optimizer))
         .route("/overseer", get(get_overseer))
+        .route("/tmux/sessions", get(list_tmux_sessions))
+        .route("/tmux/sessions/{name}/snapshot", get(tmux_snapshot))
+        .route("/tmux/adopt", post(adopt_tmux_session))
+        .route("/claude-config", get(get_claude_config))
+        .route("/claude-config/apply", post(apply_claude_config))
+        .route("/claude-config/restart", post(restart_claude_code))
         .merge(
             SwaggerUi::new("/api-docs")
                 .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
@@ -772,7 +778,7 @@ fn run_overseer(
         &ctx,
         event_label,
         &decision,
-        "deterministic",
+        state.overseer_handler(),
     ));
     Some(decision)
 }
@@ -781,7 +787,8 @@ fn run_overseer(
 ///
 /// Why: the CLI and dashboard surface whether oversight is active and which
 /// strategy is in force.
-/// What: returns `{ "overseer": { "enabled": <bool>, "handler": "deterministic" } }`.
+/// What: returns `{ "overseer": { "enabled": <bool>, "handler": <str> } }`,
+/// where `handler` is the active strategy name reported by the overseer.
 /// Test: `get_overseer_returns_status`.
 #[utoipa::path(
     get,
@@ -793,7 +800,7 @@ pub async fn get_overseer(State(state): State<Arc<DaemonState>>) -> Json<serde_j
     Json(serde_json::json!({
         "overseer": {
             "enabled": state.overseer().is_enabled(),
-            "handler": "deterministic",
+            "handler": state.overseer_handler(),
         }
     }))
 }
@@ -898,6 +905,245 @@ pub async fn current_project(
         Some(info) => Ok(Json(serde_json::json!(info))),
         None => Err(StatusCode::NOT_FOUND),
     }
+}
+
+// ---- universal tmux session management ---------------------------------
+
+/// `GET /tmux/sessions` — every tmux session on the host, origin-tagged.
+///
+/// Why: trusty-mpm manages *all* tmux sessions, not just the ones it created;
+/// the dashboard needs the full list with an origin label so it can offer to
+/// adopt external sessions.
+/// What: runs `TmuxDriver::list_all_sessions` and returns
+/// `{ "sessions": [ExternalSession, ...] }`. tmux being unavailable yields an
+/// empty array rather than an error.
+/// Test: `list_tmux_sessions_returns_array`.
+#[utoipa::path(
+    get,
+    path = "/tmux/sessions",
+    tag = "tmux",
+    responses((status = 200, description = "All tmux sessions with origin labels"))
+)]
+pub async fn list_tmux_sessions(State(_state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    let sessions = match TmuxDriver::discover() {
+        Ok(driver) => driver.list_all_sessions().unwrap_or_else(|e| {
+            tracing::warn!("tmux list_all_sessions failed: {e}");
+            Vec::new()
+        }),
+        Err(_) => {
+            tracing::info!("tmux unavailable; /tmux/sessions returns empty");
+            Vec::new()
+        }
+    };
+    Json(serde_json::json!({ "sessions": sessions }))
+}
+
+/// `GET /tmux/sessions/{name}/snapshot` — capture any session's current state.
+///
+/// Why: the dashboard inspects any session (internal or external) without
+/// attaching to it.
+/// What: runs `TmuxDriver::monitor_session` for the last 100 pane lines and
+/// returns the [`SessionSnapshot`]. A missing session or absent tmux is `404`.
+/// Test: `tmux_snapshot_unknown_session_is_404` (covers the no-tmux path).
+#[utoipa::path(
+    get,
+    path = "/tmux/sessions/{name}/snapshot",
+    tag = "tmux",
+    params(("name" = String, Path, description = "tmux session name")),
+    responses(
+        (status = 200, description = "Session snapshot"),
+        (status = 404, description = "Session not found or tmux unavailable"),
+    )
+)]
+pub async fn tmux_snapshot(
+    State(_state): State<Arc<DaemonState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let driver = TmuxDriver::discover().map_err(|_| StatusCode::NOT_FOUND)?;
+    match driver.monitor_session(&name, 100) {
+        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Err(e) => {
+            tracing::warn!("tmux snapshot for {name} failed: {e}");
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+}
+
+/// JSON body for `POST /tmux/adopt`.
+///
+/// Why: adopting an external session needs only its name.
+/// What: the tmux session name to bring under oversight.
+/// Test: `adopt_tmux_session_handles_missing`.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct AdoptRequest {
+    /// tmux session name to adopt.
+    pub session: String,
+}
+
+/// `POST /tmux/adopt` — register an external tmux session for oversight.
+///
+/// Why: trusty-mpm should watch sessions it did not create; adoption is the
+/// explicit, non-destructive opt-in for that.
+/// What: runs `TmuxDriver::adopt_session` (which captures the session's shape
+/// without modifying it) and returns the [`AdoptedSession`]. A missing session
+/// or absent tmux is `404`.
+/// Test: `adopt_tmux_session_handles_missing`.
+#[utoipa::path(
+    post,
+    path = "/tmux/adopt",
+    tag = "tmux",
+    request_body = AdoptRequest,
+    responses(
+        (status = 200, description = "Session adopted; returns its captured state"),
+        (status = 404, description = "Session not found or tmux unavailable"),
+    )
+)]
+pub async fn adopt_tmux_session(
+    State(_state): State<Arc<DaemonState>>,
+    Json(body): Json<AdoptRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let driver = TmuxDriver::discover().map_err(|_| StatusCode::NOT_FOUND)?;
+    match driver.adopt_session(&body.session) {
+        Ok(adopted) => Ok(Json(serde_json::json!({ "adopted": adopted }))),
+        Err(e) => {
+            tracing::warn!("tmux adopt {} failed: {e}", body.session);
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+}
+
+// ---- Claude Code configuration analyzer ---------------------------------
+
+/// Query parameters for `GET /claude-config`.
+///
+/// Why: the analyzer inspects the config for a specific project directory.
+/// What: the absolute project path to analyze.
+/// Test: `get_claude_config_returns_recommendations`.
+#[derive(serde::Deserialize)]
+pub struct ClaudeConfigQuery {
+    /// Project directory whose Claude Code config to analyze.
+    pub project: PathBuf,
+}
+
+/// `GET /claude-config?project=<path>` — analyze Claude Code config.
+///
+/// Why: trusty-mpm can recommend config changes (hooks, permission scoping,
+/// agent deployment) for a project's Claude Code setup.
+/// What: resolves the user- and project-level config paths, reads and merges
+/// them, and returns `{ config, recommendations }`.
+/// Test: `get_claude_config_returns_recommendations`.
+#[utoipa::path(
+    get,
+    path = "/claude-config",
+    tag = "claude-config",
+    params(("project" = String, Query, description = "Project directory")),
+    responses((status = 200, description = "Analyzed config plus recommendations"))
+)]
+pub async fn get_claude_config(
+    State(_state): State<Arc<DaemonState>>,
+    Query(query): Query<ClaudeConfigQuery>,
+) -> Json<serde_json::Value> {
+    use trusty_mpm_core::claude_config::ClaudeConfigReader;
+    let paths = ClaudeConfigReader::paths_for_project(&query.project);
+    let config = crate::claude_config::ClaudeConfigAnalyzer::read_config(&paths);
+    let recommendations = crate::claude_config::ClaudeConfigAnalyzer::analyze(&config);
+    Json(serde_json::json!({
+        "config": config,
+        "recommendations": recommendations,
+    }))
+}
+
+/// JSON body for `POST /claude-config/apply`.
+///
+/// Why: applying a recommendation needs the project path and the rec id.
+/// What: the project directory and the recommendation id to apply.
+/// Test: `apply_claude_config_unknown_rec_is_404`.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct ApplyConfigRequest {
+    /// Project directory the recommendation applies to.
+    #[schema(value_type = String)]
+    pub project: PathBuf,
+    /// Id of the recommendation to apply.
+    pub recommendation_id: String,
+}
+
+/// `POST /claude-config/apply` — apply a Claude Code config recommendation.
+///
+/// Why: lets an operator act on a recommendation without hand-editing JSON.
+/// What: re-analyzes the project, finds the recommendation by id, and applies
+/// it via `ClaudeConfigAnalyzer::apply_recommendation`. An unknown id is `404`.
+/// Test: `apply_claude_config_unknown_rec_is_404`.
+#[utoipa::path(
+    post,
+    path = "/claude-config/apply",
+    tag = "claude-config",
+    request_body = ApplyConfigRequest,
+    responses(
+        (status = 200, description = "Recommendation applied"),
+        (status = 404, description = "No recommendation with that id"),
+        (status = 500, description = "Applying the recommendation failed"),
+    )
+)]
+pub async fn apply_claude_config(
+    State(_state): State<Arc<DaemonState>>,
+    Json(body): Json<ApplyConfigRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use trusty_mpm_core::claude_config::ClaudeConfigReader;
+    let paths = ClaudeConfigReader::paths_for_project(&body.project);
+    let config = crate::claude_config::ClaudeConfigAnalyzer::read_config(&paths);
+    let recommendations = crate::claude_config::ClaudeConfigAnalyzer::analyze(&config);
+    let rec = recommendations
+        .iter()
+        .find(|r| r.id == body.recommendation_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    crate::claude_config::ClaudeConfigAnalyzer::apply_recommendation(rec, &paths).map_err(|e| {
+        tracing::warn!("applying recommendation {} failed: {e}", rec.id);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        serde_json::json!({ "applied": body.recommendation_id }),
+    ))
+}
+
+/// JSON body for `POST /claude-config/restart`.
+///
+/// Why: restarting Claude Code happens inside a named tmux session.
+/// What: the tmux session in which to restart `claude`.
+/// Test: `restart_claude_code_handles_missing_tmux`.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct RestartRequest {
+    /// tmux session in which to restart Claude Code.
+    pub tmux_session: String,
+}
+
+/// `POST /claude-config/restart` — restart Claude Code in a tmux session.
+///
+/// Why: after applying config changes the operator wants a clean Claude Code
+/// process; this sends Ctrl-C then `claude` into the session's pane.
+/// What: calls `ClaudeCodeRestarter::restart_in_session`. tmux being absent
+/// surfaces as `500`.
+/// Test: `restart_claude_code_handles_missing_tmux`.
+#[utoipa::path(
+    post,
+    path = "/claude-config/restart",
+    tag = "claude-config",
+    request_body = RestartRequest,
+    responses(
+        (status = 200, description = "Restart command sent"),
+        (status = 500, description = "tmux unavailable or restart failed"),
+    )
+)]
+pub async fn restart_claude_code(
+    State(_state): State<Arc<DaemonState>>,
+    Json(body): Json<RestartRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    crate::claude_config::ClaudeCodeRestarter::restart_in_session(&body.tmux_session).map_err(
+        |e| {
+            tracing::warn!("restart in {} failed: {e}", body.tmux_session);
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+    )?;
+    Ok(Json(serde_json::json!({ "restarted": body.tmux_session })))
 }
 
 /// Parse a UUID string into a `SessionId`, mapping failure to `400`.
@@ -1473,5 +1719,69 @@ mod tests {
         let result = apply_compression(Some(CompressionLevel::Summarise), &raw);
         assert_eq!(result.level_label.as_deref(), Some("summarise"));
         assert_eq!(result.stats.original_bytes, 100);
+    }
+
+    #[tokio::test]
+    async fn list_tmux_sessions_returns_array() {
+        // `GET /tmux/sessions` always returns a well-formed `sessions` array
+        // (empty when tmux is unavailable in CI).
+        let state = DaemonState::shared();
+        let Json(body) = list_tmux_sessions(State(state)).await;
+        assert!(body["sessions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn adopt_tmux_session_handles_missing() {
+        // Adopting a session that does not exist (or with tmux absent) is 404.
+        let state = DaemonState::shared();
+        let result = adopt_tmux_session(
+            State(state),
+            Json(AdoptRequest {
+                session: "trusty-mpm-no-such-session-xyz".into(),
+            }),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tmux_snapshot_unknown_session_is_404() {
+        let state = DaemonState::shared();
+        let result = tmux_snapshot(State(state), Path("no-such-session-xyz".into())).await;
+        assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_claude_config_returns_shape() {
+        // `GET /claude-config` returns a `config` object and a
+        // `recommendations` array. The exact recommendations depend on the
+        // host's real `~/.claude` (user-level settings are merged in), so the
+        // test asserts only the response *shape*, not specific entries.
+        let dir = tempfile::tempdir().unwrap();
+        let state = DaemonState::shared();
+        let Json(body) = get_claude_config(
+            State(state),
+            Query(ClaudeConfigQuery {
+                project: dir.path().to_path_buf(),
+            }),
+        )
+        .await;
+        assert!(body["config"].is_object());
+        assert!(body["recommendations"].is_array());
+    }
+
+    #[tokio::test]
+    async fn apply_claude_config_unknown_rec_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = DaemonState::shared();
+        let result = apply_claude_config(
+            State(state),
+            Json(ApplyConfigRequest {
+                project: dir.path().to_path_buf(),
+                recommendation_id: "no-such-recommendation".into(),
+            }),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
     }
 }

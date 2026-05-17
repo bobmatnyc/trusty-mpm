@@ -67,6 +67,47 @@ struct OverseerSection {
     enabled: bool,
 }
 
+/// LLM-overseer tuning (the `[llm]` table).
+///
+/// Why: the LLM-backed overseer calls OpenRouter to make nuanced allow/block
+/// decisions; the model name, the env var holding the API key, and the
+/// opt-in flag must be editable without recompiling.
+/// What: an `enabled` switch, the OpenRouter model id, and the name of the
+/// environment variable that carries the API key.
+/// Test: `llm_config_loads_from_toml`, `default_llm_is_disabled`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmConfig {
+    /// Whether the LLM overseer is active. Opt-in: defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OpenRouter model id, e.g. `meta-llama/llama-3.1-8b-instruct:free`.
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+    /// Name of the environment variable that holds the OpenRouter API key.
+    #[serde(default = "default_api_key_env")]
+    pub api_key_env: String,
+}
+
+/// `serde` default for `LlmConfig::model`.
+fn default_llm_model() -> String {
+    "meta-llama/llama-3.1-8b-instruct:free".to_string()
+}
+
+/// `serde` default for `LlmConfig::api_key_env`.
+fn default_api_key_env() -> String {
+    "OPENROUTER_API_KEY".to_string()
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_llm_model(),
+            api_key_env: default_api_key_env(),
+        }
+    }
+}
+
 /// On-disk shape of `overseer.toml`.
 ///
 /// Why: TOML tables (`[overseer]`, `[deterministic]`, `[auto_responses]`) map
@@ -80,6 +121,8 @@ struct OverseerToml {
     overseer: OverseerSection,
     #[serde(default)]
     deterministic: DeterministicConfig,
+    #[serde(default)]
+    llm: LlmConfig,
     #[serde(default)]
     auto_responses: HashMap<String, String>,
 }
@@ -99,6 +142,9 @@ pub struct OverseerConfig {
     pub enabled: bool,
     /// Rule-based overseer tuning.
     pub deterministic: DeterministicConfig,
+    /// LLM-backed overseer tuning (the `[llm]` table).
+    #[serde(default)]
+    pub llm: LlmConfig,
     /// Question-substring → canned-response map for auto-answering sessions.
     pub auto_responses: HashMap<String, String>,
 }
@@ -130,6 +176,7 @@ impl OverseerConfig {
             Ok(parsed) => Self {
                 enabled: parsed.overseer.enabled,
                 deterministic: parsed.deterministic,
+                llm: parsed.llm,
                 auto_responses: parsed.auto_responses,
             },
             Err(e) => {
@@ -210,6 +257,49 @@ mod tests {
         writeln!(file, "this is = not valid = toml [[[").unwrap();
         let cfg = OverseerConfig::load_from(&path);
         assert_eq!(cfg, OverseerConfig::default());
+    }
+
+    #[test]
+    fn default_llm_is_disabled() {
+        // The LLM overseer is opt-in: a default config has it off but still
+        // carries a sane model id and the standard env var name.
+        let llm = LlmConfig::default();
+        assert!(!llm.enabled);
+        assert_eq!(llm.api_key_env, "OPENROUTER_API_KEY");
+        assert!(llm.model.contains("llama") || llm.model.contains("haiku"));
+    }
+
+    #[test]
+    fn llm_config_loads_from_toml() {
+        // A `[llm]` table maps onto `OverseerConfig::llm`.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overseer.toml");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "[overseer]\nenabled = true\n\n\
+             [llm]\nenabled = true\nmodel = \"claude-haiku-4-5\"\n\
+             api_key_env = \"MY_KEY\""
+        )
+        .unwrap();
+        let cfg = OverseerConfig::load_from(&path);
+        assert!(cfg.llm.enabled);
+        assert_eq!(cfg.llm.model, "claude-haiku-4-5");
+        assert_eq!(cfg.llm.api_key_env, "MY_KEY");
+    }
+
+    #[test]
+    fn llm_table_uses_field_defaults() {
+        // A `[llm]` table with only `enabled` set defaults model + env var.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overseer.toml");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "[llm]\nenabled = true").unwrap();
+        let cfg = OverseerConfig::load_from(&path);
+        assert!(cfg.llm.enabled);
+        assert_eq!(cfg.llm.api_key_env, "OPENROUTER_API_KEY");
     }
 
     #[test]

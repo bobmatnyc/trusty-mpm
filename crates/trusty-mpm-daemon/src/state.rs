@@ -76,9 +76,12 @@ pub struct DaemonState {
     /// Session overseer — evaluates hook events for allow/block/respond/flag.
     ///
     /// Why: oversight is a pluggable strategy; the daemon holds it behind
-    /// `dyn Overseer` so the deterministic and (future) LLM implementations are
+    /// `dyn Overseer` so the deterministic and LLM implementations are
     /// interchangeable. Opt-in: a disabled overseer fast-paths every call.
     overseer: Arc<dyn Overseer>,
+    /// Name of the active overseer strategy, for the `GET /overseer` endpoint
+    /// and the audit log (`"deterministic"` or `"composite-llm"`).
+    overseer_handler: String,
     /// Append-only JSONL logger for every overseer decision.
     audit: Arc<AuditLogger>,
 }
@@ -118,13 +121,50 @@ fn load_optimizer_config() -> OptimizerConfig {
 /// `~/.trusty-mpm/framework/hooks/overseer.toml` (or a safe disabled default
 /// when it is absent) without ever failing to construct.
 /// What: loads [`OverseerConfig`] from [`FrameworkPaths::overseer_config`] and
-/// wraps it in a [`DeterministicOverseer`]; a missing/malformed file yields the
-/// disabled default config (handled inside `OverseerConfig::load_from`).
+/// builds the overseer via [`build_overseer`]; a missing/malformed file yields
+/// the disabled default config (handled inside `OverseerConfig::load_from`).
 /// Test: `new_overseer_is_disabled_when_file_missing`.
-fn load_overseer() -> Arc<dyn Overseer> {
+fn load_overseer() -> (Arc<dyn Overseer>, String) {
     let path = FrameworkPaths::default().overseer_config();
-    let config = OverseerConfig::load_from(&path);
-    Arc::new(DeterministicOverseer::new(config))
+    build_overseer(OverseerConfig::load_from(&path))
+}
+
+/// Assemble the overseer strategy from a loaded [`OverseerConfig`].
+///
+/// Why: the daemon may run rule-based oversight alone, or compose it with the
+/// LLM overseer when `[llm] enabled = true` *and* an API key is present.
+/// Deciding the strategy in one place keeps `new()` / `with_paths()` aligned.
+/// What: always builds a [`DeterministicOverseer`]; when the LLM section is
+/// enabled and the configured API key resolves, wraps both in a
+/// [`CompositeOverseer`] (deterministic first, LLM for uncertain cases).
+/// Returns the overseer and its handler name (`"deterministic"` or
+/// `"composite-llm"`).
+/// Test: `overseer_is_deterministic_without_llm`,
+/// `overseer_falls_back_when_llm_key_missing`.
+fn build_overseer(config: OverseerConfig) -> (Arc<dyn Overseer>, String) {
+    let deterministic = DeterministicOverseer::new(config.clone());
+    if config.llm.enabled {
+        let llm = crate::llm_overseer::LlmOverseer::new(
+            config.llm.model.clone(),
+            &config.llm.api_key_env,
+        );
+        if llm.is_enabled() {
+            tracing::info!(
+                "LLM overseer active (model {}); composing with deterministic rules",
+                config.llm.model
+            );
+            let composite = crate::overseer_compose::CompositeOverseer::new(
+                Box::new(deterministic),
+                Box::new(llm),
+            );
+            return (Arc::new(composite), "composite-llm".to_string());
+        }
+        tracing::warn!(
+            "[llm] enabled but no API key in ${}; falling back to deterministic overseer",
+            config.llm.api_key_env
+        );
+    }
+    (Arc::new(deterministic), "deterministic".to_string())
 }
 
 /// Resolve the daemon's logs directory (`~/.trusty-mpm/logs`).
@@ -153,6 +193,7 @@ impl DaemonState {
     /// `new_overseer_is_disabled_when_file_missing`.
     pub fn new() -> Self {
         let optimizer = load_optimizer_config();
+        let (overseer, overseer_handler) = load_overseer();
         Self {
             sessions: DashMap::new(),
             delegations: DashMap::new(),
@@ -164,7 +205,8 @@ impl DaemonState {
             trusty_addrs: Mutex::new(None),
             optimizer: Arc::new(parking_lot::RwLock::new(optimizer)),
             projects: Arc::new(RwLock::new(HashMap::new())),
-            overseer: load_overseer(),
+            overseer,
+            overseer_handler,
             audit: Arc::new(AuditLogger::new(&logs_dir())),
         }
     }
@@ -195,6 +237,7 @@ impl DaemonState {
             }
         };
         let overseer_cfg = OverseerConfig::load_from(&paths.overseer_config());
+        let (overseer, overseer_handler) = build_overseer(overseer_cfg);
         Self {
             sessions: DashMap::new(),
             delegations: DashMap::new(),
@@ -206,7 +249,8 @@ impl DaemonState {
             trusty_addrs: Mutex::new(None),
             optimizer: Arc::new(parking_lot::RwLock::new(optimizer)),
             projects: Arc::new(RwLock::new(HashMap::new())),
-            overseer: Arc::new(DeterministicOverseer::new(overseer_cfg)),
+            overseer,
+            overseer_handler,
             audit: Arc::new(AuditLogger::new(&paths.root.join("logs"))),
         }
     }
@@ -511,6 +555,16 @@ impl DaemonState {
         Arc::clone(&self.overseer)
     }
 
+    /// Name of the active overseer strategy.
+    ///
+    /// Why: `GET /overseer` and the audit log report which strategy is in
+    /// force; the name is fixed at construction so callers need no config.
+    /// What: returns `"deterministic"` or `"composite-llm"`.
+    /// Test: `overseer_handler_reports_strategy`.
+    pub fn overseer_handler(&self) -> &str {
+        &self.overseer_handler
+    }
+
     /// The overseer audit logger.
     ///
     /// Why: the hook relay logs every overseer decision; sharing the `Arc`
@@ -792,6 +846,36 @@ mod tests {
         // must be present but disabled — oversight is opt-in.
         let state = DaemonState::new();
         assert!(!state.overseer().is_enabled());
+    }
+
+    #[test]
+    fn overseer_is_deterministic_without_llm() {
+        // With the `[llm]` section absent/disabled, the overseer is the plain
+        // deterministic strategy and (with no rules) reports disabled.
+        let cfg = OverseerConfig::default();
+        let (overseer, handler) = build_overseer(cfg);
+        assert!(!overseer.is_enabled());
+        assert_eq!(handler, "deterministic");
+    }
+
+    #[test]
+    fn overseer_falls_back_when_llm_key_missing() {
+        // `[llm] enabled = true` but no API key resolves: the daemon must not
+        // panic — it falls back to the deterministic overseer.
+        let mut cfg = OverseerConfig::default();
+        cfg.llm.enabled = true;
+        cfg.llm.api_key_env = "TRUSTY_MPM_DEFINITELY_NOT_SET".to_string(); // pragma: allowlist secret
+        let (overseer, handler) = build_overseer(cfg);
+        // Deterministic with no rules and disabled top-level flag → disabled.
+        assert!(!overseer.is_enabled());
+        assert_eq!(handler, "deterministic");
+    }
+
+    #[test]
+    fn overseer_handler_reports_strategy() {
+        // The default daemon reports the deterministic handler.
+        let state = DaemonState::new();
+        assert_eq!(state.overseer_handler(), "deterministic");
     }
 
     #[test]

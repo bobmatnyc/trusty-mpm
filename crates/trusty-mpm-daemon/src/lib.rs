@@ -11,11 +11,14 @@
 
 pub mod api;
 pub mod audit;
+pub mod claude_config;
 pub mod discover;
+pub mod llm_overseer;
 pub mod lock;
 pub mod mcp_backend;
 pub mod openapi;
 pub mod optimizer;
+pub mod overseer_compose;
 pub mod state;
 pub mod tmux;
 pub mod watcher;
