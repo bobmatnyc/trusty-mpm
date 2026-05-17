@@ -142,11 +142,7 @@ pub async fn get_breakers(state: State<'_, GuiState>) -> Result<Value, String> {
 /// tolerates an empty body by returning `Value::Null`.
 /// Test: Call with `action = "pause"` against a live daemon and assert no
 /// error is returned.
-async fn post_session_action(
-    state: &GuiState,
-    id: &str,
-    action: &str,
-) -> Result<Value, String> {
+async fn post_session_action(state: &GuiState, id: &str, action: &str) -> Result<Value, String> {
     let url = format!("{}/sessions/{id}/{action}", state.daemon_url);
     let resp = state
         .client

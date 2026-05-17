@@ -12,6 +12,7 @@
 
 pub mod client;
 pub mod dashboard;
+pub mod iterm2;
 
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,24 @@ use dashboard::DashboardState;
 /// Test: pure parts (rendering, client) are unit-tested; this is the thin glue
 /// exercised by launching the dashboard.
 pub async fn run(url: String, interval_ms: u64) -> anyhow::Result<()> {
+    run_focused(url, interval_ms, None).await
+}
+
+/// Run the dashboard pre-focused on a specific session.
+///
+/// Why: `tm connect <target>` resolves a fuzzy target to a definitive session
+/// id and wants the TUI to open with that session already highlighted, so the
+/// operator lands directly on the right row.
+/// What: same terminal setup/teardown as [`run`], but threads `focus_id` into
+/// [`run_loop`], which selects the matching session right after the priming
+/// poll. A `None` focus behaves exactly like the plain `tui` subcommand.
+/// Test: focus selection is unit-tested via [`dashboard::DashboardState::focus_on`];
+/// the terminal glue is exercised by launching the dashboard.
+pub async fn run_focused(
+    url: String,
+    interval_ms: u64,
+    focus_id: Option<String>,
+) -> anyhow::Result<()> {
     let client = DaemonClient::new(url);
 
     enable_raw_mode()?;
@@ -42,7 +61,7 @@ pub async fn run(url: String, interval_ms: u64) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &client, interval_ms).await;
+    let result = run_loop(&mut terminal, &client, interval_ms, focus_id).await;
 
     // Always restore the terminal, even on error.
     disable_raw_mode()?;
@@ -98,12 +117,29 @@ async fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     client: &DaemonClient,
     interval_ms: u64,
+    focus_id: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut state = DashboardState::default();
+    // Why: iTerm2 detection is a stable environment property — probe it once at
+    // startup rather than every key press.
+    // What: store the result so the `o` key handler can branch on it.
+    // Test: detection itself is covered by `iterm2` unit tests.
+    let mut state = DashboardState {
+        iterm2_mode: iterm2::is_iterm2(),
+        ..DashboardState::default()
+    };
     let mut table_state = TableState::default();
 
     // Prime the dashboard with one poll before the first render.
     poll_daemon(&mut state, client).await;
+    // Why: `tm connect` resolves a session before the TUI opens; apply the
+    // requested focus only after the priming poll has populated the list.
+    // What: select the matching row and note it in the status bar.
+    // Test: `dashboard::DashboardState::focus_on` covers the selection logic.
+    if let Some(id) = focus_id.as_deref()
+        && state.focus_on(id)
+    {
+        state.last_action = Some(format!("Connected to {id}"));
+    }
     let mut last_poll = Instant::now();
 
     loop {
@@ -119,10 +155,26 @@ async fn run_loop<B: ratatui::backend::Backend>(
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
         {
+            // Why: while the `connect>` prompt is open it owns every keystroke,
+            // so typing a target never triggers navigation or action keys.
+            // What: Enter resolves the target, Esc cancels, Backspace edits, and
+            // printable characters append to the buffer.
+            // Test: `dashboard::DashboardState::submit_connect` covers resolution.
+            if state.connect_prompt.is_some() {
+                match key.code {
+                    KeyCode::Esc => state.close_connect_prompt(),
+                    KeyCode::Enter => state.submit_connect(),
+                    KeyCode::Backspace => state.connect_prompt_backspace(),
+                    KeyCode::Char(c) => state.connect_prompt_push(c),
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc if !state.show_help => return Ok(()),
                 KeyCode::Esc => state.show_help = false,
                 KeyCode::Char('?') => state.show_help = !state.show_help,
+                KeyCode::Char('c') => state.open_connect_prompt(),
                 KeyCode::Up | KeyCode::Char('k') => state.select_up(),
                 KeyCode::Down | KeyCode::Char('j') => state.select_down(),
                 KeyCode::Char('p') => {
@@ -141,7 +193,13 @@ async fn run_loop<B: ratatui::backend::Backend>(
                     last_poll = Instant::now();
                 }
                 KeyCode::Char('o') => {
-                    handle_action(&mut state, client, Action::Output).await;
+                    // Why: `o` opens the selected session in a new iTerm2 tab —
+                    // ergonomic only inside iTerm2, so branch on the startup probe.
+                    // What: in iTerm2 mode, resolve the selected target and run the
+                    // AppleScript launcher; otherwise show the fallback hint.
+                    // Test: detection is covered by `iterm2` unit tests; the
+                    // branch/message logic by `handle_open_in_iterm2` tests.
+                    handle_open_in_iterm2(&mut state);
                 }
                 _ => {}
             }
@@ -164,8 +222,31 @@ enum Action {
     Resume,
     /// Stop the selected session (`x`).
     Stop,
-    /// Capture the selected session's output (`o`).
-    Output,
+}
+
+/// Open the selected session in a new iTerm2 tab (the `o` key).
+///
+/// Why: opening a session as a sibling iTerm2 tab lets the operator keep the
+/// dashboard visible while the session runs — but that only works inside
+/// iTerm2, so the handler branches on the startup detection result.
+/// What: in iTerm2 mode, resolves the selected `tmux_name` and runs the
+/// AppleScript launcher, recording a success or `"iTerm2 error: <msg>"` line;
+/// outside iTerm2 (or with no sessions) it records the appropriate hint.
+/// Test: `open_in_iterm2_*` cases below cover every branch (no live iTerm2
+/// needed since `open_session_tab` is only reached in iTerm2 mode).
+fn handle_open_in_iterm2(state: &mut DashboardState) {
+    if !state.iterm2_mode {
+        state.last_action = Some("iTerm2 not detected — use your terminal to attach".to_string());
+        return;
+    }
+    let Some(target) = state.selected_target() else {
+        state.last_action = Some("no sessions".to_string());
+        return;
+    };
+    state.last_action = Some(match iterm2::open_session_tab(&target) {
+        Ok(()) => "Opening in iTerm2 tab…".to_string(),
+        Err(e) => format!("iTerm2 error: {e}"),
+    });
 }
 
 /// Run a session [`Action`] against the selected session.
@@ -194,13 +275,56 @@ async fn handle_action(state: &mut DashboardState, client: &DaemonClient, action
             .stop_session(&target)
             .await
             .map(|()| format!("[x] stopped {target}")),
-        Action::Output => client
-            .session_output(&target, 30)
-            .await
-            .map(|out| format!("[o] {} lines captured", out.lines().count())),
     };
     state.last_action = Some(match result {
         Ok(msg) => msg,
         Err(e) => format!("error: {e}"),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use client::SessionRow;
+
+    /// Build a `DashboardState` carrying a single session for `o`-key tests.
+    fn state_with_session(iterm2_mode: bool) -> DashboardState {
+        DashboardState {
+            iterm2_mode,
+            sessions: vec![SessionRow {
+                id: serde_json::json!("abcd1234-5678-90ab-cdef-1234567890ab"),
+                workdir: "/tmp/proj".into(),
+                status: serde_json::json!("active"),
+                active_delegations: 0,
+                tmux_name: "tmpm-quiet-falcon".into(),
+            }],
+            ..DashboardState::default()
+        }
+    }
+
+    #[test]
+    fn open_in_iterm2_without_iterm2_shows_fallback_hint() {
+        // Why: non-iTerm2 terminals must get a clear instruction, never a launch.
+        // What: with `iterm2_mode = false`, the handler records the fallback hint.
+        // Test: assert the exact fallback message regardless of session count.
+        let mut state = state_with_session(false);
+        handle_open_in_iterm2(&mut state);
+        assert_eq!(
+            state.last_action.as_deref(),
+            Some("iTerm2 not detected — use your terminal to attach"),
+        );
+    }
+
+    #[test]
+    fn open_in_iterm2_with_no_sessions_reports_no_sessions() {
+        // Why: pressing `o` with an empty session list must not call osascript.
+        // What: iTerm2 mode but zero sessions records `"no sessions"`.
+        // Test: empty `sessions` → the `"no sessions"` status line.
+        let mut state = DashboardState {
+            iterm2_mode: true,
+            ..DashboardState::default()
+        };
+        handle_open_in_iterm2(&mut state);
+        assert_eq!(state.last_action.as_deref(), Some("no sessions"));
+    }
 }

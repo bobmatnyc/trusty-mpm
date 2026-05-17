@@ -22,9 +22,8 @@ pub fn write_lock(addr: &str, tailscale_addr: Option<&str>) {
         .map(|a| format!("\ntailscale_addr = \"{a}\""))
         .unwrap_or_default();
     let started_at = chrono::Utc::now().to_rfc3339();
-    let content = format!(
-        "pid = {pid}\naddr = \"{addr}\"{ts_line}\nstarted_at = \"{started_at}\"\n"
-    );
+    let content =
+        format!("pid = {pid}\naddr = \"{addr}\"{ts_line}\nstarted_at = \"{started_at}\"\n");
     if let Err(e) = std::fs::write(&path, content) {
         tracing::warn!("failed to write daemon lock file {}: {e}", path.display());
     } else {

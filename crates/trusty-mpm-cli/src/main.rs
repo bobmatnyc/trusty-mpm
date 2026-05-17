@@ -94,6 +94,16 @@ enum Command {
         #[arg(long)]
         mcp: bool,
     },
+    /// Connect to an existing session by ID, name prefix, or project path.
+    /// Opens the TUI focused on the matched session.
+    Connect {
+        /// Session ID, name prefix, or project directory path.
+        target: String,
+
+        /// Print session JSON and exit (no TUI).
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect or configure the token-use optimizer.
     Optimizer {
         /// Optimizer action to perform.
@@ -303,7 +313,10 @@ async fn main() -> anyhow::Result<()> {
             let resolved = trusty_mpm_core::resolve_daemon_url(Some(&url));
             trusty_mpm_tui::run(resolved, interval_ms).await
         }
-        Command::Gui => Ok(trusty_mpm_gui::run()),
+        Command::Gui => {
+            trusty_mpm_gui::run();
+            Ok(())
+        }
         Command::Telegram { url, token, check } => {
             trusty_mpm_telegram::run(url, token, check).await
         }
@@ -313,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
             tailscale,
             mcp,
         } => run_daemon(addr, tailscale, mcp).await,
+        Command::Connect { target, json } => connect_cmd(&client, &cli.url, &target, json).await,
         Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
         Command::Overseer { action } => overseer(&client, &cli.url, action).await,
     }
@@ -910,6 +924,86 @@ fn print_compression_stats(body: &serde_json::Value) {
     println!("\n[summarized: {original} \u{2192} {compressed} bytes ({reduction}% reduction)]");
 }
 
+/// Resolve `target` to a session and either print JSON or open the TUI.
+///
+/// Why: `tm connect` is the primary ergonomic entry point — operators type a
+/// short name or path rather than a full UUID.
+/// What: Fetches `/sessions`, resolves via `resolve_target`, then either
+/// serialises to JSON (`--json`) or launches the TUI pre-focused on the match.
+/// Test: Resolution logic is tested in `trusty-mpm-core::connect`; here we
+/// test CLI flag parsing only (see unit tests).
+async fn connect_cmd(
+    client: &reqwest::Client,
+    url: &str,
+    target: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    use trusty_mpm_core::{ResolveResult, SessionSummary, resolve_target};
+
+    // The daemon wraps the session array in a `{ "sessions": [...] }` envelope.
+    let resp: serde_json::Value = client
+        .get(format!("{url}/sessions"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let empty = vec![];
+    let raw = resp
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+
+    // Parse sessions array — be tolerant of missing fields. `SessionId` is
+    // serialized as a bare UUID string; the friendly name is `tmux_name`.
+    let sessions: Vec<SessionSummary> = raw
+        .iter()
+        .filter_map(|v| {
+            Some(SessionSummary {
+                id: v["id"].as_str()?.to_string(),
+                name: v["tmux_name"].as_str().map(str::to_string),
+                workdir: v["workdir"].as_str().unwrap_or("").to_string(),
+                last_active: v["last_active"].as_u64().unwrap_or(0),
+            })
+        })
+        .collect();
+
+    match resolve_target(target, &sessions) {
+        ResolveResult::Found(id) => {
+            if json {
+                // Find the full session JSON and print it.
+                if let Some(s) = raw.iter().find(|v| v["id"].as_str() == Some(&id)) {
+                    println!("{}", serde_json::to_string_pretty(s)?);
+                }
+                return Ok(());
+            }
+            // Launch the TUI focused on this session.
+            let resolved_url = trusty_mpm_core::resolve_daemon_url(Some(url));
+            trusty_mpm_tui::run_focused(resolved_url, 1000, Some(id)).await
+        }
+        ResolveResult::Ambiguous(ids) => {
+            eprintln!(
+                "Ambiguous target '{target}' — matched {} sessions:",
+                ids.len()
+            );
+            for id in &ids {
+                eprintln!("  {id}");
+            }
+            std::process::exit(1);
+        }
+        ResolveResult::NotFound => {
+            eprintln!("No session matched '{target}'.");
+            if !sessions.is_empty() {
+                eprintln!("Available sessions:");
+                for s in &sessions {
+                    let name = s.name.as_deref().unwrap_or("-");
+                    eprintln!("  {} ({})  {}", s.id, name, s.workdir);
+                }
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `overseer` subcommand — inspect the session overseer.
 ///
 /// Why: operators need to see whether oversight is active without the TUI.
@@ -1132,10 +1226,7 @@ async fn run_daemon(addr: SocketAddr, tailscale: bool, mcp: bool) -> anyhow::Res
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == ErrorKind::AddrInUse => {
-            tracing::warn!(
-                "port {} is busy — selecting an ephemeral port",
-                addr.port()
-            );
+            tracing::warn!("port {} is busy — selecting an ephemeral port", addr.port());
             tokio::net::TcpListener::bind("127.0.0.1:0").await?
         }
         Err(e) => return Err(e.into()),
@@ -1876,6 +1967,35 @@ mod tests {
         let summary = event_summary(&payload);
         assert!(summary.chars().count() <= 61);
         assert!(summary.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn cli_parses_connect() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "connect", "frontend"]).unwrap();
+        match cli.command {
+            Command::Connect { target, json } => {
+                assert_eq!(target, "frontend");
+                assert!(!json);
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_connect_with_json() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "connect", "abc-123", "--json"]).unwrap();
+        match cli.command {
+            Command::Connect { target, json } => {
+                assert_eq!(target, "abc-123");
+                assert!(json);
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_connect_requires_target() {
+        assert!(Cli::try_parse_from(["trusty-mpm", "connect"]).is_err());
     }
 
     #[test]

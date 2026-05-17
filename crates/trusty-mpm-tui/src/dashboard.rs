@@ -22,7 +22,7 @@ use crate::client::{BreakerRow, EventRow, SessionRow};
 
 /// One-line key hint shown in the status bar before any action is taken.
 pub const KEY_HINT: &str =
-    "keys: ↑↓ navigate | p pause | r resume | x stop | o output | ? help | q quit";
+    "keys: ↑↓ navigate | p pause | r resume | x stop | o iTerm2 tab | c connect | ? help | q quit";
 
 /// Snapshot of everything the dashboard renders this frame.
 ///
@@ -57,6 +57,23 @@ pub struct DashboardState {
     pub last_action: Option<String>,
     /// Whether the help overlay is currently visible (toggled with `?`).
     pub show_help: bool,
+    /// Whether the TUI is running inside iTerm2.
+    ///
+    /// Why: the `o` key opens the selected session in a new iTerm2 tab, but
+    /// that only works inside iTerm2; detection is done once at startup so the
+    /// key handler can pick the iTerm2 path or the fallback message.
+    /// What: set from [`crate::iterm2::is_iterm2`] when the dashboard
+    /// initialises; drives the `[iTerm2]` status-bar indicator.
+    /// Test: `status_line_shows_iterm2_indicator`.
+    pub iterm2_mode: bool,
+    /// Current contents of the inline `connect>` prompt, if it is open.
+    ///
+    /// Why: the `c` key opens an inline prompt where the operator types a fuzzy
+    /// session target; while it is `Some` the event loop routes every keystroke
+    /// to the prompt instead of navigation/action keys.
+    /// What: `None` when the prompt is closed, `Some(buffer)` while editing.
+    /// Test: `connect_prompt_open_close`, `connect_prompt_edits_buffer`.
+    pub connect_prompt: Option<String>,
 }
 
 impl DashboardState {
@@ -97,6 +114,117 @@ impl DashboardState {
         self.sessions
             .get(self.selected_session)
             .map(|s| s.tmux_name.clone())
+    }
+
+    /// Move the selection to the session whose UUID equals `id`.
+    ///
+    /// Why: `tm connect` and the in-TUI `/connect` prompt both resolve a fuzzy
+    /// target to a definitive session id; the dashboard must then highlight that
+    /// row so the operator lands on the right session.
+    /// What: searches [`Self::sessions`] for a row whose `id` string equals `id`,
+    /// updates [`Self::selected_session`] and returns `true` on a hit; leaves the
+    /// selection untouched and returns `false` when no session matches.
+    /// Test: `focus_on_selects_matching_session`, `focus_on_missing_is_noop`.
+    pub fn focus_on(&mut self, id: &str) -> bool {
+        if let Some(idx) = self.sessions.iter().position(|s| s.id.as_str() == Some(id)) {
+            self.selected_session = idx;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Build the [`SessionSummary`] slice the resolver searches.
+    ///
+    /// Why: `trusty_mpm_core::resolve_target` works on its own minimal summary
+    /// type; the dashboard's `SessionRow` carries extra render-only fields, so a
+    /// projection is needed before resolution.
+    /// What: maps each polled `SessionRow` to a `SessionSummary` — UUID string,
+    /// friendly `tmux_name`, and `workdir`; `last_active` is unavailable in the
+    /// dashboard wire shape, so it defaults to `0` (recency tie-breaking is only
+    /// reached for workdir-prefix matches).
+    /// Test: covered indirectly by `submit_connect_*` tests.
+    fn session_summaries(&self) -> Vec<trusty_mpm_core::SessionSummary> {
+        self.sessions
+            .iter()
+            .filter_map(|s| {
+                Some(trusty_mpm_core::SessionSummary {
+                    id: s.id.as_str()?.to_string(),
+                    name: Some(s.tmux_name.clone()).filter(|n| !n.is_empty()),
+                    workdir: s.workdir.clone(),
+                    last_active: 0,
+                })
+            })
+            .collect()
+    }
+
+    /// Open the inline `connect>` prompt with an empty buffer.
+    ///
+    /// Why: the `c` key starts a fuzzy session-connect flow without leaving the
+    /// dashboard.
+    /// What: sets [`Self::connect_prompt`] to `Some(String::new())`.
+    /// Test: `connect_prompt_open_close`.
+    pub fn open_connect_prompt(&mut self) {
+        self.connect_prompt = Some(String::new());
+    }
+
+    /// Close the `connect>` prompt without taking any action (the Esc key).
+    ///
+    /// Why: the operator must be able to abandon a half-typed target.
+    /// What: clears [`Self::connect_prompt`] back to `None`.
+    /// Test: `connect_prompt_open_close`.
+    pub fn close_connect_prompt(&mut self) {
+        self.connect_prompt = None;
+    }
+
+    /// Append a character to the open `connect>` prompt buffer.
+    ///
+    /// Why: printable keystrokes build up the target string while the prompt is
+    /// open.
+    /// What: pushes `c` onto the buffer; a no-op when the prompt is closed.
+    /// Test: `connect_prompt_edits_buffer`.
+    pub fn connect_prompt_push(&mut self, c: char) {
+        if let Some(buf) = self.connect_prompt.as_mut() {
+            buf.push(c);
+        }
+    }
+
+    /// Delete the last character of the open `connect>` prompt buffer.
+    ///
+    /// Why: Backspace must edit a mistyped target.
+    /// What: pops the trailing character; a no-op when closed or empty.
+    /// Test: `connect_prompt_edits_buffer`.
+    pub fn connect_prompt_backspace(&mut self) {
+        if let Some(buf) = self.connect_prompt.as_mut() {
+            buf.pop();
+        }
+    }
+
+    /// Resolve the typed target and focus the matching session (the Enter key).
+    ///
+    /// Why: completes the in-TUI `/connect` flow — the operator types a fuzzy
+    /// target and expects the dashboard to jump to that session.
+    /// What: resolves the prompt buffer against the current sessions via
+    /// [`trusty_mpm_core::resolve_target`]; on `Found` it focuses the row and
+    /// records `"Connected to <id>"`, on `Ambiguous`/`NotFound` it records the
+    /// matching status line; always closes the prompt afterward.
+    /// Test: `submit_connect_found`, `submit_connect_not_found`,
+    /// `submit_connect_ambiguous`.
+    pub fn submit_connect(&mut self) {
+        let Some(target) = self.connect_prompt.take() else {
+            return;
+        };
+        let summaries = self.session_summaries();
+        self.last_action = Some(match trusty_mpm_core::resolve_target(&target, &summaries) {
+            trusty_mpm_core::ResolveResult::Found(id) => {
+                self.focus_on(&id);
+                format!("Connected to {id}")
+            }
+            trusty_mpm_core::ResolveResult::Ambiguous(ids) => {
+                format!("Ambiguous: {}", ids.join(", "))
+            }
+            trusty_mpm_core::ResolveResult::NotFound => "No session matched".to_string(),
+        });
     }
 }
 
@@ -261,13 +389,20 @@ pub fn event_lines(state: &DashboardState) -> Vec<String> {
 ///
 /// Why: gives the operator feedback on the last action, or the key hint when
 /// nothing has happened yet; isolating it keeps `render` simple and testable.
-/// What: returns `last_action` if set, otherwise [`KEY_HINT`].
-/// Test: `status_line_falls_back_to_key_hint`, `status_line_shows_last_action`.
+/// What: returns `last_action` if set, otherwise [`KEY_HINT`]; prefixes a
+/// `[iTerm2]` mode indicator when the TUI is running inside iTerm2.
+/// Test: `status_line_falls_back_to_key_hint`, `status_line_shows_last_action`,
+/// `status_line_shows_iterm2_indicator`.
 pub fn status_line(state: &DashboardState) -> String {
-    state
+    let body = state
         .last_action
         .clone()
-        .unwrap_or_else(|| KEY_HINT.to_string())
+        .unwrap_or_else(|| KEY_HINT.to_string());
+    if state.iterm2_mode {
+        format!("[iTerm2] {body}")
+    } else {
+        body
+    }
 }
 
 /// Compute a centred sub-rectangle for the help overlay.
@@ -322,7 +457,8 @@ pub fn help_text() -> String {
         "  p         pause selected session",
         "  r         resume selected session",
         "  x         stop selected session",
-        "  o         capture selected session output",
+        "  o         open session in iTerm2 tab",
+        "  c         connect to session",
         "  ?         toggle this help",
         "  q / Esc   quit",
     ]
@@ -440,6 +576,48 @@ pub fn render_with_table_state(
     if state.show_help {
         render_help_overlay(frame);
     }
+
+    if let Some(buffer) = state.connect_prompt.as_deref() {
+        render_connect_prompt(frame, buffer);
+    }
+}
+
+/// Render the inline `connect>` prompt at the bottom of the frame.
+///
+/// Why: the `c` key starts a fuzzy session-connect flow; the operator needs a
+/// visible single-line input showing what they have typed so far.
+/// What: clears a one-row-tall bordered box on the bottom line and draws
+/// `connect> <buffer>` inside it.
+/// Test: the prompt text is covered by `connect_prompt_line`; the layout math
+/// is exercised by the rendering smoke test.
+fn render_connect_prompt(frame: &mut Frame, buffer: &str) {
+    let area = frame.area();
+    let row = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(3),
+        width: area.width,
+        height: 3,
+    };
+    frame.render_widget(Clear, row);
+    frame.render_widget(
+        Paragraph::new(connect_prompt_line(buffer))
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Connect — Enter to resolve, Esc to cancel"),
+            ),
+        row,
+    );
+}
+
+/// Build the text shown inside the `connect>` prompt.
+///
+/// Why: kept separate so a test can assert the prompt prefix without a frame.
+/// What: returns `connect> <buffer>`.
+/// Test: `connect_prompt_line`.
+pub fn connect_prompt_line(buffer: &str) -> String {
+    format!("connect> {buffer}")
 }
 
 #[cfg(test)]
@@ -571,11 +749,27 @@ mod tests {
     }
 
     #[test]
+    fn status_line_shows_iterm2_indicator() {
+        // Why: when running inside iTerm2 the status bar must carry a visible
+        // `[iTerm2]` mode label; non-iTerm2 mode must not.
+        let iterm = DashboardState {
+            iterm2_mode: true,
+            ..DashboardState::default()
+        };
+        assert!(status_line(&iterm).starts_with("[iTerm2]"));
+
+        let plain = DashboardState::default();
+        assert!(!status_line(&plain).starts_with("[iTerm2]"));
+    }
+
+    #[test]
     fn help_text_lists_all_bindings() {
         let text = help_text();
         for key in ["p", "r", "x", "o", "?", "q"] {
             assert!(text.contains(key), "help text missing binding `{key}`");
         }
+        // The `o` binding now opens an iTerm2 tab; its help line must say so.
+        assert!(text.contains("iTerm2"), "help text missing iTerm2 hint");
     }
 
     #[test]
@@ -721,6 +915,124 @@ mod tests {
         assert_eq!(breaker_state_color("half_open"), Color::Yellow);
         assert_eq!(breaker_state_color("open"), Color::Red);
         assert_eq!(breaker_state_color("weird"), Color::Gray);
+    }
+
+    #[test]
+    fn focus_on_selects_matching_session() {
+        // Focusing a present session id moves the selection to its row.
+        let mut state = DashboardState {
+            sessions: vec![
+                session("aaa", "/p/a", "active", "tmpm-a"),
+                session("bbb", "/p/b", "active", "tmpm-b"),
+            ],
+            ..DashboardState::default()
+        };
+        assert!(state.focus_on("bbb"));
+        assert_eq!(state.selected_session, 1);
+    }
+
+    #[test]
+    fn focus_on_missing_is_noop() {
+        // An unknown id leaves the selection untouched and returns false.
+        let mut state = DashboardState {
+            sessions: vec![session("aaa", "/p/a", "active", "tmpm-a")],
+            selected_session: 0,
+            ..DashboardState::default()
+        };
+        assert!(!state.focus_on("zzz"));
+        assert_eq!(state.selected_session, 0);
+    }
+
+    #[test]
+    fn connect_prompt_open_close() {
+        // `c` opens an empty prompt; Esc closes it.
+        let mut state = DashboardState::default();
+        assert!(state.connect_prompt.is_none());
+        state.open_connect_prompt();
+        assert_eq!(state.connect_prompt.as_deref(), Some(""));
+        state.close_connect_prompt();
+        assert!(state.connect_prompt.is_none());
+    }
+
+    #[test]
+    fn connect_prompt_edits_buffer() {
+        // Printable keys append, Backspace removes the trailing character.
+        let mut state = DashboardState::default();
+        state.open_connect_prompt();
+        state.connect_prompt_push('f');
+        state.connect_prompt_push('e');
+        assert_eq!(state.connect_prompt.as_deref(), Some("fe"));
+        state.connect_prompt_backspace();
+        assert_eq!(state.connect_prompt.as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn submit_connect_found() {
+        // A unique name-prefix match focuses the row and reports "Connected to".
+        let mut state = DashboardState {
+            sessions: vec![
+                session("aaa", "/p/a", "active", "frontend"),
+                session("bbb", "/p/b", "active", "backend"),
+            ],
+            ..DashboardState::default()
+        };
+        state.open_connect_prompt();
+        for c in "front".chars() {
+            state.connect_prompt_push(c);
+        }
+        state.submit_connect();
+        assert!(state.connect_prompt.is_none());
+        assert_eq!(state.selected_session, 0);
+        assert_eq!(state.last_action.as_deref(), Some("Connected to aaa"));
+    }
+
+    #[test]
+    fn submit_connect_not_found() {
+        // A target matching nothing reports "No session matched".
+        let mut state = DashboardState {
+            sessions: vec![session("aaa", "/p/a", "active", "frontend")],
+            ..DashboardState::default()
+        };
+        state.open_connect_prompt();
+        for c in "zzz".chars() {
+            state.connect_prompt_push(c);
+        }
+        state.submit_connect();
+        assert_eq!(state.last_action.as_deref(), Some("No session matched"));
+    }
+
+    #[test]
+    fn submit_connect_ambiguous() {
+        // Two sessions sharing a name prefix yield an "Ambiguous:" status line.
+        let mut state = DashboardState {
+            sessions: vec![
+                session("aaa", "/p/a", "active", "feature-a"),
+                session("bbb", "/p/b", "active", "feature-b"),
+            ],
+            ..DashboardState::default()
+        };
+        state.open_connect_prompt();
+        for c in "feature".chars() {
+            state.connect_prompt_push(c);
+        }
+        state.submit_connect();
+        assert!(
+            state
+                .last_action
+                .as_deref()
+                .unwrap()
+                .starts_with("Ambiguous:")
+        );
+    }
+
+    #[test]
+    fn connect_prompt_line_has_prefix() {
+        assert_eq!(connect_prompt_line("front"), "connect> front");
+    }
+
+    #[test]
+    fn help_text_lists_connect_binding() {
+        assert!(help_text().contains("connect to session"));
     }
 
     #[test]

@@ -26,10 +26,10 @@ pub fn lock_file_path() -> PathBuf {
 /// 3. `DEFAULT_DAEMON_URL`
 pub fn resolve_daemon_url(explicit: Option<&str>) -> String {
     // 1. Explicit override wins.
-    if let Some(url) = explicit {
-        if !url.is_empty() {
-            return url.to_string();
-        }
+    if let Some(url) = explicit
+        && !url.is_empty()
+    {
+        return url.to_string();
     }
 
     // 2. Lock file.
