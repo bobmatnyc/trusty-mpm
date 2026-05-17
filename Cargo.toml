@@ -6,6 +6,7 @@ members = [
     "crates/trusty-mpm-cli",
     "crates/trusty-mpm-tui",
     "crates/trusty-mpm-telegram",
+    "crates/trusty-mpm-gui",
 ]
 resolver = "2"
 
