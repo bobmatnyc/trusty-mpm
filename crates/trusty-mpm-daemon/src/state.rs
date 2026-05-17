@@ -39,6 +39,12 @@ use crate::tmux::TmuxDriver;
 /// memory in a long-lived daemon; a ring buffer caps it.
 pub const HOOK_HISTORY_LIMIT: usize = 1024;
 
+/// How long a one-time bot pairing code stays valid after it is issued.
+///
+/// Why: a pairing code is a low-entropy secret; a short five-minute window
+/// limits the time an intercepted code is useful.
+pub const PAIR_CODE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// The daemon's shared, mutable view of the world.
 ///
 /// Why: shared via `Arc<DaemonState>` into every axum handler and the MCP
@@ -84,6 +90,23 @@ pub struct DaemonState {
     overseer_handler: String,
     /// Append-only JSONL logger for every overseer decision.
     audit: Arc<AuditLogger>,
+    /// The Telegram chat id paired with this daemon, when one has confirmed a
+    /// pairing code.
+    ///
+    /// Why: the Telegram bot pairs a single chat with the daemon so push alerts
+    /// have an unambiguous destination; the chat id is stored here after a
+    /// successful `/pair` handshake.
+    /// What: `None` until a pairing completes, then the confirmed chat id.
+    /// Test: `pairing_round_trip`.
+    paired_chat_id: Mutex<Option<i64>>,
+    /// The outstanding one-time pairing code and the instant it was issued.
+    ///
+    /// Why: `tm pair` generates a short code valid for five minutes; the daemon
+    /// must remember it (with its issue time, for TTL enforcement) until a
+    /// `/pair` confirm consumes it or it expires.
+    /// What: `None` when no code is outstanding, else `(code, issued_at)`.
+    /// Test: `pairing_round_trip`, `expired_pair_code_is_rejected`.
+    pair_code: Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl Default for DaemonState {
@@ -208,6 +231,8 @@ impl DaemonState {
             overseer,
             overseer_handler,
             audit: Arc::new(AuditLogger::new(&logs_dir())),
+            paired_chat_id: Mutex::new(None),
+            pair_code: Mutex::new(None),
         }
     }
 
@@ -252,7 +277,63 @@ impl DaemonState {
             overseer,
             overseer_handler,
             audit: Arc::new(AuditLogger::new(&paths.root.join("logs"))),
+            paired_chat_id: Mutex::new(None),
+            pair_code: Mutex::new(None),
         }
+    }
+
+    // ---- bot pairing ----------------------------------------------------
+
+    /// Generate and store a one-time pairing code.
+    ///
+    /// Why: `tm pair` asks the daemon for a short code the operator types into
+    /// the Telegram bot; the daemon must remember it (and its issue time) so a
+    /// later `/pair` confirm can validate it within the TTL window.
+    /// What: derives a six-character uppercase alphanumeric code from a fresh
+    /// UUID, stores it with the current instant, and returns the code.
+    /// Test: `pairing_round_trip`.
+    pub fn generate_pair_code(&self) -> String {
+        let code: String = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(6)
+            .collect::<String>()
+            .to_uppercase();
+        *self.pair_code.lock() = Some((code.clone(), std::time::Instant::now()));
+        code
+    }
+
+    /// Confirm a pairing code and register `chat_id` on success.
+    ///
+    /// Why: the bot's `/pair <code>` flow validates the operator's code and, on
+    /// success, binds the chat so push alerts have a destination.
+    /// What: returns `true` and stores `chat_id` when `code` matches the
+    /// outstanding code and it is within [`PAIR_CODE_TTL`]; clears the code
+    /// either way (a used or expired code never validates twice).
+    /// Test: `pairing_round_trip`, `expired_pair_code_is_rejected`.
+    pub fn confirm_pair_code(&self, code: &str, chat_id: i64) -> bool {
+        let mut guard = self.pair_code.lock();
+        let valid = matches!(
+            guard.as_ref(),
+            Some((stored, issued))
+                if stored == code && issued.elapsed() < PAIR_CODE_TTL
+        );
+        *guard = None;
+        if valid {
+            *self.paired_chat_id.lock() = Some(chat_id);
+        }
+        valid
+    }
+
+    /// The chat id currently paired with this daemon, if any.
+    ///
+    /// Why: `GET /pair/status` and the alert loop need the paired destination.
+    /// What: returns the stored chat id, or `None` when unpaired.
+    /// Test: `pairing_round_trip`.
+    pub fn paired_chat_id(&self) -> Option<i64> {
+        *self.paired_chat_id.lock()
     }
 
     // ---- sessions -------------------------------------------------------
@@ -910,5 +991,28 @@ mod tests {
         }
         assert_eq!(state.recent_hook_events().len(), HOOK_HISTORY_LIMIT);
         assert_eq!(state.hook_events_for(id).len(), HOOK_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn pairing_round_trip() {
+        // A freshly-generated code confirms once, binds the chat id, and is
+        // then consumed so the same code cannot validate twice.
+        let state = DaemonState::new();
+        assert_eq!(state.paired_chat_id(), None);
+        let code = state.generate_pair_code();
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(state.confirm_pair_code(&code, 12345678));
+        assert_eq!(state.paired_chat_id(), Some(12345678));
+        // The code was consumed; confirming it again must fail.
+        assert!(!state.confirm_pair_code(&code, 999));
+    }
+
+    #[test]
+    fn wrong_pair_code_is_rejected() {
+        let state = DaemonState::new();
+        let _code = state.generate_pair_code();
+        assert!(!state.confirm_pair_code("ZZZZZZ", 12345678));
+        assert_eq!(state.paired_chat_id(), None);
     }
 }

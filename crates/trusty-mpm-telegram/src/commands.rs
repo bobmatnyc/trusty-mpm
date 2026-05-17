@@ -1,84 +1,112 @@
-//! Telegram operator command parsing.
+//! Native Telegram slash commands.
 //!
-//! Why: the bot lets an operator drive the daemon from a phone — list sessions,
-//! check status, approve a pending permission request. Parsing the chat text
-//! into a typed command is pure logic that should be tested without teloxide.
-//! What: [`BotCommand`] enumerates the supported commands; [`parse`] turns a
-//! raw message string into one (or a parse error).
-//! Test: `cargo test -p trusty-mpm-telegram` covers every command and the
-//! error paths.
+//! Why: the bot used to hand-roll a `parse()` function over raw message text.
+//! teloxide's `#[derive(BotCommands)]` gives the same dispatch for free, plus a
+//! generated `/`-command picker and per-command help — so the manual parser is
+//! gone.
+//! What: [`TelegramCommand`] is the teloxide-native command enum; the `From`
+//! impl converts it into the shared, UI-agnostic
+//! [`trusty_mpm_client::TrustyCommand`] that the executor consumes. An empty
+//! argument to `/pair` or `/status` etc. is preserved as an empty string and
+//! handled downstream (e.g. `/pair` with no code queries pairing status).
+//! Test: `cargo test -p trusty-mpm-telegram` covers the conversion.
 
-// The teloxide command-dispatch loop that calls `parse` lands in a follow-up
-// issue; until then the parser is exercised only by its own tests.
-#![allow(dead_code)]
+use teloxide::utils::command::BotCommands;
+use trusty_mpm_client::TrustyCommand;
 
-/// A parsed operator command from a Telegram message.
+/// The bot's native Telegram slash commands.
 ///
-/// Why: a typed command keeps the bot's dispatch exhaustive and the parser
-/// testable.
-/// What: the small set of remote-management actions trusty-mpm supports.
-/// Test: see the `parse_*` tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BotCommand {
-    /// `/sessions` — list all managed sessions.
+/// Why: deriving `BotCommands` makes teloxide parse `/command args` for us and
+/// lets `set_my_commands` register the picker from `bot_commands()`.
+/// What: one variant per operator action; single-`String` variants take the
+/// remainder of the message as their argument (empty when omitted).
+/// Test: `telegram_command_converts_to_trusty_command`.
+#[derive(BotCommands, Clone, Debug, PartialEq, Eq)]
+#[command(rename_rule = "lowercase", description = "trusty-mpm commands:")]
+pub enum TelegramCommand {
+    /// List managed sessions.
+    #[command(description = "List managed sessions")]
     Sessions,
-    /// `/status <id>` — show detailed status for one session.
-    Status { session_id: String },
-    /// `/approve <id>` — approve a session's pending permission request.
-    Approve { session_id: String },
-    /// `/deny <id>` — deny a session's pending permission request.
-    Deny { session_id: String },
-    /// `/help` — show the command list.
+    /// Session status — `/status <id>`.
+    #[command(description = "Session status")]
+    Status(String),
+    /// Approve a permission request — `/approve <id>`.
+    #[command(description = "Approve a permission request")]
+    Approve(String),
+    /// Deny a permission request — `/deny <id>`.
+    #[command(description = "Deny a permission request")]
+    Deny(String),
+    /// Show overseer status.
+    #[command(description = "Show overseer status")]
+    Overseer,
+    /// List all tmux sessions.
+    #[command(description = "List all tmux sessions")]
+    Tmux,
+    /// Analyze Claude Code config — `/config <path>`.
+    #[command(description = "Analyze Claude Code config")]
+    Config(String),
+    /// Capture tmux pane output — `/snapshot <session>`.
+    #[command(description = "Capture tmux pane output")]
+    Snapshot(String),
+    /// Kill a session — `/kill <id>`.
+    #[command(description = "Kill a session")]
+    Kill(String),
+    /// Show alert subscriptions.
+    #[command(description = "Show alert subscriptions")]
+    Alerts,
+    /// Pair with the daemon — `/pair <code>`.
+    #[command(description = "Pair with daemon")]
+    Pair(String),
+    /// Start and pair — `/start [code]`.
+    #[command(description = "Start and pair")]
+    Start(String),
+    /// Show all commands.
+    #[command(description = "Show all commands")]
     Help,
 }
 
-/// Parse a raw Telegram message into a [`BotCommand`].
+impl From<TelegramCommand> for TrustyCommand {
+    /// Convert a teloxide command into the shared command model.
+    ///
+    /// Why: the executor only understands [`TrustyCommand`]; the bot's native
+    /// enum must be projected onto it before dispatch.
+    /// What: maps each variant; an empty `/pair`/`/start` argument becomes
+    /// `Pair { code: None }` / `Start` so "no code" queries pairing status.
+    /// Test: `telegram_command_converts_to_trusty_command`.
+    fn from(cmd: TelegramCommand) -> Self {
+        match cmd {
+            TelegramCommand::Sessions => TrustyCommand::Sessions,
+            TelegramCommand::Status(session_id) => TrustyCommand::Status { session_id },
+            TelegramCommand::Approve(session_id) => TrustyCommand::Approve { session_id },
+            TelegramCommand::Deny(session_id) => TrustyCommand::Deny { session_id },
+            TelegramCommand::Overseer => TrustyCommand::Overseer,
+            TelegramCommand::Tmux => TrustyCommand::Tmux,
+            TelegramCommand::Config(project) => TrustyCommand::Config { project },
+            TelegramCommand::Snapshot(session) => TrustyCommand::Snapshot { session },
+            TelegramCommand::Kill(session_id) => TrustyCommand::Kill { session_id },
+            TelegramCommand::Alerts => TrustyCommand::Alerts,
+            TelegramCommand::Pair(code) => TrustyCommand::Pair {
+                code: non_empty(code),
+            },
+            TelegramCommand::Start(_) => TrustyCommand::Start,
+            TelegramCommand::Help => TrustyCommand::Help,
+        }
+    }
+}
+
+/// Map an empty argument string to `None`, a non-empty one to `Some`.
 ///
-/// Why: one entry point keeps command syntax in a single, tested place.
-/// What: matches the leading `/word`; commands that need an argument
-/// (`/status`, `/approve`, `/deny`) require exactly one. Returns `Err` with a
-/// human-readable reason the bot can echo back to the operator.
-/// Test: `parse_sessions`, `parse_status_requires_argument`, etc.
-pub fn parse(message: &str) -> Result<BotCommand, String> {
-    let mut parts = message.split_whitespace();
-    let verb = parts.next().ok_or_else(|| "empty message".to_string())?;
-    let arg = parts.next();
-    // Reject trailing junk so `/status a b` is an explicit error.
-    if parts.next().is_some() {
-        return Err(format!("too many arguments for `{verb}`"));
+/// Why: teloxide hands a missing `String` argument as `""`; the command model
+/// distinguishes "no argument" via `Option`, so the empty string is normalized.
+/// What: trims and returns `Some(trimmed)` when non-empty, else `None`.
+/// Test: covered by `telegram_command_converts_to_trusty_command`.
+fn non_empty(s: String) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
-
-    match verb {
-        "/sessions" => Ok(BotCommand::Sessions),
-        "/help" => Ok(BotCommand::Help),
-        "/status" => Ok(BotCommand::Status {
-            session_id: require_arg(verb, arg)?,
-        }),
-        "/approve" => Ok(BotCommand::Approve {
-            session_id: require_arg(verb, arg)?,
-        }),
-        "/deny" => Ok(BotCommand::Deny {
-            session_id: require_arg(verb, arg)?,
-        }),
-        other => Err(format!("unknown command: `{other}` (try /help)")),
-    }
-}
-
-/// Require that a command was given exactly one argument.
-fn require_arg(verb: &str, arg: Option<&str>) -> Result<String, String> {
-    arg.map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("`{verb}` needs a session id"))
-}
-
-/// The `/help` text listing every command.
-pub fn help_text() -> &'static str {
-    "trusty-mpm bot commands:\n\
-     /sessions — list managed sessions\n\
-     /status <id> — detailed session status\n\
-     /approve <id> — approve a pending permission request\n\
-     /deny <id> — deny a pending permission request\n\
-     /help — this message"
 }
 
 #[cfg(test)]
@@ -86,58 +114,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_sessions() {
-        assert_eq!(parse("/sessions").unwrap(), BotCommand::Sessions);
-        // Surrounding whitespace is tolerated.
-        assert_eq!(parse("  /sessions  ").unwrap(), BotCommand::Sessions);
-    }
-
-    #[test]
-    fn parse_help() {
-        assert_eq!(parse("/help").unwrap(), BotCommand::Help);
-        assert!(help_text().contains("/approve"));
-    }
-
-    #[test]
-    fn parse_status_with_argument() {
+    fn telegram_command_converts_to_trusty_command() {
+        // The no-argument commands map one-to-one.
         assert_eq!(
-            parse("/status abc-123").unwrap(),
-            BotCommand::Status {
+            TrustyCommand::from(TelegramCommand::Sessions),
+            TrustyCommand::Sessions
+        );
+        assert_eq!(
+            TrustyCommand::from(TelegramCommand::Help),
+            TrustyCommand::Help
+        );
+        // An argument-carrying command threads its argument through.
+        assert_eq!(
+            TrustyCommand::from(TelegramCommand::Status("abc-123".into())),
+            TrustyCommand::Status {
                 session_id: "abc-123".into()
             }
         );
-    }
-
-    #[test]
-    fn parse_status_requires_argument() {
-        let err = parse("/status").unwrap_err();
-        assert!(err.contains("needs a session id"));
-    }
-
-    #[test]
-    fn parse_approve_and_deny() {
+        // `/pair` with a code carries it; `/pair` with no code is a status query.
         assert_eq!(
-            parse("/approve s1").unwrap(),
-            BotCommand::Approve {
-                session_id: "s1".into()
+            TrustyCommand::from(TelegramCommand::Pair("A4X9KZ".into())),
+            TrustyCommand::Pair {
+                code: Some("A4X9KZ".into())
             }
         );
         assert_eq!(
-            parse("/deny s2").unwrap(),
-            BotCommand::Deny {
-                session_id: "s2".into()
-            }
+            TrustyCommand::from(TelegramCommand::Pair(String::new())),
+            TrustyCommand::Pair { code: None }
+        );
+        // `/start` always becomes the Start command regardless of any argument.
+        assert_eq!(
+            TrustyCommand::from(TelegramCommand::Start("A4X9KZ".into())),
+            TrustyCommand::Start
         );
     }
 
     #[test]
-    fn parse_rejects_extra_arguments() {
-        assert!(parse("/status a b").is_err());
+    fn bot_commands_lists_every_command() {
+        // teloxide's generated descriptor must enumerate all thirteen commands.
+        let descriptions = TelegramCommand::bot_commands();
+        assert_eq!(descriptions.len(), 13);
+        assert!(descriptions.iter().any(|c| c.command == "/sessions"));
+        assert!(descriptions.iter().any(|c| c.command == "/pair"));
+        assert!(descriptions.iter().any(|c| c.command == "/start"));
     }
 
     #[test]
-    fn parse_rejects_unknown_command() {
-        let err = parse("/frobnicate").unwrap_err();
-        assert!(err.contains("unknown command"));
+    fn parse_round_trips_a_command() {
+        // teloxide's parser turns raw text into the typed command.
+        let cmd = TelegramCommand::parse("/status abc-123", "trusty_mpm_bot").unwrap();
+        assert_eq!(cmd, TelegramCommand::Status("abc-123".into()));
     }
 }

@@ -75,6 +75,9 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/claude-config/restore", post(restore_checkpoint))
         .route("/claude-config/profiles", get(list_profiles))
         .route("/claude-config/deploy", post(deploy_profile))
+        .route("/pair/request", post(pair_request))
+        .route("/pair/confirm", post(pair_confirm))
+        .route("/pair/status", get(pair_status))
         .merge(
             SwaggerUi::new("/api-docs")
                 .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
@@ -1408,6 +1411,93 @@ pub async fn restart_claude_code(
     Ok(Json(serde_json::json!({ "restarted": body.tmux_session })))
 }
 
+// ---- bot pairing --------------------------------------------------------
+
+/// `POST /pair/request` — generate a one-time Telegram-bot pairing code.
+///
+/// Why: pairing the Telegram bot to this daemon needs an out-of-band shared
+/// secret; `tm pair` calls this on the local daemon to obtain a short code the
+/// operator then types into the bot.
+/// What: generates a six-character code (stored with a five-minute TTL) and
+/// returns `{ "code", "expires_in_seconds" }`.
+/// Test: `pair_request_returns_code`.
+#[utoipa::path(
+    post,
+    path = "/pair/request",
+    tag = "config",
+    responses((status = 200, description = "A one-time pairing code and its TTL"))
+)]
+pub async fn pair_request(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    let code = state.generate_pair_code();
+    Json(serde_json::json!({
+        "code": code,
+        "expires_in_seconds": crate::state::PAIR_CODE_TTL.as_secs(),
+    }))
+}
+
+/// JSON body for `POST /pair/confirm`.
+///
+/// Why: confirming a pairing needs the operator's code and the Telegram chat id
+/// to bind.
+/// What: the six-character code and the chat id.
+/// Test: `pair_confirm_validates_code`.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct PairConfirmRequest {
+    /// The one-time pairing code issued by `POST /pair/request`.
+    pub code: String,
+    /// The Telegram chat id to pair with this daemon.
+    pub chat_id: i64,
+}
+
+/// `POST /pair/confirm` — confirm a pairing code and register the chat.
+///
+/// Why: the Telegram bot's `/pair <code>` flow validates the operator's code so
+/// push alerts have an authenticated destination.
+/// What: validates `code` against the outstanding code within its TTL; on
+/// success stores `chat_id` and returns `{ "success": true, "chat_id" }`,
+/// otherwise `{ "success": false, "error": "invalid or expired code" }`.
+/// Test: `pair_confirm_validates_code`, `pair_confirm_rejects_bad_code`.
+#[utoipa::path(
+    post,
+    path = "/pair/confirm",
+    tag = "config",
+    request_body = PairConfirmRequest,
+    responses((status = 200, description = "Pairing result (success flag and chat id or error)"))
+)]
+pub async fn pair_confirm(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<PairConfirmRequest>,
+) -> Json<serde_json::Value> {
+    if state.confirm_pair_code(&body.code, body.chat_id) {
+        Json(serde_json::json!({ "success": true, "chat_id": body.chat_id }))
+    } else {
+        Json(serde_json::json!({
+            "success": false,
+            "error": "invalid or expired code",
+        }))
+    }
+}
+
+/// `GET /pair/status` — report whether a Telegram chat is paired.
+///
+/// Why: the bot's `/start` command branches on whether the daemon is already
+/// paired so it shows either a welcome-and-pair prompt or a ready message.
+/// What: returns `{ "paired": <bool>, "chat_id": <i64 or null> }`.
+/// Test: `pair_status_reports_unpaired`.
+#[utoipa::path(
+    get,
+    path = "/pair/status",
+    tag = "config",
+    responses((status = 200, description = "Pairing status (paired flag and chat id)"))
+)]
+pub async fn pair_status(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    let chat_id = state.paired_chat_id();
+    Json(serde_json::json!({
+        "paired": chat_id.is_some(),
+        "chat_id": chat_id,
+    }))
+}
+
 /// Parse a UUID string into a `SessionId`, mapping failure to `400`.
 fn parse_id(raw: &str) -> Result<SessionId, StatusCode> {
     uuid::Uuid::parse_str(raw)
@@ -2151,6 +2241,64 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pair_request_returns_code() {
+        // `POST /pair/request` returns a six-character code and a TTL.
+        let state = DaemonState::shared();
+        let Json(body) = pair_request(State(state)).await;
+        let code = body["code"].as_str().expect("code is a string");
+        assert_eq!(code.len(), 6);
+        assert_eq!(body["expires_in_seconds"], 300);
+    }
+
+    #[tokio::test]
+    async fn pair_confirm_validates_code() {
+        // A code from `/pair/request` confirms successfully, and `/pair/status`
+        // then reports the daemon as paired with that chat.
+        let state = DaemonState::shared();
+        let Json(req) = pair_request(State(Arc::clone(&state))).await;
+        let code = req["code"].as_str().unwrap().to_string();
+        let Json(confirm) = pair_confirm(
+            State(Arc::clone(&state)),
+            Json(PairConfirmRequest { code, chat_id: 777 }),
+        )
+        .await;
+        assert_eq!(confirm["success"], true);
+        assert_eq!(confirm["chat_id"], 777);
+
+        let Json(status) = pair_status(State(state)).await;
+        assert_eq!(status["paired"], true);
+        assert_eq!(status["chat_id"], 777);
+    }
+
+    #[tokio::test]
+    async fn pair_confirm_rejects_bad_code() {
+        // A code that was never issued must not pair the daemon.
+        let state = DaemonState::shared();
+        let _ = pair_request(State(Arc::clone(&state))).await;
+        let Json(confirm) = pair_confirm(
+            State(Arc::clone(&state)),
+            Json(PairConfirmRequest {
+                code: "ZZZZZZ".into(),
+                chat_id: 777,
+            }),
+        )
+        .await;
+        assert_eq!(confirm["success"], false);
+        assert!(confirm["error"].as_str().unwrap().contains("invalid"));
+
+        let Json(status) = pair_status(State(state)).await;
+        assert_eq!(status["paired"], false);
+        assert!(status["chat_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn pair_status_reports_unpaired() {
+        let state = DaemonState::shared();
+        let Json(status) = pair_status(State(state)).await;
+        assert_eq!(status["paired"], false);
     }
 
     #[tokio::test]

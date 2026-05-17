@@ -4944,6 +4944,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -5280,11 +5281,29 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "trusty-mpm-client",
  "trusty-mpm-core",
  "trusty-mpm-daemon",
  "trusty-mpm-gui",
  "trusty-mpm-telegram",
  "trusty-mpm-tui",
+]
+
+[[package]]
+name = "trusty-mpm-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "trusty-mpm-core",
+ "trusty-mpm-daemon",
+ "uuid",
 ]
 
 [[package]]
@@ -5385,12 +5404,14 @@ dependencies = [
  "axum",
  "clap",
  "reqwest 0.12.28",
- "serde",
  "serde_json",
  "teloxide",
+ "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "trusty-mpm-client",
  "trusty-mpm-core",
  "trusty-mpm-daemon",
 ]
@@ -5405,11 +5426,10 @@ dependencies = [
  "crossterm",
  "dirs 5.0.1",
  "ratatui",
- "reqwest 0.12.28",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "trusty-mpm-client",
  "trusty-mpm-core",
 ]
 

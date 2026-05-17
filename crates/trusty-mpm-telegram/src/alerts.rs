@@ -9,10 +9,6 @@
 //! [`format_event_alert`] (the human-readable message bodies).
 //! Test: `cargo test -p trusty-mpm-telegram` covers the filter and formatting.
 
-// The teloxide alert-pusher loop that calls these lands in a follow-up issue;
-// until then the alert logic is exercised only by its own tests.
-#![allow(dead_code)]
-
 use trusty_mpm_core::hook::{HookCategory, HookEvent};
 use trusty_mpm_core::memory::MemoryPressure;
 
@@ -89,6 +85,90 @@ pub fn format_event_alert(session_id: &str, event: HookEvent) -> String {
     )
 }
 
+/// Format an overseer-block alert message.
+///
+/// Why: when the overseer blocks a session the operator needs an immediate,
+/// glanceable interrupt — this is exactly what push alerts exist for.
+/// What: a one-line HTML-safe string naming the session the overseer flagged.
+/// Test: `overseer_block_alert_names_session`.
+pub fn format_overseer_block_alert(session_id: &str) -> String {
+    format!("🛑 trusty-mpm: overseer blocked session {session_id}")
+}
+
+/// An alert decided by [`check_and_alert`], ready to be sent to Telegram.
+///
+/// Why: keeping the polling logic pure (it returns alerts rather than sending
+/// them) lets it be unit-tested with no network or teloxide runtime.
+/// What: the formatted message body the bot should push.
+/// Test: `alert_loop_does_not_panic_on_empty_sessions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAlert {
+    /// The fully formatted, ready-to-send message body.
+    pub message: String,
+}
+
+/// Per-session bookkeeping for the push-alert loop.
+///
+/// Why: the loop must only alert on *new* events; it tracks the most recent
+/// event timestamp it has already alerted on, keyed by session id.
+/// What: a plain map of session id to last-seen RFC3339 timestamp string.
+/// Test: `check_and_alert` is exercised with empty and populated maps.
+pub type LastSeen = std::collections::HashMap<String, String>;
+
+/// Pure core of the push-alert loop: decide which events warrant an alert.
+///
+/// Why: the I/O (polling `/sessions`, `/sessions/{id}/events`, sending
+/// messages) is thin and untestable; the *decision* of which events are new
+/// and subscribed is the part worth testing, so it is extracted here.
+/// What: walks each session's events, and for every event newer than the
+/// `last_seen` timestamp for that session that also passes [`should_alert`],
+/// produces a [`PendingAlert`]. Mutates `last_seen` to the newest timestamp
+/// observed per session so the next poll does not re-alert.
+/// Test: `alert_loop_does_not_panic_on_empty_sessions`,
+/// `check_and_alert_emits_for_new_subscribed_event`.
+pub fn check_and_alert(
+    sessions: &[serde_json::Value],
+    events_by_session: &std::collections::HashMap<String, Vec<serde_json::Value>>,
+    last_seen: &mut LastSeen,
+    config: &AlertConfig,
+) -> Vec<PendingAlert> {
+    let mut alerts = Vec::new();
+    for session in sessions {
+        let Some(id) = session["id"].as_str() else {
+            continue;
+        };
+        let Some(events) = events_by_session.get(id) else {
+            continue;
+        };
+        let prev = last_seen.get(id).cloned().unwrap_or_default();
+        let mut newest = prev.clone();
+        for record in events {
+            let at = record["at"].as_str().unwrap_or_default();
+            if at <= prev.as_str() {
+                continue;
+            }
+            if at > newest.as_str() {
+                newest = at.to_string();
+            }
+            let Some(event_name) = record["event"].as_str() else {
+                continue;
+            };
+            let Some(event) = HookEvent::from_wire(event_name) else {
+                continue;
+            };
+            if should_alert(config, event) {
+                alerts.push(PendingAlert {
+                    message: format_event_alert(id, event),
+                });
+            }
+        }
+        if !newest.is_empty() {
+            last_seen.insert(id.to_string(), newest);
+        }
+    }
+    alerts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +222,69 @@ mod tests {
         let msg = format_event_alert("sess-2", HookEvent::SubagentStopFailure);
         assert!(msg.contains("sess-2"));
         assert!(msg.contains("SubagentStopFailure"));
+    }
+
+    #[test]
+    fn overseer_block_alert_names_session() {
+        let msg = format_overseer_block_alert("sess-7");
+        assert!(msg.contains("sess-7"));
+        assert!(msg.contains("overseer"));
+    }
+
+    #[test]
+    fn alert_loop_does_not_panic_on_empty_sessions() {
+        // The pure core of the push-alert loop must be a no-op (and never
+        // panic) when there are no sessions and no events.
+        let cfg = AlertConfig::recommended();
+        let mut last_seen = LastSeen::new();
+        let alerts = check_and_alert(&[], &std::collections::HashMap::new(), &mut last_seen, &cfg);
+        assert!(alerts.is_empty());
+        assert!(last_seen.is_empty());
+    }
+
+    #[test]
+    fn check_and_alert_emits_for_new_subscribed_event() {
+        // A new event in a subscribed category (Permission) produces exactly
+        // one alert and advances the per-session last-seen cursor.
+        let cfg = AlertConfig::recommended();
+        let sessions = vec![serde_json::json!({ "id": "sess-1" })];
+        let mut events = std::collections::HashMap::new();
+        events.insert(
+            "sess-1".to_string(),
+            vec![serde_json::json!({
+                "event": "PermissionDenied",
+                "at": "2026-05-17T10:00:00Z",
+            })],
+        );
+        let mut last_seen = LastSeen::new();
+        let alerts = check_and_alert(&sessions, &events, &mut last_seen, &cfg);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("PermissionDenied"));
+        assert_eq!(
+            last_seen.get("sess-1").map(String::as_str),
+            Some("2026-05-17T10:00:00Z")
+        );
+        // A second poll with the same event must not re-alert.
+        let again = check_and_alert(&sessions, &events, &mut last_seen, &cfg);
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn check_and_alert_skips_unsubscribed_category() {
+        // A `PreToolUse` event (Tool category) is not in the recommended
+        // subscription, so it must not produce an alert.
+        let cfg = AlertConfig::recommended();
+        let sessions = vec![serde_json::json!({ "id": "sess-1" })];
+        let mut events = std::collections::HashMap::new();
+        events.insert(
+            "sess-1".to_string(),
+            vec![serde_json::json!({
+                "event": "PreToolUse",
+                "at": "2026-05-17T10:00:00Z",
+            })],
+        );
+        let mut last_seen = LastSeen::new();
+        let alerts = check_and_alert(&sessions, &events, &mut last_seen, &cfg);
+        assert!(alerts.is_empty());
     }
 }

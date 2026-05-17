@@ -1,0 +1,344 @@
+//! Telegram-specific rendering of [`CommandResult`].
+//!
+//! Why: the executor returns a structured, UI-agnostic [`CommandResult`]; the
+//! Telegram bot must turn that into HTML message text and, for the session
+//! list, an inline keyboard. Keeping the rendering pure (no network, no
+//! teloxide runtime) makes it unit-testable.
+//! What: [`TelegramFormatter::format`] produces the HTML body and
+//! [`TelegramFormatter::keyboard_for`] the optional inline keyboard.
+//! Test: `cargo test -p trusty-mpm-telegram` covers each variant's rendering.
+
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
+use trusty_mpm_client::CommandResult;
+
+/// How many characters of a session id to show in chat output.
+///
+/// Why: full UUIDs are unreadable on a phone; the first 8 chars disambiguate in
+/// practice while keeping messages compact.
+const SHORT_ID_LEN: usize = 8;
+
+/// Renders [`CommandResult`]s into Telegram HTML messages and keyboards.
+///
+/// Why: the bot's message handler stays thin — it executes a command and hands
+/// the result here for presentation.
+/// What: a stateless formatter; both methods are associated functions.
+/// Test: the `format_*` tests below.
+pub struct TelegramFormatter;
+
+impl TelegramFormatter {
+    /// Render a [`CommandResult`] into an HTML message body.
+    ///
+    /// Why: every command's reply text is produced here so presentation is
+    /// consistent and testable.
+    /// What: matches each variant and returns an HTML-formatted string suitable
+    /// for teloxide's `ParseMode::Html`.
+    /// Test: `format_sessions_*`, `pair_code_command_formats_correctly`, etc.
+    pub fn format(result: &CommandResult) -> String {
+        match result {
+            CommandResult::Sessions(sessions) => {
+                if sessions.is_empty() {
+                    return "No active sessions.".to_string();
+                }
+                let mut text = String::from("<b>trusty-mpm sessions</b>\n");
+                for s in sessions {
+                    let dot = if s.status.eq_ignore_ascii_case("active") {
+                        "🟢"
+                    } else {
+                        "🔴"
+                    };
+                    text.push_str(&format!(
+                        "\n{dot} <code>{}</code> — {}\n  📁 <code>{}</code>\n",
+                        short_id(&s.id),
+                        s.status,
+                        s.workdir,
+                    ));
+                }
+                text
+            }
+            CommandResult::SessionDetail { id, events, .. } => {
+                if events.is_empty() {
+                    format!("Session {id}: no recent events")
+                } else {
+                    let lines = events
+                        .iter()
+                        .map(|e| format!("• {e}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("<b>Session {}</b>\n{lines}", short_id(id))
+                }
+            }
+            CommandResult::OverseerStatus {
+                enabled,
+                handler,
+                decisions,
+            } => format!(
+                "<b>Overseer Status</b>\nHandler: <code>{handler}</code>\nEnabled: {}\n\
+                 Recent decisions: allow ({}), block ({}), flag ({})",
+                if *enabled { "✅" } else { "❌" },
+                decisions.allow,
+                decisions.block,
+                decisions.flag,
+            ),
+            CommandResult::TmuxSessions(sessions) => {
+                if sessions.is_empty() {
+                    return "No tmux sessions found.".to_string();
+                }
+                let lines = sessions
+                    .iter()
+                    .map(|s| format!("• <code>{}</code>", s.name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("<b>tmux sessions</b>\n{lines}")
+            }
+            CommandResult::ConfigAnalysis {
+                project,
+                recommendations,
+            } => {
+                if recommendations.is_empty() {
+                    format!(
+                        "<b>Claude config</b> for <code>{project}</code>\n\
+                         No recommendations — config looks healthy."
+                    )
+                } else {
+                    let lines = recommendations
+                        .iter()
+                        .map(|r| format!("• {}", r.message))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("<b>Claude config</b> for <code>{project}</code>\n{lines}")
+                }
+            }
+            CommandResult::Snapshot { session, output } => {
+                let tail: Vec<&str> = output.lines().rev().take(50).collect();
+                let lines = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+                if lines.is_empty() {
+                    format!("Session <code>{session}</code>: empty pane")
+                } else {
+                    format!(
+                        "<b>Snapshot: {session}</b>\n<pre>{}</pre>",
+                        html_escape(&lines)
+                    )
+                }
+            }
+            CommandResult::Killed { session_id } => {
+                format!("🗑️ Session {} killed", short_id(session_id))
+            }
+            CommandResult::Approved { session_id } => {
+                format!("✅ Permission approved for session {session_id}")
+            }
+            CommandResult::Denied { session_id } => {
+                format!("❌ Permission denied for session {session_id}")
+            }
+            CommandResult::PairCode {
+                code,
+                expires_in_seconds,
+            } => format!(
+                "<b>Pairing code:</b> <code>{code}</code>\n\
+                 Expires in {} minutes\n\nSend to your bot: <code>/pair {code}</code>",
+                expires_in_seconds / 60,
+            ),
+            CommandResult::PairSuccess { chat_info } => {
+                format!(
+                    "✅ Successfully paired! This chat ({chat_info}) is now registered for alerts."
+                )
+            }
+            CommandResult::PairState { paired } => {
+                if *paired {
+                    "✅ Bot is paired with this daemon. Type /help to see commands.".to_string()
+                } else {
+                    "👋 Welcome to trusty-mpm bot! To pair this bot with your daemon, run \
+                     `tm pair` on your server, then send the code with /pair <code>"
+                        .to_string()
+                }
+            }
+            CommandResult::AlertSubscriptions(lines) => {
+                format!("<b>Alert subscription</b>\n{}", lines.join("\n"))
+            }
+            CommandResult::Help(text) => text.clone(),
+            CommandResult::Error(msg) => format!("❌ {msg}"),
+        }
+    }
+
+    /// Build the inline keyboard for a [`CommandResult`], if it warrants one.
+    ///
+    /// Why: the `/sessions` list decorates each session with `[Status]
+    /// [Approve] [Deny]` action buttons; other results have no keyboard.
+    /// What: returns one button row per session for [`CommandResult::Sessions`],
+    /// `None` for every other variant.
+    /// Test: `keyboard_for_sessions_has_rows`, `keyboard_for_help_is_none`.
+    pub fn keyboard_for(result: &CommandResult) -> Option<InlineKeyboardMarkup> {
+        match result {
+            CommandResult::Sessions(sessions) if !sessions.is_empty() => {
+                let rows: Vec<Vec<InlineKeyboardButton>> = sessions
+                    .iter()
+                    .map(|s| {
+                        vec![
+                            InlineKeyboardButton::callback("📋 Status", format!("status:{}", s.id)),
+                            InlineKeyboardButton::callback(
+                                "✅ Approve",
+                                format!("approve:{}", s.id),
+                            ),
+                            InlineKeyboardButton::callback("❌ Deny", format!("deny:{}", s.id)),
+                        ]
+                    })
+                    .collect();
+                Some(InlineKeyboardMarkup::new(rows))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Shorten a session id for compact chat display.
+///
+/// Why: full UUIDs do not fit comfortably on a phone screen.
+/// What: returns the first [`SHORT_ID_LEN`] chars plus an ellipsis, or the id
+/// unchanged when already short.
+/// Test: `short_id_truncates_long_ids`.
+fn short_id(id: &str) -> String {
+    if id.len() > SHORT_ID_LEN {
+        format!("{}…", &id[..SHORT_ID_LEN])
+    } else {
+        id.to_string()
+    }
+}
+
+/// Escape the three HTML-significant characters for teloxide's HTML parse mode.
+///
+/// Why: snapshot output is arbitrary terminal text; un-escaped `<`/`>`/`&`
+/// would break the message or be silently dropped by Telegram.
+/// What: replaces `&`, `<`, `>` with their HTML entities.
+/// Test: covered indirectly by the snapshot formatting test.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trusty_mpm_client::{
+        DecisionCounts, RecommendationSummary, SessionSummary, TmuxSessionSummary,
+    };
+
+    #[test]
+    fn format_sessions_empty() {
+        let text = TelegramFormatter::format(&CommandResult::Sessions(vec![]));
+        assert_eq!(text, "No active sessions.");
+    }
+
+    #[test]
+    fn format_sessions_lists_each() {
+        let result = CommandResult::Sessions(vec![SessionSummary {
+            id: "abcd1234-5678".into(),
+            status: "active".into(),
+            workdir: "/tmp/proj".into(),
+        }]);
+        let text = TelegramFormatter::format(&result);
+        assert!(text.contains("/tmp/proj"));
+        assert!(text.contains("trusty-mpm sessions"));
+    }
+
+    #[test]
+    fn keyboard_for_sessions_has_rows() {
+        let result = CommandResult::Sessions(vec![SessionSummary {
+            id: "abc".into(),
+            status: "active".into(),
+            workdir: "/p".into(),
+        }]);
+        let keyboard = TelegramFormatter::keyboard_for(&result).expect("keyboard");
+        assert_eq!(keyboard.inline_keyboard.len(), 1);
+        assert_eq!(keyboard.inline_keyboard[0].len(), 3);
+    }
+
+    #[test]
+    fn keyboard_for_help_is_none() {
+        let result = CommandResult::Help("help".into());
+        assert!(TelegramFormatter::keyboard_for(&result).is_none());
+    }
+
+    #[test]
+    fn pair_code_command_formats_correctly() {
+        let result = CommandResult::PairCode {
+            code: "A4X9KZ".into(),
+            expires_in_seconds: 300,
+        };
+        let text = TelegramFormatter::format(&result);
+        assert!(text.contains("A4X9KZ"), "code must be visible: {text}");
+        assert!(text.contains("5 minutes"));
+    }
+
+    #[test]
+    fn pair_success_formats_correctly() {
+        let result = CommandResult::PairSuccess {
+            chat_info: "chat 12345678".into(),
+        };
+        let text = TelegramFormatter::format(&result);
+        assert!(text.contains("Successfully paired"));
+        assert!(text.contains("12345678"));
+    }
+
+    #[test]
+    fn pair_state_unpaired_prompts_pairing() {
+        let text = TelegramFormatter::format(&CommandResult::PairState { paired: false });
+        assert!(text.contains("tm pair"));
+        let paired = TelegramFormatter::format(&CommandResult::PairState { paired: true });
+        assert!(paired.contains("paired"));
+    }
+
+    #[test]
+    fn format_error_marks_failure() {
+        let text = TelegramFormatter::format(&CommandResult::Error("boom".into()));
+        assert!(text.contains("boom"));
+    }
+
+    #[test]
+    fn format_overseer_status() {
+        let result = CommandResult::OverseerStatus {
+            enabled: true,
+            handler: "deterministic".into(),
+            decisions: DecisionCounts {
+                allow: 3,
+                block: 1,
+                flag: 0,
+            },
+        };
+        let text = TelegramFormatter::format(&result);
+        assert!(text.contains("deterministic"));
+        assert!(text.contains("allow (3)"));
+    }
+
+    #[test]
+    fn format_tmux_and_config() {
+        let tmux = CommandResult::TmuxSessions(vec![TmuxSessionSummary {
+            name: "tmpm-a".into(),
+        }]);
+        assert!(TelegramFormatter::format(&tmux).contains("tmpm-a"));
+
+        let config = CommandResult::ConfigAnalysis {
+            project: "/p".into(),
+            recommendations: vec![RecommendationSummary {
+                id: "r1".into(),
+                message: "enable hooks".into(),
+            }],
+        };
+        assert!(TelegramFormatter::format(&config).contains("enable hooks"));
+    }
+
+    #[test]
+    fn short_id_truncates_long_ids() {
+        assert_eq!(short_id("0123456789abcdef"), "01234567…");
+        assert_eq!(short_id("short"), "short");
+    }
+
+    #[test]
+    fn snapshot_escapes_html() {
+        let result = CommandResult::Snapshot {
+            session: "s".into(),
+            output: "<script>".into(),
+        };
+        let text = TelegramFormatter::format(&result);
+        assert!(text.contains("&lt;script&gt;"));
+    }
+}

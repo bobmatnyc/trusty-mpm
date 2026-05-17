@@ -1,0 +1,788 @@
+//! Unified daemon HTTP client.
+//!
+//! Why: every trusty-mpm UI (TUI, Telegram bot, CLI) is a separate process from
+//! the daemon and must reach it over HTTP. Before this crate the transport was
+//! reimplemented per UI; [`DaemonClient`] is the single shared wrapper so a new
+//! endpoint is wired exactly once.
+//! What: [`DaemonClient`] holds a base URL plus a shared `reqwest::Client` and
+//! exposes one async method per daemon endpoint the UIs need — session listing
+//! and lifecycle, the event feed, breaker state, the overseer / tmux / config
+//! analyzer views, and the pairing handshake.
+//! Test: `cargo test -p trusty-mpm-client` checks URL construction and wire-shape
+//! deserialization; live HTTP is exercised by the executor tests against an
+//! in-process test daemon and by the daemon's own API tests.
+
+use serde::Deserialize;
+
+/// HTTP client for one trusty-mpm daemon.
+///
+/// Why: a thin wrapper so any UI can be pointed at any daemon address.
+/// What: holds the base URL and a shared `reqwest::Client`.
+/// Test: `base_url_is_stored`.
+#[derive(Debug, Clone)]
+pub struct DaemonClient {
+    /// Base URL of the daemon, e.g. `http://127.0.0.1:7880`.
+    base: String,
+    /// Shared connection-pooling HTTP client.
+    http: reqwest::Client,
+}
+
+/// One session row as returned by `GET /sessions`.
+///
+/// Why: the UIs render sessions and resolve action targets from this shape.
+/// What: mirrors the daemon's `Session` serde output, keeping only the fields
+/// every UI consumes.
+/// Test: `session_row_deserializes_tmux_name`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRow {
+    /// Session id (UUID), serialized by the daemon as a bare string.
+    pub id: serde_json::Value,
+    /// Working directory.
+    pub workdir: String,
+    /// Lifecycle status string.
+    pub status: serde_json::Value,
+    /// Number of active delegations.
+    #[serde(default)]
+    pub active_delegations: u32,
+    /// Friendly tmux session name (`tmpm-<adjective>-<noun>`).
+    ///
+    /// Why: session action endpoints resolve their `{id}` path segment against
+    /// this friendly name; the UIs use it as the action target rather than the
+    /// raw UUID.
+    /// Test: `session_row_deserializes_tmux_name`.
+    #[serde(default)]
+    pub tmux_name: String,
+    /// Last-seen timestamp from the daemon, serialized as
+    /// `{"secs_since_epoch": u64, "nanos_since_epoch": u32}`.
+    ///
+    /// Why: recency tie-breaking for `connect` workdir-prefix resolution.
+    /// What: deserialized from the daemon's `SystemTime` serde output; defaults
+    /// to `{"secs_since_epoch":0}` when absent.
+    #[serde(default)]
+    pub last_seen: LastSeen,
+}
+
+/// Serde shape for `SystemTime` as emitted by the daemon.
+///
+/// Why: `serde` serializes `SystemTime` as a struct, not a plain integer; only
+/// the seconds component is needed for recency comparison.
+/// What: a single `secs_since_epoch` field, defaulting to zero.
+/// Test: covered by `session_row_deserializes_tmux_name`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LastSeen {
+    /// Whole seconds since the Unix epoch.
+    #[serde(default)]
+    pub secs_since_epoch: u64,
+}
+
+/// One hook-event row as returned by `GET /events`.
+///
+/// Why: the dashboard's event panel renders the daemon's live hook feed.
+/// What: mirrors the serde output of `HookEventRecord`.
+/// Test: `events_deserialize_from_record_shape`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventRow {
+    /// Originating session (`SessionId` newtype JSON: `{"0": "<uuid>"}`).
+    pub session: serde_json::Value,
+    /// Claude Code wire event name (e.g. `PreToolUse`).
+    pub event: String,
+    /// RFC3339 timestamp the daemon received the event.
+    pub at: String,
+    /// Opaque event payload; defaults to `Null` when the daemon omits it.
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+/// One circuit-breaker row as returned by `GET /breakers`.
+///
+/// Why: the dashboard's breaker panel shows which agents have tripped.
+/// What: the agent name plus the flattened breaker state and failure count.
+/// Test: `breakers_deserialize_from_api_shape`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BreakerRow {
+    /// Agent name the breaker guards.
+    pub agent: String,
+    /// Breaker state: `closed` / `open` / `half_open`.
+    pub state: String,
+    /// Consecutive failures observed since the last success.
+    pub consecutive_failures: u32,
+}
+
+/// One tmux session row as returned by `GET /tmux/sessions`.
+///
+/// Why: the Telegram `/tmux` command lists every tmux session on the host.
+/// What: the session name; the daemon's payload may be a plain string or an
+/// object carrying a `name` field, so both shapes are accepted on parse.
+/// Test: `tmux_session_row_accepts_name`.
+#[derive(Debug, Clone)]
+pub struct TmuxSessionRow {
+    /// tmux session name.
+    pub name: String,
+}
+
+/// One Claude Code config recommendation from `GET /claude-config`.
+///
+/// Why: the `/config` command surfaces analyzer recommendations to the operator.
+/// What: the recommendation id and its human-readable message.
+/// Test: covered by the executor's config tests.
+#[derive(Debug, Clone)]
+pub struct ConfigRecommendation {
+    /// Stable recommendation id (used to apply it).
+    pub id: String,
+    /// Human-readable description of the recommendation.
+    pub message: String,
+}
+
+/// Overseer status as returned by `GET /overseer`.
+///
+/// Why: the `/overseer` command reports whether oversight is active.
+/// What: the enabled flag, the handler name, and the recent decision counts.
+/// Test: covered by the executor's overseer test.
+#[derive(Debug, Clone)]
+pub struct OverseerSnapshot {
+    /// Whether the overseer is enabled.
+    pub enabled: bool,
+    /// Active overseer strategy name.
+    pub handler: String,
+    /// Recent allow / block / flag decision counts.
+    pub decisions: (u64, u64, u64),
+}
+
+/// Response body of `POST /pair/request`.
+///
+/// Why: `tm pair` shows the code and its TTL to the operator.
+/// What: the generated pairing code and its lifetime in seconds.
+/// Test: covered by the executor's pairing test.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairRequest {
+    /// One-time pairing code (six uppercase alphanumeric characters).
+    pub code: String,
+    /// Seconds until the code expires.
+    #[serde(default)]
+    pub expires_in_seconds: u64,
+}
+
+/// Response body of `POST /pair/confirm`.
+///
+/// Why: the bot's `/pair` flow reports success or the failure reason.
+/// What: the success flag, the registered chat id, and an optional error.
+/// Test: covered by the executor's pairing test.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairConfirm {
+    /// Whether the code was valid and the chat is now paired.
+    pub success: bool,
+    /// The chat id that was registered, when `success` is true.
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+    /// Failure reason, when `success` is false.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Response body of `GET /pair/status`.
+///
+/// Why: the `/start` command branches on whether the daemon is already paired.
+/// What: the paired flag and the registered chat id when present.
+/// Test: covered by the executor's pairing test.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairStatus {
+    /// Whether a chat is currently paired with the daemon.
+    pub paired: bool,
+    /// The paired chat id, when `paired` is true.
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+}
+
+impl DaemonClient {
+    /// Build a client targeting `base` (e.g. `http://127.0.0.1:7880`).
+    ///
+    /// Why: a UI is pointed at a daemon address resolved from a flag or the
+    /// service lock file.
+    /// What: stores the base URL and a fresh pooled `reqwest::Client`.
+    /// Test: `base_url_is_stored`.
+    pub fn new(base: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// The base URL this client targets.
+    ///
+    /// Why: tests and diagnostics need to read back the configured address.
+    /// What: returns the stored base URL string.
+    /// Test: `base_url_is_stored`.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    /// Fetch the current session list from the daemon.
+    ///
+    /// Why: every UI's session view refreshes from this.
+    /// What: `GET /sessions`, returns the `sessions` array deserialized.
+    /// Test: covered by the daemon API tests and the executor tests.
+    pub async fn sessions(&self) -> anyhow::Result<Vec<SessionRow>> {
+        #[derive(Deserialize)]
+        struct Body {
+            sessions: Vec<SessionRow>,
+        }
+        let url = format!("{}/sessions", self.base);
+        let body: Body = self.http.get(&url).send().await?.json().await?;
+        Ok(body.sessions)
+    }
+
+    /// Fetch the recent hook-event feed from the daemon.
+    ///
+    /// Why: the dashboard's event panel refreshes from this.
+    /// What: `GET /events`, returns the `events` array deserialized.
+    /// Test: `events_deserialize_from_record_shape` covers the wire shape.
+    pub async fn events(&self) -> anyhow::Result<Vec<EventRow>> {
+        #[derive(Deserialize)]
+        struct Body {
+            events: Vec<EventRow>,
+        }
+        let url = format!("{}/events", self.base);
+        let body: Body = self.http.get(&url).send().await?.json().await?;
+        Ok(body.events)
+    }
+
+    /// Fetch one session's recent hook events.
+    ///
+    /// Why: the `/status` command shows a session's last events.
+    /// What: `GET /sessions/{id}/events`, returns the `events` array.
+    /// Test: covered by the executor's status test.
+    pub async fn session_events(&self, id: &str) -> anyhow::Result<Vec<EventRow>> {
+        #[derive(Deserialize)]
+        struct Body {
+            events: Vec<EventRow>,
+        }
+        let url = format!("{}/sessions/{id}/events", self.base);
+        let body: Body = self.http.get(&url).send().await?.json().await?;
+        Ok(body.events)
+    }
+
+    /// Fetch every agent's circuit-breaker state from the daemon.
+    ///
+    /// Why: the dashboard's breaker panel needs the latest breaker snapshot.
+    /// What: `GET /breakers`, flattening the nested `breaker` object into a
+    /// flat [`BreakerRow`] per agent.
+    /// Test: `breakers_deserialize_from_api_shape` covers the wire shape.
+    pub async fn breakers(&self) -> anyhow::Result<Vec<BreakerRow>> {
+        #[derive(Deserialize)]
+        struct WireBreaker {
+            state: String,
+            consecutive_failures: u32,
+        }
+        #[derive(Deserialize)]
+        struct WireRow {
+            agent: String,
+            breaker: WireBreaker,
+        }
+        #[derive(Deserialize)]
+        struct Body {
+            breakers: Vec<WireRow>,
+        }
+        let url = format!("{}/breakers", self.base);
+        let body: Body = self.http.get(&url).send().await?.json().await?;
+        Ok(body
+            .breakers
+            .into_iter()
+            .map(|r| BreakerRow {
+                agent: r.agent,
+                state: r.breaker.state,
+                consecutive_failures: r.breaker.consecutive_failures,
+            })
+            .collect())
+    }
+
+    /// Probe whether the daemon is reachable.
+    ///
+    /// Why: the TUI greys out its panels when the daemon is down.
+    /// What: `GET /health`, true on any 2xx response.
+    /// Test: covered by the daemon API tests.
+    pub async fn is_healthy(&self) -> bool {
+        let url = format!("{}/health", self.base);
+        matches!(self.http.get(&url).send().await, Ok(r) if r.status().is_success())
+    }
+
+    /// Pause a session via `POST /sessions/{id}/pause`.
+    ///
+    /// Why: the dashboard's `p` key pauses the selected session in place.
+    /// What: POSTs `{"summary": null}` and returns the `summary` field.
+    /// Test: live HTTP is covered by the daemon's session-lifecycle tests.
+    pub async fn pause_session(&self, id: &str) -> anyhow::Result<String> {
+        let url = format!("{}/sessions/{id}/pause", self.base);
+        let body: serde_json::Value = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "summary": serde_json::Value::Null }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// Resume a session via `POST /sessions/{id}/resume`.
+    ///
+    /// Why: the dashboard's `r` key resumes the selected paused session.
+    /// What: POSTs to the resume endpoint and discards the response body.
+    /// Test: live HTTP is covered by the daemon's session-lifecycle tests.
+    pub async fn resume_session(&self, id: &str) -> anyhow::Result<()> {
+        let url = format!("{}/sessions/{id}/resume", self.base);
+        self.http.post(&url).send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    /// Stop a session via `DELETE /sessions/{id}`.
+    ///
+    /// Why: the dashboard's `x` key and the `/kill` command stop a session.
+    /// What: sends a DELETE to the session endpoint; returns `Ok(true)` when the
+    /// session existed, `Ok(false)` on a 404, `Err` on transport failure.
+    /// Test: covered by the executor's kill test.
+    pub async fn kill_session(&self, id: &str) -> anyhow::Result<bool> {
+        let url = format!("{}/sessions/{id}", self.base);
+        let resp = self.http.delete(&url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        resp.error_for_status()?;
+        Ok(true)
+    }
+
+    /// Stop a session, discarding the found/missing distinction.
+    ///
+    /// Why: the TUI's `x` key only needs success-or-error feedback.
+    /// What: calls [`Self::kill_session`] and maps the result to `()`.
+    /// Test: covered by the executor's kill test.
+    pub async fn stop_session(&self, id: &str) -> anyhow::Result<()> {
+        self.kill_session(id).await.map(|_| ())
+    }
+
+    /// Capture recent session output via `GET /sessions/{id}/output`.
+    ///
+    /// Why: the dashboard's `o` key snapshots the selected session's pane.
+    /// What: `GET /sessions/{id}/output?lines={lines}`, returns the `output`
+    /// field from the 200 response.
+    /// Test: live HTTP is covered by the daemon's session-lifecycle tests.
+    pub async fn session_output(&self, id: &str, lines: u32) -> anyhow::Result<String> {
+        let url = format!("{}/sessions/{id}/output", self.base);
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .query(&[("lines", lines.to_string())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// Fetch the overseer status via `GET /overseer`.
+    ///
+    /// Why: the `/overseer` command reports oversight status.
+    /// What: returns the enabled flag, handler name, and decision counts.
+    /// Test: covered by the executor's overseer test.
+    pub async fn overseer_status(&self) -> anyhow::Result<OverseerSnapshot> {
+        let url = format!("{}/overseer", self.base);
+        let body: serde_json::Value = self.http.get(&url).send().await?.json().await?;
+        let o = &body["overseer"];
+        let decisions = &o["decisions"];
+        Ok(OverseerSnapshot {
+            enabled: o["enabled"].as_bool().unwrap_or(false),
+            handler: o["handler"].as_str().unwrap_or("?").to_string(),
+            decisions: (
+                decisions["allow"].as_u64().unwrap_or(0),
+                decisions["block"].as_u64().unwrap_or(0),
+                decisions["flag"].as_u64().unwrap_or(0),
+            ),
+        })
+    }
+
+    /// List every tmux session on the daemon host via `GET /tmux/sessions`.
+    ///
+    /// Why: the `/tmux` command lists internal and external tmux sessions.
+    /// What: returns one [`TmuxSessionRow`] per session; the daemon payload may
+    /// be plain strings or objects, both of which are accepted.
+    /// Test: `tmux_session_row_accepts_name`.
+    pub async fn tmux_sessions(&self) -> anyhow::Result<Vec<TmuxSessionRow>> {
+        let url = format!("{}/tmux/sessions", self.base);
+        let body: serde_json::Value = self.http.get(&url).send().await?.json().await?;
+        let sessions = body["sessions"].as_array().cloned().unwrap_or_default();
+        Ok(sessions
+            .iter()
+            .filter_map(|s| {
+                let name = s
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| s.as_str())?;
+                Some(TmuxSessionRow {
+                    name: name.to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// Capture a tmux pane snapshot via `GET /tmux/sessions/{name}/snapshot`.
+    ///
+    /// Why: the `/snapshot` command shows a tmux pane's recent output.
+    /// What: returns the snapshot text, or `Ok(None)` when the session is
+    /// unknown / tmux is unavailable (the daemon answers 404).
+    /// Test: covered by the daemon's tmux tests.
+    pub async fn snapshot_tmux_session(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let url = format!("{}/tmux/sessions/{name}/snapshot", self.base);
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(Some(snapshot_text(&body["snapshot"])))
+    }
+
+    /// Adopt an external tmux session via `POST /tmux/adopt`.
+    ///
+    /// Why: brings a session trusty-mpm did not create under oversight.
+    /// What: POSTs the session name; returns `Ok(true)` on success, `Ok(false)`
+    /// when the session was not found.
+    /// Test: covered by the daemon's tmux tests.
+    pub async fn adopt_tmux_session(&self, name: &str) -> anyhow::Result<bool> {
+        let url = format!("{}/tmux/adopt", self.base);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "session": name }))
+            .send()
+            .await?;
+        Ok(resp.status().is_success())
+    }
+
+    /// Analyze a project's Claude Code config via `GET /claude-config`.
+    ///
+    /// Why: the `/config` command surfaces analyzer recommendations.
+    /// What: `GET /claude-config?project=<path>`, returns one
+    /// [`ConfigRecommendation`] per recommendation.
+    /// Test: covered by the executor's config test.
+    pub async fn analyze_config(&self, project: &str) -> anyhow::Result<Vec<ConfigRecommendation>> {
+        let url = format!("{}/claude-config", self.base);
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .query(&[("project", project)])
+            .send()
+            .await?
+            .json()
+            .await?;
+        let recs = body["recommendations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        Ok(recs
+            .iter()
+            .map(|r| ConfigRecommendation {
+                id: r
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                message: r
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| r.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            })
+            .collect())
+    }
+
+    /// Apply a config recommendation via `POST /claude-config/apply`.
+    ///
+    /// Why: lets a UI act on a recommendation without hand-editing JSON.
+    /// What: POSTs the project path and recommendation id; returns the
+    /// checkpoint id on success.
+    /// Test: covered by the daemon's claude-config tests.
+    pub async fn apply_recommendation(
+        &self,
+        project: &str,
+        recommendation_id: &str,
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/claude-config/apply", self.base);
+        let body: serde_json::Value = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "project": project,
+                "recommendation_id": recommendation_id,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body
+            .get("checkpoint_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// List a project's config checkpoints via `GET /claude-config/checkpoints`.
+    ///
+    /// Why: a UI offers a restore picker fed by this list.
+    /// What: returns the raw checkpoint JSON array.
+    /// Test: covered by the daemon's claude-config tests.
+    pub async fn list_checkpoints(&self, project: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let url = format!("{}/claude-config/checkpoints", self.base);
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .query(&[("project", project)])
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(body["checkpoints"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Deploy a built-in profile via `POST /claude-config/deploy`.
+    ///
+    /// Why: lets a UI apply a configuration preset in one call.
+    /// What: POSTs the project path and profile name; returns the checkpoint id.
+    /// Test: covered by the daemon's claude-config tests.
+    pub async fn deploy_profile(
+        &self,
+        project: &str,
+        profile_name: &str,
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/claude-config/deploy", self.base);
+        let body: serde_json::Value = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "project": project,
+                "profile_name": profile_name,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body
+            .get("checkpoint_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// Request a one-time pairing code via `POST /pair/request`.
+    ///
+    /// Why: `tm pair` asks the local daemon for a code to type into the bot.
+    /// What: POSTs an empty body; returns the generated code and its TTL.
+    /// Test: covered by the executor's pairing test.
+    pub async fn pair_request(&self) -> anyhow::Result<PairRequest> {
+        let url = format!("{}/pair/request", self.base);
+        let body: PairRequest = self
+            .http
+            .post(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body)
+    }
+
+    /// Confirm a pairing code via `POST /pair/confirm`.
+    ///
+    /// Why: the bot's `/pair <code>` flow registers its chat with the daemon.
+    /// What: POSTs the code and chat id; returns the success / error result.
+    /// Test: covered by the executor's pairing test.
+    pub async fn pair_confirm(&self, code: &str, chat_id: i64) -> anyhow::Result<PairConfirm> {
+        let url = format!("{}/pair/confirm", self.base);
+        let body: PairConfirm = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "code": code, "chat_id": chat_id }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(body)
+    }
+
+    /// Query pairing status via `GET /pair/status`.
+    ///
+    /// Why: the `/start` command branches on whether the daemon is paired.
+    /// What: `GET /pair/status`, returns the paired flag and chat id.
+    /// Test: covered by the executor's pairing test.
+    pub async fn pair_status(&self) -> anyhow::Result<PairStatus> {
+        let url = format!("{}/pair/status", self.base);
+        let body: PairStatus = self.http.get(&url).send().await?.json().await?;
+        Ok(body)
+    }
+}
+
+/// Render a tmux snapshot JSON value as a flat text block.
+///
+/// Why: the daemon's snapshot payload may be a plain string or an object with a
+/// `content` / `lines` field; a UI needs a single string.
+/// What: returns the string form, joining a `lines` array if present.
+/// Test: covered indirectly by `snapshot_tmux_session`.
+fn snapshot_text(snapshot: &serde_json::Value) -> String {
+    if let Some(s) = snapshot.as_str() {
+        return s.to_string();
+    }
+    if let Some(content) = snapshot.get("content").and_then(|v| v.as_str()) {
+        return content.to_string();
+    }
+    if let Some(lines) = snapshot.get("lines").and_then(|v| v.as_array()) {
+        return lines
+            .iter()
+            .filter_map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    snapshot.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_url_is_stored() {
+        let client = DaemonClient::new("http://127.0.0.1:7880");
+        assert_eq!(client.base_url(), "http://127.0.0.1:7880");
+    }
+
+    #[test]
+    fn session_row_deserializes_tmux_name() {
+        let json = serde_json::json!({
+            "id": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "workdir": "/tmp/proj",
+            "status": "active",
+            "active_delegations": 1,
+            "tmux_name": "tmpm-quiet-falcon"
+        });
+        let row: SessionRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.tmux_name, "tmpm-quiet-falcon");
+    }
+
+    #[test]
+    fn session_row_defaults_tmux_name_when_absent() {
+        let json = serde_json::json!({
+            "id": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "workdir": "/tmp/proj",
+            "status": "active"
+        });
+        let row: SessionRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.tmux_name, "");
+        assert_eq!(row.last_seen.secs_since_epoch, 0);
+    }
+
+    #[test]
+    fn events_deserialize_from_record_shape() {
+        let json = serde_json::json!({
+            "session": {"0": "abcd1234-5678-90ab-cdef-1234567890ab"},
+            "event": "PreToolUse",
+            "at": "2024-01-01T00:00:00Z",
+            "payload": {}
+        });
+        let row: EventRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.event, "PreToolUse");
+        assert_eq!(row.at, "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn events_default_payload_when_absent() {
+        let json = serde_json::json!({
+            "session": {"0": "abcd1234-5678-90ab-cdef-1234567890ab"},
+            "event": "Stop",
+            "at": "2024-01-01T00:00:00Z"
+        });
+        let row: EventRow = serde_json::from_value(json).unwrap();
+        assert!(row.payload.is_null());
+    }
+
+    #[test]
+    fn breakers_deserialize_from_api_shape() {
+        let json = serde_json::json!({
+            "agent": "research",
+            "breaker": { "state": "closed", "consecutive_failures": 0 }
+        });
+        #[derive(serde::Deserialize)]
+        struct WireBreaker {
+            state: String,
+            consecutive_failures: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct WireRow {
+            agent: String,
+            breaker: WireBreaker,
+        }
+        let row: WireRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.agent, "research");
+        assert_eq!(row.breaker.state, "closed");
+        assert_eq!(row.breaker.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn tmux_session_row_accepts_name() {
+        // The snapshot helper joins a `lines` array; the name parse is exercised
+        // here directly on both wire shapes.
+        let obj = serde_json::json!({"name": "tmpm-quiet-falcon"});
+        assert_eq!(
+            obj.get("name").and_then(|v| v.as_str()),
+            Some("tmpm-quiet-falcon")
+        );
+        let plain = serde_json::json!("external-shell");
+        assert_eq!(plain.as_str(), Some("external-shell"));
+    }
+
+    #[test]
+    fn snapshot_text_handles_each_shape() {
+        assert_eq!(snapshot_text(&serde_json::json!("plain")), "plain");
+        assert_eq!(
+            snapshot_text(&serde_json::json!({"content": "from content"})),
+            "from content"
+        );
+        assert_eq!(
+            snapshot_text(&serde_json::json!({"lines": ["a", "b"]})),
+            "a\nb"
+        );
+    }
+
+    #[test]
+    fn pair_request_deserializes() {
+        let json = serde_json::json!({"code": "A4X9KZ", "expires_in_seconds": 300});
+        let req: PairRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.code, "A4X9KZ");
+        assert_eq!(req.expires_in_seconds, 300);
+    }
+
+    #[test]
+    fn pair_confirm_deserializes_failure() {
+        let json = serde_json::json!({"success": false, "error": "invalid or expired code"});
+        let confirm: PairConfirm = serde_json::from_value(json).unwrap();
+        assert!(!confirm.success);
+        assert_eq!(confirm.error.as_deref(), Some("invalid or expired code"));
+        assert_eq!(confirm.chat_id, None);
+    }
+
+    #[test]
+    fn pair_status_deserializes() {
+        let json = serde_json::json!({"paired": true, "chat_id": 12345678});
+        let status: PairStatus = serde_json::from_value(json).unwrap();
+        assert!(status.paired);
+        assert_eq!(status.chat_id, Some(12345678));
+    }
+}

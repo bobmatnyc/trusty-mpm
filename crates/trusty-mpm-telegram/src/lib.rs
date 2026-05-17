@@ -1,33 +1,130 @@
 //! trusty-mpm Telegram bot library.
 //!
 //! Why: remote management lets an operator drive the daemon from a phone —
-//! list sessions, check status, approve a pending permission request, and
-//! receive memory-pressure / hook-event alerts — without a terminal. Exposing
-//! the bot as a library lets the unified `trusty-mpm telegram` subcommand reuse
-//! it without a separate binary.
-//! What: parses operator commands via [`commands`] and decides/format alerts
-//! via [`alerts`]. The teloxide runtime wiring in [`run`] is intentionally
-//! thin; all decision logic lives in the two unit-tested modules.
-//! Test: `cargo test -p trusty-mpm-telegram` covers command parsing and alert
-//! formatting; `trusty-mpm telegram --check` validates config.
+//! list sessions, check status, approve a pending permission request, inspect
+//! the overseer / tmux, pair the bot to a daemon, and receive push alerts.
+//! After the client refactor this crate is a *thin adapter*: all command
+//! dispatch and daemon I/O lives in the shared `trusty-mpm-client` crate
+//! ([`CommandExecutor`]); this crate only wires teloxide, converts the native
+//! [`TelegramCommand`] into the shared [`TrustyCommand`], renders results via
+//! [`TelegramFormatter`], runs the push-alert loop, and owns the pairing flow.
+//! What: [`run`] boots the teloxide dispatcher; [`commands`] holds the native
+//! command enum and its conversion; [`formatter`] renders results; [`alerts`]
+//! holds the pure alert-decision core.
+//! Test: `cargo test -p trusty-mpm-telegram` covers command conversion, alert
+//! formatting, the pure alert-loop core, and result formatting.
 
 pub mod alerts;
 pub mod commands;
+pub mod formatter;
+
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use teloxide::prelude::*;
+use teloxide::types::ParseMode;
+use teloxide::utils::command::BotCommands;
+use tokio_util::sync::CancellationToken;
 
-use alerts::AlertConfig;
+use alerts::{AlertConfig, LastSeen};
+use commands::TelegramCommand;
+use formatter::TelegramFormatter;
+use trusty_mpm_client::{CommandExecutor, CommandResult, TrustyCommand};
+
+/// Poll interval for the per-session event push-alert loop.
+const SESSION_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Poll interval for the overseer push-alert loop.
+const OVERSEER_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Optional operator restriction + alert routing for the bot runtime.
+///
+/// Why: the bot can be locked to a single Telegram user and can push
+/// unsolicited alerts to one chat; both are optional CLI-driven settings that
+/// must thread through the teloxide handlers.
+/// What: holds the allowed user id (when restricted) and the alert chat id.
+/// Test: the unauthorized branch is exercised by `is_authorized`.
+#[derive(Debug, Clone, Default)]
+pub struct BotOptions {
+    /// When set, only this Telegram user id may use the bot.
+    pub allowed_user_id: Option<i64>,
+    /// When set, the chat id push alerts are delivered to.
+    pub alert_chat_id: Option<i64>,
+}
+
+/// Resolve a secret the same way the LLM overseer does: `.env.local`, then
+/// `.env`, then the process environment.
+///
+/// Why: the operator stores the bot token in `.env.local` (gitignored) exactly
+/// as they store `OPENROUTER_API_KEY`; the bot must honour that same resolution
+/// order so a single dotenv file configures the whole tool.
+/// What: returns the first non-empty value found for `var_name`, or `None`.
+/// Test: `resolve_token_reads_dotenv`, `resolve_token_missing_is_none`.
+pub fn resolve_token(var_name: &str) -> Option<String> {
+    for file in [".env.local", ".env"] {
+        if let Some(value) = read_dotenv_key(Path::new(file), var_name) {
+            return Some(value);
+        }
+    }
+    std::env::var(var_name).ok().filter(|v| !v.is_empty())
+}
+
+/// Read a single `KEY=value` pair from a dotenv-style file.
+///
+/// Why: pulling the parse out keeps [`resolve_token`] testable against a temp
+/// file. Mirrors the daemon's `read_dotenv_key`.
+/// What: returns the trimmed, unquoted value for `var_name`, or `None` if the
+/// file is absent or the key is not present / empty.
+/// Test: `resolve_token_reads_dotenv`.
+fn read_dotenv_key(path: &Path, var_name: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim() == var_name
+        {
+            let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// True if a message from `user_id` may be processed under `options`.
+///
+/// Why: an optionally-restricted bot must reject every other operator.
+/// What: returns true when no restriction is configured, or when the message's
+/// user id matches the allowed id.
+/// Test: `authorization_respects_allowed_user`.
+fn is_authorized(options: &BotOptions, user_id: Option<i64>) -> bool {
+    match options.allowed_user_id {
+        None => true,
+        Some(allowed) => user_id == Some(allowed),
+    }
+}
 
 /// Run the Telegram remote-management bot against `url`.
 ///
 /// Why: shared entry point for both the `trusty-mpm telegram` subcommand and
 /// the backward-compatible `trusty-mpm-telegram` shim binary.
 /// What: with `check`, prints the resolved configuration and exits; otherwise
-/// boots the teloxide long-polling repl, dispatching each text message through
-/// [`handle_command`] against the daemon HTTP API.
+/// registers the generated command menu, spawns the push-alert loop (when an
+/// alert chat id is configured), and boots the teloxide dispatcher handling
+/// both text messages and inline-keyboard callback queries.
 /// Test: `--check` mode is deterministic; live behaviour is exercised by
 /// running the bot against a daemon. Command handling is covered by tests.
-pub async fn run(url: String, token: Option<String>, check: bool) -> anyhow::Result<()> {
+pub async fn run(
+    url: String,
+    token: Option<String>,
+    check: bool,
+    options: BotOptions,
+) -> anyhow::Result<()> {
     let alert_config = AlertConfig::recommended();
 
     if check {
@@ -39,8 +136,22 @@ pub async fn run(url: String, token: Option<String>, check: bool) -> anyhow::Res
         );
         println!("  alert categories  : {:?}", alert_config.categories);
         println!("  memory alerts     : {}", alert_config.memory_alerts);
+        println!(
+            "  alert chat id     : {}",
+            options
+                .alert_chat_id
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "none".into())
+        );
+        println!(
+            "  allowed user id   : {}",
+            options
+                .allowed_user_id
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "unrestricted".into())
+        );
         println!();
-        println!("{}", commands::help_text());
+        println!("{}", trusty_mpm_client::command::help_text());
         return Ok(());
     }
 
@@ -48,110 +159,328 @@ pub async fn run(url: String, token: Option<String>, check: bool) -> anyhow::Res
         anyhow::anyhow!("TELEGRAM_BOT_TOKEN is required (or pass --check to validate config)")
     })?;
 
-    // Run the teloxide long-polling repl: every text message is parsed into a
-    // `BotCommand` and dispatched against the daemon's HTTP API.
     let bot = Bot::new(token);
-    let daemon_url = url.clone();
 
-    teloxide::repl(bot, move |bot: Bot, msg: Message| {
-        let daemon_url = daemon_url.clone();
-        async move {
-            if let Some(text) = msg.text() {
-                let reply = match commands::parse(text) {
-                    Ok(cmd) => handle_command(cmd, &daemon_url).await,
-                    Err(e) => e,
-                };
-                bot.send_message(msg.chat.id, reply).await?;
-            }
-            Ok(())
-        }
-    })
-    .await;
+    // Register the command menu so users see a `/`-command picker in Telegram.
+    bot.set_my_commands(TelegramCommand::bot_commands()).await?;
+
+    let shutdown = CancellationToken::new();
+
+    // Spawn the push-alert loop when an alert chat id was configured.
+    if let Some(chat_id) = options.alert_chat_id {
+        let alert_bot = bot.clone();
+        let alert_url = url.clone();
+        let alert_cfg = alert_config.clone();
+        let token = shutdown.clone();
+        tokio::spawn(async move {
+            run_alert_loop(alert_bot, ChatId(chat_id), alert_url, alert_cfg, token).await;
+        });
+    }
+
+    // The one executor every handler shares — all daemon I/O goes through it.
+    let executor = Arc::new(CommandExecutor::new(url));
+    let opts = Arc::new(options);
+
+    let handler = dptree::entry()
+        .branch(Update::filter_message().endpoint(on_message))
+        .branch(Update::filter_callback_query().endpoint(on_callback));
+
+    Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![executor, opts])
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+
+    shutdown.cancel();
     Ok(())
 }
 
-/// Dispatch a parsed operator command against the daemon HTTP API.
+/// teloxide message handler: authorize, parse, execute, render, reply.
 ///
-/// Why: keeps the teloxide closure thin — all daemon I/O and reply formatting
-/// lives here where it can evolve independently of the runtime wiring.
-/// What: maps each [`commands::BotCommand`] to a daemon request and renders a
-/// human-readable reply string; unreachable-daemon and parse errors become the
-/// reply text rather than panics.
-/// Test: covered indirectly by `commands` parsing tests; live behaviour is
-/// exercised by running the bot against a daemon.
-pub async fn handle_command(cmd: commands::BotCommand, daemon_url: &str) -> String {
-    use commands::BotCommand::*;
+/// Why: the dispatcher branch for text messages — kept thin so all command
+/// dispatch stays in the shared [`CommandExecutor`].
+/// What: rejects unauthorized users, parses the text into a [`TelegramCommand`]
+/// via teloxide, dispatches it (the pairing commands need the message's chat id
+/// so they are special-cased), formats the [`CommandResult`], and replies with
+/// the appropriate inline keyboard.
+/// Test: command conversion is covered by `commands` tests; formatting by
+/// `formatter` tests; authorization by `authorization_respects_allowed_user`.
+async fn on_message(
+    bot: Bot,
+    msg: Message,
+    executor: Arc<CommandExecutor>,
+    options: Arc<BotOptions>,
+) -> ResponseResult<()> {
+    let Some(text) = msg.text() else {
+        return Ok(());
+    };
+    let user_id = msg.from.as_ref().map(|u| u.id.0 as i64);
+    if !is_authorized(&options, user_id) {
+        tracing::warn!(?user_id, "unauthorized Telegram message rejected");
+        bot.send_message(
+            msg.chat.id,
+            "🔒 This bot is restricted to authorized operators.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let command = match TelegramCommand::parse(text, "trusty_mpm_bot") {
+        Ok(cmd) => cmd,
+        Err(_) => {
+            bot.send_message(msg.chat.id, "Unknown command — try /help")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let result = dispatch_command(command, &executor, msg.chat.id.0).await;
+    let body = TelegramFormatter::format(&result);
+    let mut send = bot
+        .send_message(msg.chat.id, body)
+        .parse_mode(ParseMode::Html);
+    if let Some(keyboard) = TelegramFormatter::keyboard_for(&result) {
+        send = send.reply_markup(keyboard);
+    }
+    send.await?;
+    Ok(())
+}
+
+/// Dispatch one [`TelegramCommand`], threading the chat id for pairing.
+///
+/// Why: most commands are pure `TrustyCommand` dispatch, but the pairing
+/// commands need the Telegram chat id (which is not part of the command model)
+/// to confirm a code or honour a `?start=<code>` deep link.
+/// What: `/pair <code>` and `/start <code>` route to [`CommandExecutor::pair_confirm`]
+/// with `chat_id`; every other command (and the no-code pairing case) is
+/// converted to a [`TrustyCommand`] and executed normally.
+/// Test: pairing dispatch is covered by the executor tests; conversion by the
+/// `commands` tests.
+async fn dispatch_command(
+    command: TelegramCommand,
+    executor: &CommandExecutor,
+    chat_id: i64,
+) -> CommandResult {
+    match &command {
+        // `/pair <code>` confirms the code for this chat.
+        TelegramCommand::Pair(code) if !code.trim().is_empty() => {
+            executor.pair_confirm(code.trim(), chat_id).await
+        }
+        // `/start <code>` is the deep-link form (`?start=<code>`): confirm it.
+        TelegramCommand::Start(code) if !code.trim().is_empty() => {
+            executor.pair_confirm(code.trim(), chat_id).await
+        }
+        // Everything else — including `/pair` and `/start` with no code —
+        // converts to the shared command model and runs through the executor.
+        _ => executor.execute(TrustyCommand::from(command)).await,
+    }
+}
+
+/// teloxide callback-query handler for inline-keyboard buttons.
+///
+/// Why: the `/sessions` list attaches `[Status] [Approve] [Deny]` buttons whose
+/// taps arrive as callback queries rather than messages.
+/// What: parses the `verb:id` callback data into a [`TrustyCommand`], executes
+/// it, answers the callback (to clear the client spinner), and posts the reply.
+/// Test: callback dispatch reuses the shared executor, covered by its tests.
+async fn on_callback(
+    bot: Bot,
+    query: CallbackQuery,
+    executor: Arc<CommandExecutor>,
+    options: Arc<BotOptions>,
+) -> ResponseResult<()> {
+    bot.answer_callback_query(query.id.clone()).await?;
+
+    let user_id = Some(query.from.id.0 as i64);
+    if !is_authorized(&options, user_id) {
+        tracing::warn!(?user_id, "unauthorized Telegram callback rejected");
+        return Ok(());
+    }
+
+    let Some(data) = query.data.as_deref() else {
+        return Ok(());
+    };
+    let Some(chat_id) = query.message.as_ref().map(|m| m.chat().id) else {
+        return Ok(());
+    };
+
+    let cmd = match data.split_once(':') {
+        Some(("status", id)) => Some(TrustyCommand::Status {
+            session_id: id.to_string(),
+        }),
+        Some(("approve", id)) => Some(TrustyCommand::Approve {
+            session_id: id.to_string(),
+        }),
+        Some(("deny", id)) => Some(TrustyCommand::Deny {
+            session_id: id.to_string(),
+        }),
+        _ => None,
+    };
+
+    if let Some(cmd) = cmd {
+        let result = executor.execute(cmd).await;
+        bot.send_message(chat_id, TelegramFormatter::format(&result))
+            .parse_mode(ParseMode::Html)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The push-alert loop: poll the daemon and forward new events to Telegram.
+///
+/// Why: an absent operator wants to be interrupted when a session hits a
+/// permission prompt, an agent fails, or the overseer blocks something —
+/// without having to poll the bot themselves.
+/// What: every [`SESSION_POLL_INTERVAL`] it fetches `GET /sessions` and each
+/// session's `GET /sessions/{id}/events`, runs [`alerts::check_and_alert`] to
+/// find new subscribed events, and sends each as a message to `chat_id`. Every
+/// [`OVERSEER_POLL_INTERVAL`] it also checks `GET /overseer` for a block
+/// decision. Cancelled cleanly via `shutdown`.
+/// Test: the pure decision core is `alerts::check_and_alert`, unit-tested
+/// directly; the loop itself is exercised only against a live daemon.
+pub async fn run_alert_loop(
+    bot: Bot,
+    chat_id: ChatId,
+    daemon_url: String,
+    config: AlertConfig,
+    shutdown: CancellationToken,
+) {
     let client = reqwest::Client::new();
-    match cmd {
-        Help => commands::help_text().to_string(),
-        Sessions => {
-            let url = format!("{daemon_url}/sessions");
-            match client.get(&url).send().await {
-                Ok(r) => match r.json::<serde_json::Value>().await {
-                    Ok(body) => {
-                        let sessions = body["sessions"].as_array().cloned().unwrap_or_default();
-                        if sessions.is_empty() {
-                            "No active sessions.".into()
-                        } else {
-                            sessions
-                                .iter()
-                                .map(|s| {
-                                    format!(
-                                        "{} {} {}",
-                                        s["id"].as_str().unwrap_or("?"),
-                                        s["status"].as_str().unwrap_or("?"),
-                                        s["workdir"].as_str().unwrap_or("?")
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        }
-                    }
-                    Err(e) => format!("parse error: {e}"),
-                },
-                Err(e) => format!("daemon unreachable: {e}"),
+    let last_seen = Arc::new(Mutex::new(LastSeen::new()));
+    let mut session_tick = tokio::time::interval(SESSION_POLL_INTERVAL);
+    let mut overseer_tick = tokio::time::interval(OVERSEER_POLL_INTERVAL);
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("alert loop shutting down");
+                return;
             }
-        }
-        Status { session_id } => {
-            let url = format!("{daemon_url}/sessions/{session_id}/events");
-            match client.get(&url).send().await {
-                Ok(r) => match r.json::<serde_json::Value>().await {
-                    Ok(body) => {
-                        let events = body["events"].as_array().cloned().unwrap_or_default();
-                        let last5: Vec<_> = events.iter().rev().take(5).collect();
-                        if last5.is_empty() {
-                            format!("Session {session_id}: no recent events")
-                        } else {
-                            last5
-                                .iter()
-                                .map(|e| e["event"].as_str().unwrap_or("?").to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        }
+            _ = session_tick.tick() => {
+                let alerts = poll_session_alerts(&client, &daemon_url, &config, &last_seen).await;
+                for alert in alerts {
+                    if let Err(e) = bot.send_message(chat_id, &alert.message).await {
+                        tracing::warn!("failed to send alert: {e}");
                     }
-                    Err(e) => format!("parse error: {e}"),
-                },
-                Err(e) => format!("daemon unreachable: {e}"),
+                }
             }
-        }
-        Approve { session_id } | Deny { session_id } => {
-            format!("Permission approval for {session_id} not yet wired to daemon API")
+            _ = overseer_tick.tick() => {
+                if let Some(msg) = poll_overseer_alert(&client, &daemon_url).await
+                    && let Err(e) = bot.send_message(chat_id, &msg).await {
+                        tracing::warn!("failed to send overseer alert: {e}");
+                    }
+            }
         }
     }
+}
+
+/// One iteration of the per-session event poll.
+///
+/// Why: separating the I/O from the loop keeps [`run_alert_loop`] readable and
+/// lets the pure decision (`check_and_alert`) be tested in isolation.
+/// What: fetches the session list and each session's events, then delegates to
+/// [`alerts::check_and_alert`] which mutates `last_seen` and returns alerts.
+/// Test: the decision logic is covered by `alerts::check_and_alert` tests.
+async fn poll_session_alerts(
+    client: &reqwest::Client,
+    daemon_url: &str,
+    config: &AlertConfig,
+    last_seen: &Mutex<LastSeen>,
+) -> Vec<alerts::PendingAlert> {
+    let sessions: Vec<serde_json::Value> =
+        match client.get(format!("{daemon_url}/sessions")).send().await {
+            Ok(r) => match r.json::<serde_json::Value>().await {
+                Ok(b) => b["sessions"].as_array().cloned().unwrap_or_default(),
+                Err(_) => return Vec::new(),
+            },
+            Err(_) => return Vec::new(),
+        };
+
+    let mut events_by_session = std::collections::HashMap::new();
+    for s in &sessions {
+        let Some(id) = s["id"].as_str() else { continue };
+        let url = format!("{daemon_url}/sessions/{id}/events");
+        if let Ok(r) = client.get(&url).send().await
+            && let Ok(body) = r.json::<serde_json::Value>().await
+        {
+            let events = body["events"].as_array().cloned().unwrap_or_default();
+            events_by_session.insert(id.to_string(), events);
+        }
+    }
+
+    let mut guard = last_seen.lock().expect("last_seen mutex poisoned");
+    alerts::check_and_alert(&sessions, &events_by_session, &mut guard, config)
+}
+
+/// One iteration of the overseer poll.
+///
+/// Why: a block decision is rare but critical; the operator should hear about
+/// it within [`OVERSEER_POLL_INTERVAL`].
+/// What: fetches `GET /overseer`; if the overseer is enabled and reports a
+/// blocked session, returns a formatted alert.
+/// Test: exercised against a live daemon; the formatter is unit-tested as
+/// `alerts::format_overseer_block_alert`.
+async fn poll_overseer_alert(client: &reqwest::Client, daemon_url: &str) -> Option<String> {
+    let body: serde_json::Value = client
+        .get(format!("{daemon_url}/overseer"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let o = &body["overseer"];
+    if !o["enabled"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    let blocked = o["blocked_session"].as_str()?;
+    Some(alerts::format_overseer_block_alert(blocked))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commands::BotCommand;
+
+    #[test]
+    fn resolve_token_reads_dotenv() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "TELEGRAM_BOT_TOKEN=\"123:ABC\"").unwrap();
+        let value = read_dotenv_key(&path, "TELEGRAM_BOT_TOKEN");
+        assert_eq!(value.as_deref(), Some("123:ABC"));
+    }
+
+    #[test]
+    fn resolve_token_missing_is_none() {
+        let value = read_dotenv_key(Path::new("/no/such/.env"), "TELEGRAM_BOT_TOKEN");
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn authorization_respects_allowed_user() {
+        let unrestricted = BotOptions::default();
+        assert!(is_authorized(&unrestricted, Some(7)));
+        assert!(is_authorized(&unrestricted, None));
+
+        let restricted = BotOptions {
+            allowed_user_id: Some(42),
+            alert_chat_id: None,
+        };
+        assert!(is_authorized(&restricted, Some(42)));
+        assert!(!is_authorized(&restricted, Some(99)));
+        assert!(!is_authorized(&restricted, None));
+    }
 
     /// Spawn the daemon's real HTTP API on a random loopback port.
     ///
-    /// Why: lets the Telegram command handler be tested against the genuine
+    /// Why: lets the bot's command dispatch be tested against the genuine
     /// daemon routes without a live daemon, tmux, or external network.
     /// What: builds `api::router(DaemonState::shared())`, binds an ephemeral
     /// port, serves it on a background task, and returns the state plus base URL.
-    /// Test: used by the `handle_*` tests below.
+    /// Test: used by the `dispatch_*` tests below.
     async fn spawn_test_daemon() -> (
         std::sync::Arc<trusty_mpm_daemon::state::DaemonState>,
         String,
@@ -167,77 +496,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_help_returns_help_text() {
-        // Pure branch: `Help` echoes the static help text, no HTTP needed.
-        let reply = handle_command(BotCommand::Help, "http://unused").await;
-        assert_eq!(reply, commands::help_text());
+    async fn dispatch_help_returns_help() {
+        let executor = CommandExecutor::new("http://unused");
+        let result = dispatch_command(TelegramCommand::Help, &executor, 1).await;
+        assert!(matches!(result, CommandResult::Help(_)));
     }
 
     #[tokio::test]
-    async fn handle_approve_contains_session_id() {
-        let reply = handle_command(
-            BotCommand::Approve {
-                session_id: "sess-42".into(),
-            },
-            "http://unused",
-        )
-        .await;
-        assert!(reply.contains("sess-42"));
-    }
-
-    #[tokio::test]
-    async fn handle_deny_contains_session_id() {
-        let reply = handle_command(
-            BotCommand::Deny {
-                session_id: "sess-99".into(),
-            },
-            "http://unused",
-        )
-        .await;
-        assert!(reply.contains("sess-99"));
-    }
-
-    #[tokio::test]
-    async fn handle_sessions_with_no_sessions_returns_empty_msg() {
+    async fn dispatch_start_with_no_code_queries_state() {
+        // `/start` with no code is a pairing-status query against the daemon.
         let (_state, url) = spawn_test_daemon().await;
-        let reply = handle_command(BotCommand::Sessions, &url).await;
-        assert_eq!(reply, "No active sessions.");
+        let executor = CommandExecutor::new(url);
+        let result = dispatch_command(TelegramCommand::Start(String::new()), &executor, 1).await;
+        match result {
+            CommandResult::PairState { paired } => assert!(!paired),
+            other => panic!("expected PairState, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn handle_sessions_lists_one_session() {
-        use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
+    async fn dispatch_start_with_deep_link_code_confirms() {
+        // `/start <code>` (the `?start=` deep-link form) confirms the code.
         let (state, url) = spawn_test_daemon().await;
-        let mut session = Session::new(SessionId::new(), "/tmp/proj", ControlModel::Tmux);
-        session.status = SessionStatus::Active;
-        state.register_session(session);
-        let reply = handle_command(BotCommand::Sessions, &url).await;
-        assert!(reply.contains("/tmp/proj"));
-        assert_ne!(reply, "No active sessions.");
+        let code = state.generate_pair_code();
+        let executor = CommandExecutor::new(url);
+        let result = dispatch_command(TelegramCommand::Start(code), &executor, 555).await;
+        match result {
+            CommandResult::PairSuccess { chat_info } => assert!(chat_info.contains("555")),
+            other => panic!("expected PairSuccess, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn handle_sessions_daemon_unreachable_returns_error() {
-        // Port 1 is never bound by a daemon; the handler must report it.
-        let reply = handle_command(BotCommand::Sessions, "http://127.0.0.1:1").await;
-        assert!(reply.contains("unreachable"));
-    }
-
-    #[tokio::test]
-    async fn handle_status_no_events_returns_message() {
-        use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
-        let (state, url) = spawn_test_daemon().await;
-        let id = SessionId::new();
-        let mut session = Session::new(id, "/tmp/proj", ControlModel::Tmux);
-        session.status = SessionStatus::Active;
-        state.register_session(session);
-        let reply = handle_command(
-            BotCommand::Status {
-                session_id: id.0.to_string(),
-            },
-            &url,
-        )
-        .await;
-        assert!(reply.contains("no recent events"));
+    async fn dispatch_pair_with_bad_code_errors() {
+        let (_state, url) = spawn_test_daemon().await;
+        let executor = CommandExecutor::new(url);
+        let result = dispatch_command(TelegramCommand::Pair("ZZZZZZ".into()), &executor, 1).await;
+        assert!(matches!(result, CommandResult::Error(_)));
     }
 }

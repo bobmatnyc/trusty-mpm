@@ -58,6 +58,9 @@ use utoipa::OpenApi;
         crate::api::delete_checkpoint,
         crate::api::list_profiles,
         crate::api::deploy_profile,
+        crate::api::pair_request,
+        crate::api::pair_confirm,
+        crate::api::pair_status,
     ),
     components(schemas(
         trusty_mpm_core::session::Session,
@@ -80,6 +83,7 @@ use utoipa::OpenApi;
         crate::api::CreateCheckpointRequest,
         crate::api::RestoreRequest,
         crate::api::DeployProfileRequest,
+        crate::api::PairConfirmRequest,
     )),
     tags(
         (name = "sessions", description = "Session lifecycle management"),

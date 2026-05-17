@@ -69,9 +69,16 @@ enum Command {
         /// Base URL of the trusty-mpm daemon.
         #[arg(long, env = "TRUSTY_MPM_URL", default_value = DEFAULT_URL)]
         url: String,
-        /// Telegram bot token (read from the environment in production).
-        #[arg(long, env = "TELEGRAM_BOT_TOKEN")]
+        /// Telegram bot token. When omitted, resolved from `.env.local` /
+        /// `.env` / the `TELEGRAM_BOT_TOKEN` environment variable.
+        #[arg(long)]
         token: Option<String>,
+        /// Chat id to push unsolicited alerts to.
+        #[arg(long)]
+        alert_chat_id: Option<i64>,
+        /// Restrict the bot to this Telegram user id.
+        #[arg(long)]
+        allowed_user_id: Option<i64>,
         /// Validate configuration and exit without connecting to Telegram.
         #[arg(long)]
         check: bool,
@@ -116,6 +123,8 @@ enum Command {
         #[command(subcommand)]
         action: OverseerAction,
     },
+    /// Request a one-time code to pair the Telegram bot with this daemon.
+    Pair,
 }
 
 /// Actions for the `project` subcommand.
@@ -317,8 +326,19 @@ async fn main() -> anyhow::Result<()> {
             trusty_mpm_gui::run();
             Ok(())
         }
-        Command::Telegram { url, token, check } => {
-            trusty_mpm_telegram::run(url, token, check).await
+        Command::Telegram {
+            url,
+            token,
+            alert_chat_id,
+            allowed_user_id,
+            check,
+        } => {
+            let token = token.or_else(|| trusty_mpm_telegram::resolve_token("TELEGRAM_BOT_TOKEN"));
+            let options = trusty_mpm_telegram::BotOptions {
+                allowed_user_id,
+                alert_chat_id,
+            };
+            trusty_mpm_telegram::run(url, token, check, options).await
         }
         Command::Install { force } => install(force),
         Command::Daemon {
@@ -329,7 +349,38 @@ async fn main() -> anyhow::Result<()> {
         Command::Connect { target, json } => connect_cmd(&client, &cli.url, &target, json).await,
         Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
         Command::Overseer { action } => overseer(&client, &cli.url, action).await,
+        Command::Pair => pair(&cli.url).await,
     }
+}
+
+/// `pair` subcommand — request a Telegram-bot pairing code.
+///
+/// Why: pairing the Telegram bot to this daemon needs an out-of-band shared
+/// secret; `tm pair` asks the local daemon for a short code and prints both the
+/// `/pair` command and a `t.me` deep link the operator can use.
+/// What: calls `POST /pair/request` via the shared [`CommandExecutor`] and
+/// prints the code, its TTL, the `/pair <code>` command, and the deep link.
+/// Test: covered by the executor's `pair_request_returns_code` test.
+async fn pair(url: &str) -> anyhow::Result<()> {
+    use trusty_mpm_client::{CommandExecutor, CommandResult};
+    let executor = CommandExecutor::new(url.to_string());
+    match executor.pair_request().await {
+        CommandResult::PairCode {
+            code,
+            expires_in_seconds,
+        } => {
+            println!("Pairing code: {code}");
+            println!("Expires in: {} minutes", expires_in_seconds / 60);
+            println!();
+            println!("In Telegram, send to your bot:");
+            println!("  /pair {code}");
+            println!();
+            println!("Or click: https://t.me/trusty_mpm_bot?start={code}");
+        }
+        CommandResult::Error(msg) => eprintln!("pairing failed: {msg}"),
+        other => eprintln!("unexpected pairing result: {other:?}"),
+    }
+    Ok(())
 }
 
 /// `install` subcommand — deploy the bundled framework artifacts.
@@ -1557,6 +1608,30 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_telegram_alert_and_user_flags() {
+        let cli = Cli::try_parse_from([
+            "trusty-mpm",
+            "telegram",
+            "--alert-chat-id",
+            "12345",
+            "--allowed-user-id",
+            "67890",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Telegram {
+                alert_chat_id,
+                allowed_user_id,
+                ..
+            } => {
+                assert_eq!(alert_chat_id, Some(12345));
+                assert_eq!(allowed_user_id, Some(67890));
+            }
+            other => panic!("expected Telegram, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cli_parses_daemon_defaults() {
         let cli = Cli::try_parse_from(["trusty-mpm", "daemon"]).unwrap();
         match cli.command {
@@ -1996,6 +2071,12 @@ mod tests {
     #[test]
     fn cli_connect_requires_target() {
         assert!(Cli::try_parse_from(["trusty-mpm", "connect"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_pair() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "pair"]).unwrap();
+        assert!(matches!(cli.command, Command::Pair));
     }
 
     #[test]
