@@ -16,23 +16,30 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
     routing::{get, post},
 };
-use serde_json::Value;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use trusty_mpm_core::compress::{CompressionLevel, compress_output};
-use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
-use trusty_mpm_core::overseer::{OverseerContext, OverseerDecision};
+use trusty_mpm_core::compress::CompressionLevel;
+use trusty_mpm_core::hook::HookEvent;
 use trusty_mpm_core::project::ProjectInfo;
 use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
 use trusty_mpm_core::tmux::TmuxTarget;
 
-use crate::audit::AuditEntry;
+use crate::error::DaemonError;
+use crate::services::{HookDecision, HookService, PairingService, SessionService, TmuxService};
 use crate::state::DaemonState;
 use crate::tmux::TmuxDriver;
+
+/// The Claude Code configuration analyzer routes (`/claude-config/*`).
+///
+/// Why: that endpoint cluster is cohesive and large; keeping it in its own
+/// module keeps `api.rs` focused on the core session / hook / tmux surface.
+/// The handlers are re-exported below so `router` and `openapi.rs` can keep
+/// referring to them as `crate::api::<handler>`.
+pub mod claude_config_routes;
+pub use claude_config_routes::*;
 
 /// Build the daemon's HTTP router with shared state injected.
 ///
@@ -220,11 +227,11 @@ pub async fn register_session(
 pub async fn remove_session(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, DaemonError> {
     let session = parse_id(&id)?;
     match state.remove_session(session) {
         Some(_) => Ok(Json(serde_json::json!({ "removed": id }))),
-        None => Err(StatusCode::NOT_FOUND),
+        None => Err(DaemonError::SessionNotFound { id }),
     }
 }
 
@@ -243,14 +250,8 @@ pub async fn remove_session(
     responses((status = 200, description = "Dead sessions reaped; returns the removed count"))
 )]
 pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    let removed = match TmuxDriver::discover() {
-        Ok(driver) => state.reap_dead_sessions(&driver),
-        Err(_) => {
-            tracing::info!("tmux unavailable; skipping dead-session reap");
-            0
-        }
-    };
-    Json(serde_json::json!({ "removed": removed }))
+    let result = SessionService::new(&state).reap();
+    Json(serde_json::json!({ "removed": result.reaped }))
 }
 
 /// `GET /sessions/:id/events` — recent hook events for one session.
@@ -267,51 +268,11 @@ pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_
 pub async fn session_events(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, DaemonError> {
     let session = parse_id(&id)?;
     Ok(Json(serde_json::json!({
         "events": state.hook_events_for(session),
     })))
-}
-
-/// Resolve a `{id}` path param against the session registry.
-///
-/// Why: the pause/resume/command/output endpoints accept either a session UUID
-/// or its friendly `tmpm-<adj>-<noun>` tmux name, exactly like the CLI's
-/// `session stop`. Centralizing the lookup keeps the four handlers uniform.
-/// What: tries `DaemonState::find_session`, which matches a UUID string first
-/// and then scans for a matching `tmux_name`; maps a miss to `404`.
-fn resolve_session(state: &DaemonState, key: &str) -> Result<Session, StatusCode> {
-    state.find_session(key).ok_or(StatusCode::NOT_FOUND)
-}
-
-/// Best-effort capture of a session's tmux pane output.
-///
-/// Why: pause/command/output all want recent pane text, but tmux may be absent
-/// (CI) or the session may not be hosted in tmux. None of those is fatal — the
-/// endpoints still succeed, just without captured text.
-/// What: discovers tmux and captures the last `lines` of the session's pane;
-/// any failure is logged and yields an empty string.
-fn capture_pane(session: &Session, lines: u32) -> String {
-    match TmuxDriver::discover() {
-        Ok(driver) => {
-            let target = TmuxTarget::session(&session.tmux_name);
-            match driver.capture(&target, Some(lines)) {
-                Ok(text) => text,
-                Err(e) => {
-                    tracing::warn!("tmux capture failed for {}: {e}", session.tmux_name);
-                    String::new()
-                }
-            }
-        }
-        Err(_) => {
-            tracing::info!(
-                "tmux unavailable; capture for {} skipped",
-                session.tmux_name
-            );
-            String::new()
-        }
-    }
 }
 
 /// Result of applying an optional compression level to captured output.
@@ -342,7 +303,7 @@ struct CompressedOutput {
 fn apply_compression(level: Option<CompressionLevel>, raw: &str) -> CompressedOutput {
     match level {
         Some(level) => {
-            let (text, stats) = compress_output(raw, level);
+            let (text, stats) = trusty_mpm_core::compress::compress_output(raw, level);
             CompressedOutput {
                 text,
                 stats,
@@ -411,38 +372,12 @@ pub async fn pause_session(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     Json(body): Json<PauseRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let session = resolve_session(&state, &id)?;
-    let captured = capture_pane(&session, 50);
-    let summary = body.summary.unwrap_or_else(|| {
-        // No operator note: derive a cleaner auto-summary by running the
-        // captured pane text through `Summarise` compression (strips ANSI,
-        // collapses blank lines) and keeping the first 500 chars.
-        let (compressed, _) = compress_output(&captured, CompressionLevel::Summarise);
-        compressed.chars().take(500).collect::<String>()
-    });
-    let now = std::time::SystemTime::now();
-
-    state.update_session(&session.id, |s| {
-        s.status = SessionStatus::Paused;
-        s.paused_at = Some(now);
-        s.pause_summary = Some(summary.clone());
-    });
-
-    // Persist the pause record so the state survives a daemon restart.
-    if let Some(updated) = state.session(session.id)
-        && let Err(e) = trusty_mpm_core::session_store::save_pause(&updated)
-    {
-        tracing::warn!(
-            "failed to persist pause state for {}: {e}",
-            session.tmux_name
-        );
-    }
-
+) -> Result<Json<serde_json::Value>, DaemonError> {
+    let result = SessionService::new(&state).pause(&id, body.summary)?;
     Ok(Json(serde_json::json!({
         "paused": true,
-        "session_id": session.id,
-        "summary": summary,
+        "session_id": result.session_id,
+        "summary": result.summary,
     })))
 }
 
@@ -468,22 +403,8 @@ pub async fn pause_session(
 pub async fn resume_session(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let session = resolve_session(&state, &id)?;
-    if session.status != SessionStatus::Paused {
-        return Err(StatusCode::CONFLICT);
-    }
-
-    state.update_session(&session.id, |s| {
-        s.status = SessionStatus::Active;
-        s.paused_at = None;
-        s.pause_summary = None;
-    });
-
-    if let Err(e) = trusty_mpm_core::session_store::clear_pause(&session.id) {
-        tracing::warn!("failed to clear pause state for {}: {e}", session.tmux_name);
-    }
-
+) -> Result<Json<serde_json::Value>, DaemonError> {
+    SessionService::new(&state).resume(&id)?;
     Ok(Json(serde_json::json!({ "resumed": true })))
 }
 
@@ -544,31 +465,13 @@ pub async fn send_command(
     Path(id): Path<String>,
     Query(query): Query<CommandQuery>,
     Json(body): Json<CommandRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let session = resolve_session(&state, &id)?;
-    if session.status == SessionStatus::Stopped {
-        return Err(StatusCode::CONFLICT);
-    }
-
-    // Best-effort: send the command. tmux may be absent in CI.
-    match TmuxDriver::discover() {
-        Ok(driver) => {
-            let target = TmuxTarget::session(&session.tmux_name);
-            if let Err(e) = driver.send_line(&target, &body.command) {
-                tracing::warn!("tmux send_line failed for {}: {e}", session.tmux_name);
-            }
-        }
-        Err(_) => {
-            tracing::info!(
-                "tmux unavailable; command for {} not sent",
-                session.tmux_name
-            );
-        }
-    }
+) -> Result<Json<serde_json::Value>, DaemonError> {
+    let session = SessionService::new(&state).command_target(&id)?;
+    TmuxService::send_command(&session, &body.command);
 
     // Give the pane a moment to render the command's output before capturing.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let raw = capture_pane(&session, 100);
+    let raw = TmuxService::capture(&session, 100);
     let compressed = apply_compression(query.compress, &raw);
 
     Ok(Json(serde_json::json!({
@@ -630,10 +533,10 @@ pub async fn get_output(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     Query(query): Query<OutputQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let session = resolve_session(&state, &id)?;
+) -> Result<Json<serde_json::Value>, DaemonError> {
+    let session = SessionService::new(&state).resolve(&id)?;
     let lines = query.lines.unwrap_or_else(default_output_lines);
-    let raw = capture_pane(&session, lines);
+    let raw = TmuxService::capture(&session, lines);
     let compressed = apply_compression(query.compress, &raw);
     Ok(Json(serde_json::json!({
         "output": compressed.text,
@@ -678,29 +581,6 @@ pub struct HookPost {
     pub payload: serde_json::Value,
 }
 
-/// Build an [`OverseerContext`] from a hook payload.
-///
-/// Why: the overseer evaluates events by tool name and input; extracting these
-/// from the opaque payload in one place keeps the relay handler readable.
-/// What: resolves the session's friendly tmux name (falling back to the UUID),
-/// reads `payload["tool"]` as the tool name, and serializes `payload["input"]`
-/// (or the whole payload when absent) as the tool input.
-fn overseer_context(state: &DaemonState, session: SessionId, payload: &Value) -> OverseerContext {
-    let tmux_name = state
-        .session(session)
-        .map(|s| s.tmux_name)
-        .unwrap_or_else(|| session.0.to_string());
-    let tool_name = payload
-        .get("tool")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let tool_input = payload
-        .get("input")
-        .map(|v| v.to_string())
-        .or_else(|| Some(payload.to_string()));
-    OverseerContext::new(session, tmux_name, tool_name, tool_input)
-}
-
 /// `POST /hooks` — universal hook relay; ingests one Claude Code hook event.
 ///
 /// Why: this is how the daemon achieves full observability — a forwarder shim
@@ -726,75 +606,16 @@ fn overseer_context(state: &DaemonState, session: SessionId, payload: &Value) ->
 pub async fn ingest_hook(
     State(state): State<Arc<DaemonState>>,
     Json(post): Json<HookPost>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, DaemonError> {
     let session = parse_id(&post.session_id)?;
-    let event = HookEvent::from_wire(&post.event).ok_or(StatusCode::BAD_REQUEST)?;
+    let event = HookEvent::from_wire(&post.event).ok_or_else(|| {
+        DaemonError::InvalidRequest(format!("unknown hook event: {}", post.event))
+    })?;
 
-    let mut payload = post.payload;
-
-    // Overseer: evaluate and audit tool-use events. Skipped entirely when the
-    // overseer is disabled (the common, opt-out path).
-    let overseer = state.overseer();
-    if overseer.is_enabled()
-        && let Some(decision) = run_overseer(&state, &overseer, event, session, &payload)
-    {
-        // A Block verdict halts the event: return early with `403` so the
-        // forwarder shim can surface the refusal to Claude Code.
-        if matches!(decision, OverseerDecision::Block { .. }) {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        // Respond verdicts are noted for the (future) tmux send-keys wiring.
-        if let OverseerDecision::Respond { text } = &decision {
-            tracing::info!("overseer auto-response for {session:?}: {text}");
-        }
+    match HookService::new(&state).process(session, event, post.payload) {
+        HookDecision::Block { reason } => Err(DaemonError::OverseerBlocked { reason }),
+        _ => Ok(Json(serde_json::json!({ "accepted": post.event }))),
     }
-
-    // For PostToolUse events, compress the tool output before it enters the
-    // ring buffer (and hence the dashboard / compacted history).
-    if event == HookEvent::PostToolUse {
-        let tool_name = payload
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        let cfg = state.optimizer_config();
-        crate::optimizer::optimize_tool_output(&cfg, &tool_name, &mut payload);
-    }
-
-    state.push_hook_event(HookEventRecord::now(session, event, payload));
-    Ok(Json(serde_json::json!({ "accepted": post.event })))
-}
-
-/// Run the overseer for one hook event and audit the verdict.
-///
-/// Why: keeping the event-kind dispatch and the audit write in one helper keeps
-/// [`ingest_hook`] focused on the relay flow.
-/// What: maps `PreToolUse` / `PostToolUse` / `Stop` events onto the matching
-/// overseer call, writes an [`AuditEntry`], and returns the decision. Events
-/// the overseer does not act on return `None`.
-fn run_overseer(
-    state: &DaemonState,
-    overseer: &Arc<dyn trusty_mpm_core::overseer::Overseer>,
-    event: HookEvent,
-    session: SessionId,
-    payload: &Value,
-) -> Option<OverseerDecision> {
-    let ctx = overseer_context(state, session, payload);
-    let (event_label, decision) = match event {
-        HookEvent::PreToolUse => ("PreToolUse", overseer.pre_tool_use(&ctx)),
-        HookEvent::PostToolUse => {
-            let output = payload.get("output").and_then(Value::as_str).unwrap_or("");
-            ("PostToolUse", overseer.post_tool_use(&ctx, output))
-        }
-        _ => return None,
-    };
-    state.audit().log(AuditEntry::from_decision(
-        &ctx,
-        event_label,
-        &decision,
-        state.overseer_handler(),
-    ));
-    Some(decision)
 }
 
 /// `GET /overseer` — current session-overseer configuration and status.
@@ -914,10 +735,12 @@ pub struct CurrentProjectQuery {
 pub async fn current_project(
     State(state): State<Arc<DaemonState>>,
     Query(query): Query<CurrentProjectQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, DaemonError> {
     match state.project(&query.path) {
         Some(info) => Ok(Json(serde_json::json!(info))),
-        None => Err(StatusCode::NOT_FOUND),
+        None => Err(DaemonError::SessionNotFound {
+            id: query.path.display().to_string(),
+        }),
     }
 }
 
@@ -939,17 +762,7 @@ pub async fn current_project(
     responses((status = 200, description = "All tmux sessions with origin labels"))
 )]
 pub async fn list_tmux_sessions(State(_state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    let sessions = match TmuxDriver::discover() {
-        Ok(driver) => driver.list_all_sessions().unwrap_or_else(|e| {
-            tracing::warn!("tmux list_all_sessions failed: {e}");
-            Vec::new()
-        }),
-        Err(_) => {
-            tracing::info!("tmux unavailable; /tmux/sessions returns empty");
-            Vec::new()
-        }
-    };
-    Json(serde_json::json!({ "sessions": sessions }))
+    Json(serde_json::json!({ "sessions": TmuxService::list_all() }))
 }
 
 /// `GET /tmux/sessions/{name}/snapshot` — capture any session's current state.
@@ -972,15 +785,9 @@ pub async fn list_tmux_sessions(State(_state): State<Arc<DaemonState>>) -> Json<
 pub async fn tmux_snapshot(
     State(_state): State<Arc<DaemonState>>,
     Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let driver = TmuxDriver::discover().map_err(|_| StatusCode::NOT_FOUND)?;
-    match driver.monitor_session(&name, 100) {
-        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
-        Err(e) => {
-            tracing::warn!("tmux snapshot for {name} failed: {e}");
-            Err(StatusCode::NOT_FOUND)
-        }
-    }
+) -> Result<Json<serde_json::Value>, DaemonError> {
+    let snapshot = TmuxService::snapshot(&name, 100)?;
+    Ok(Json(serde_json::json!({ "snapshot": snapshot })))
 }
 
 /// JSON body for `POST /tmux/adopt`.
@@ -1015,400 +822,9 @@ pub struct AdoptRequest {
 pub async fn adopt_tmux_session(
     State(_state): State<Arc<DaemonState>>,
     Json(body): Json<AdoptRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let driver = TmuxDriver::discover().map_err(|_| StatusCode::NOT_FOUND)?;
-    match driver.adopt_session(&body.session) {
-        Ok(adopted) => Ok(Json(serde_json::json!({ "adopted": adopted }))),
-        Err(e) => {
-            tracing::warn!("tmux adopt {} failed: {e}", body.session);
-            Err(StatusCode::NOT_FOUND)
-        }
-    }
-}
-
-// ---- Claude Code configuration analyzer ---------------------------------
-
-/// Query parameters for `GET /claude-config`.
-///
-/// Why: the analyzer inspects the config for a specific project directory.
-/// What: the absolute project path to analyze.
-/// Test: `get_claude_config_returns_recommendations`.
-#[derive(serde::Deserialize)]
-pub struct ClaudeConfigQuery {
-    /// Project directory whose Claude Code config to analyze.
-    pub project: PathBuf,
-}
-
-/// `GET /claude-config?project=<path>` — analyze Claude Code config.
-///
-/// Why: trusty-mpm can recommend config changes (hooks, permission scoping,
-/// agent deployment) for a project's Claude Code setup.
-/// What: resolves the user- and project-level config paths, reads and merges
-/// them, and returns `{ config, recommendations }`.
-/// Test: `get_claude_config_returns_recommendations`.
-#[utoipa::path(
-    get,
-    path = "/claude-config",
-    tag = "claude-config",
-    params(("project" = String, Query, description = "Project directory")),
-    responses((status = 200, description = "Analyzed config plus recommendations"))
-)]
-pub async fn get_claude_config(
-    State(_state): State<Arc<DaemonState>>,
-    Query(query): Query<ClaudeConfigQuery>,
-) -> Json<serde_json::Value> {
-    use trusty_mpm_core::claude_config::ClaudeConfigReader;
-    let paths = ClaudeConfigReader::paths_for_project(&query.project);
-    let config = crate::claude_config::ClaudeConfigAnalyzer::read_config(&paths);
-    let recommendations = crate::claude_config::ClaudeConfigAnalyzer::analyze(&config);
-    Json(serde_json::json!({
-        "config": config,
-        "recommendations": recommendations,
-    }))
-}
-
-/// JSON body for `POST /claude-config/apply`.
-///
-/// Why: applying a recommendation needs the project path and the rec id.
-/// What: the project directory and the recommendation id to apply.
-/// Test: `apply_claude_config_unknown_rec_is_404`.
-#[derive(serde::Deserialize, utoipa::ToSchema)]
-pub struct ApplyConfigRequest {
-    /// Project directory the recommendation applies to.
-    #[schema(value_type = String)]
-    pub project: PathBuf,
-    /// Id of the recommendation to apply.
-    pub recommendation_id: String,
-}
-
-/// `POST /claude-config/apply` — apply a Claude Code config recommendation.
-///
-/// Why: lets an operator act on a recommendation without hand-editing JSON.
-/// What: re-analyzes the project, finds the recommendation by id, and applies
-/// it via `ClaudeConfigAnalyzer::apply_recommendation`, which checkpoints the
-/// config first. Returns `{ applied: true, checkpoint_id }` so the caller can
-/// undo. An unknown id is `404`.
-/// Test: `apply_claude_config_unknown_rec_is_404`.
-#[utoipa::path(
-    post,
-    path = "/claude-config/apply",
-    tag = "claude-config",
-    request_body = ApplyConfigRequest,
-    responses(
-        (status = 200, description = "Recommendation applied; returns checkpoint id"),
-        (status = 404, description = "No recommendation with that id"),
-        (status = 500, description = "Applying the recommendation failed"),
-    )
-)]
-pub async fn apply_claude_config(
-    State(_state): State<Arc<DaemonState>>,
-    Json(body): Json<ApplyConfigRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    use trusty_mpm_core::claude_config::ClaudeConfigReader;
-    let paths = ClaudeConfigReader::paths_for_project(&body.project);
-    let config = crate::claude_config::ClaudeConfigAnalyzer::read_config(&paths);
-    let recommendations = crate::claude_config::ClaudeConfigAnalyzer::analyze(&config);
-    let rec = recommendations
-        .iter()
-        .find(|r| r.id == body.recommendation_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let checkpoint_id = crate::claude_config::ClaudeConfigAnalyzer::apply_recommendation(
-        rec,
-        &paths,
-        &body.project,
-    )
-    .map_err(|e| {
-        tracing::warn!("applying recommendation {} failed: {e}", rec.id);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok(Json(serde_json::json!({
-        "applied": true,
-        "recommendation_id": body.recommendation_id,
-        "checkpoint_id": checkpoint_id,
-    })))
-}
-
-// ---- checkpoints & deployment profiles ----------------------------------
-
-/// Query parameters for the checkpoint list / delete endpoints.
-///
-/// Why: checkpoints are project-scoped; the project path identifies which
-/// `.trusty-mpm/checkpoints` directory to operate on.
-/// What: the project directory.
-/// Test: `list_checkpoints_returns_array`.
-#[derive(serde::Deserialize)]
-pub struct CheckpointQuery {
-    /// Project directory whose checkpoints to operate on.
-    pub project: PathBuf,
-}
-
-/// `GET /claude-config/checkpoints?project=<path>` — list config checkpoints.
-///
-/// Why: the dashboard offers a restore picker; this feeds it.
-/// What: returns `{ checkpoints: [ConfigCheckpoint, ...] }`, newest first.
-/// Test: `list_checkpoints_returns_array`.
-#[utoipa::path(
-    get,
-    path = "/claude-config/checkpoints",
-    tag = "claude-config",
-    params(("project" = String, Query, description = "Project directory")),
-    responses((status = 200, description = "Config checkpoints, newest first"))
-)]
-pub async fn list_checkpoints(
-    State(_state): State<Arc<DaemonState>>,
-    Query(query): Query<CheckpointQuery>,
-) -> Json<serde_json::Value> {
-    let checkpoints = crate::claude_config::ConfigCheckpointer::list(&query.project)
-        .unwrap_or_else(|e| {
-            tracing::warn!("listing checkpoints failed: {e}");
-            Vec::new()
-        });
-    Json(serde_json::json!({ "checkpoints": checkpoints }))
-}
-
-/// JSON body for `POST /claude-config/checkpoints`.
-///
-/// Why: creating a checkpoint needs the project and an optional human label.
-/// What: the project directory and an optional label.
-/// Test: `create_checkpoint_returns_id`.
-#[derive(serde::Deserialize, utoipa::ToSchema)]
-pub struct CreateCheckpointRequest {
-    /// Project directory to checkpoint.
-    #[schema(value_type = String)]
-    pub project: PathBuf,
-    /// Optional human-readable label for the checkpoint.
-    #[serde(default)]
-    pub label: Option<String>,
-}
-
-/// `POST /claude-config/checkpoints` — create a config checkpoint.
-///
-/// Why: lets the operator take a manual backup before a risky change.
-/// What: snapshots the project's config and returns `{ id }`.
-/// Test: `create_checkpoint_returns_id`.
-#[utoipa::path(
-    post,
-    path = "/claude-config/checkpoints",
-    tag = "claude-config",
-    request_body = CreateCheckpointRequest,
-    responses(
-        (status = 200, description = "Checkpoint created; returns its id"),
-        (status = 500, description = "Creating the checkpoint failed"),
-    )
-)]
-pub async fn create_checkpoint(
-    State(_state): State<Arc<DaemonState>>,
-    Json(body): Json<CreateCheckpointRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    use trusty_mpm_core::claude_config::ClaudeConfigReader;
-    let paths = ClaudeConfigReader::paths_for_project(&body.project);
-    let id = crate::claude_config::ConfigCheckpointer::create(
-        &paths,
-        &body.project,
-        body.label.as_deref(),
-    )
-    .map_err(|e| {
-        tracing::warn!("creating checkpoint failed: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok(Json(serde_json::json!({ "id": id })))
-}
-
-/// JSON body for `POST /claude-config/restore`.
-///
-/// Why: restoring needs the project and the checkpoint id to revert to.
-/// What: the project directory and the checkpoint id.
-/// Test: `restore_unknown_checkpoint_is_500`.
-#[derive(serde::Deserialize, utoipa::ToSchema)]
-pub struct RestoreRequest {
-    /// Project directory whose config to restore.
-    #[schema(value_type = String)]
-    pub project: PathBuf,
-    /// Id of the checkpoint to restore.
-    pub checkpoint_id: String,
-}
-
-/// `POST /claude-config/restore` — restore config from a checkpoint.
-///
-/// Why: the undo half of the safety model.
-/// What: rewrites the project's config files to the checkpoint's state. A
-/// missing or malformed checkpoint surfaces as `500`.
-/// Test: `restore_unknown_checkpoint_is_500`.
-#[utoipa::path(
-    post,
-    path = "/claude-config/restore",
-    tag = "claude-config",
-    request_body = RestoreRequest,
-    responses(
-        (status = 200, description = "Config restored from the checkpoint"),
-        (status = 500, description = "Checkpoint missing or restore failed"),
-    )
-)]
-pub async fn restore_checkpoint(
-    State(_state): State<Arc<DaemonState>>,
-    Json(body): Json<RestoreRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    crate::claude_config::ConfigCheckpointer::restore(&body.project, &body.checkpoint_id).map_err(
-        |e| {
-            tracing::warn!("restoring checkpoint {} failed: {e}", body.checkpoint_id);
-            StatusCode::INTERNAL_SERVER_ERROR
-        },
-    )?;
-    Ok(Json(serde_json::json!({
-        "restored": true,
-        "checkpoint_id": body.checkpoint_id,
-    })))
-}
-
-/// `DELETE /claude-config/checkpoints/{id}?project=<path>` — delete a checkpoint.
-///
-/// Why: checkpoints accumulate; the operator prunes them here.
-/// What: removes the checkpoint file. A missing checkpoint surfaces as `404`.
-/// Test: `delete_unknown_checkpoint_is_404`.
-#[utoipa::path(
-    delete,
-    path = "/claude-config/checkpoints/{id}",
-    tag = "claude-config",
-    params(
-        ("id" = String, Path, description = "Checkpoint id"),
-        ("project" = String, Query, description = "Project directory"),
-    ),
-    responses(
-        (status = 200, description = "Checkpoint deleted"),
-        (status = 404, description = "No checkpoint with that id"),
-    )
-)]
-pub async fn delete_checkpoint(
-    State(_state): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-    Query(query): Query<CheckpointQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    crate::claude_config::ConfigCheckpointer::delete(&query.project, &id).map_err(|e| {
-        tracing::warn!("deleting checkpoint {id} failed: {e}");
-        StatusCode::NOT_FOUND
-    })?;
-    Ok(Json(serde_json::json!({ "deleted": id })))
-}
-
-/// `GET /claude-config/profiles` — list the built-in deployment profiles.
-///
-/// Why: the dashboard shows the available configuration presets.
-/// What: returns `{ profiles: [DeploymentProfile, ...] }`.
-/// Test: `list_profiles_returns_builtins`.
-#[utoipa::path(
-    get,
-    path = "/claude-config/profiles",
-    tag = "claude-config",
-    responses((status = 200, description = "Built-in deployment profiles"))
-)]
-pub async fn list_profiles(State(_state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    let profiles = crate::claude_config::ProfileDeployer::builtin_profiles();
-    Json(serde_json::json!({ "profiles": profiles }))
-}
-
-/// JSON body for `POST /claude-config/deploy`.
-///
-/// Why: deploying a profile needs the project, the profile name, and an
-/// optional target override.
-/// What: the project directory, the profile name, and an optional deploy
-/// target (`user`, `project`, `both`) overriding the profile's default.
-/// Test: `deploy_profile_returns_checkpoint_id`.
-#[derive(serde::Deserialize, utoipa::ToSchema)]
-pub struct DeployProfileRequest {
-    /// Project directory to deploy the profile onto.
-    #[schema(value_type = String)]
-    pub project: PathBuf,
-    /// Name of the built-in profile to deploy.
-    pub profile_name: String,
-    /// Optional deploy-target override (`user`, `project`, `both`).
-    #[serde(default)]
-    pub target: Option<trusty_mpm_core::claude_config::DeployTarget>,
-}
-
-/// `POST /claude-config/deploy` — deploy a built-in profile onto a project.
-///
-/// Why: lets the operator apply a configuration preset in one click; the deploy
-/// checkpoints the config first so it is reversible.
-/// What: looks up the named built-in profile (applying an optional `target`
-/// override), deploys it, and returns `{ checkpoint_id }`. An unknown profile
-/// name is `404`.
-/// Test: `deploy_profile_returns_checkpoint_id`, `deploy_unknown_profile_is_404`.
-#[utoipa::path(
-    post,
-    path = "/claude-config/deploy",
-    tag = "claude-config",
-    request_body = DeployProfileRequest,
-    responses(
-        (status = 200, description = "Profile deployed; returns checkpoint id"),
-        (status = 404, description = "No built-in profile with that name"),
-        (status = 500, description = "Deploying the profile failed"),
-    )
-)]
-pub async fn deploy_profile(
-    State(_state): State<Arc<DaemonState>>,
-    Json(body): Json<DeployProfileRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    use trusty_mpm_core::claude_config::ClaudeConfigReader;
-    let mut profile = crate::claude_config::ProfileDeployer::builtin_profiles()
-        .into_iter()
-        .find(|p| p.name == body.profile_name)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    if let Some(target) = body.target {
-        profile.target = target;
-    }
-    let paths = ClaudeConfigReader::paths_for_project(&body.project);
-    let checkpoint_id =
-        crate::claude_config::ProfileDeployer::deploy(&profile, &paths, &body.project).map_err(
-            |e| {
-                tracing::warn!("deploying profile {} failed: {e}", body.profile_name);
-                StatusCode::INTERNAL_SERVER_ERROR
-            },
-        )?;
-    Ok(Json(serde_json::json!({
-        "deployed": body.profile_name,
-        "checkpoint_id": checkpoint_id,
-    })))
-}
-
-/// JSON body for `POST /claude-config/restart`.
-///
-/// Why: restarting Claude Code happens inside a named tmux session.
-/// What: the tmux session in which to restart `claude`.
-/// Test: `restart_claude_code_handles_missing_tmux`.
-#[derive(serde::Deserialize, utoipa::ToSchema)]
-pub struct RestartRequest {
-    /// tmux session in which to restart Claude Code.
-    pub tmux_session: String,
-}
-
-/// `POST /claude-config/restart` — restart Claude Code in a tmux session.
-///
-/// Why: after applying config changes the operator wants a clean Claude Code
-/// process; this sends Ctrl-C then `claude` into the session's pane.
-/// What: calls `ClaudeCodeRestarter::restart_in_session`. tmux being absent
-/// surfaces as `500`.
-/// Test: `restart_claude_code_handles_missing_tmux`.
-#[utoipa::path(
-    post,
-    path = "/claude-config/restart",
-    tag = "claude-config",
-    request_body = RestartRequest,
-    responses(
-        (status = 200, description = "Restart command sent"),
-        (status = 500, description = "tmux unavailable or restart failed"),
-    )
-)]
-pub async fn restart_claude_code(
-    State(_state): State<Arc<DaemonState>>,
-    Json(body): Json<RestartRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    crate::claude_config::ClaudeCodeRestarter::restart_in_session(&body.tmux_session).map_err(
-        |e| {
-            tracing::warn!("restart in {} failed: {e}", body.tmux_session);
-            StatusCode::INTERNAL_SERVER_ERROR
-        },
-    )?;
-    Ok(Json(serde_json::json!({ "restarted": body.tmux_session })))
+) -> Result<Json<serde_json::Value>, DaemonError> {
+    let adopted = TmuxService::adopt(&body.session)?;
+    Ok(Json(serde_json::json!({ "adopted": adopted })))
 }
 
 // ---- bot pairing --------------------------------------------------------
@@ -1428,11 +844,9 @@ pub async fn restart_claude_code(
     responses((status = 200, description = "A one-time pairing code and its TTL"))
 )]
 pub async fn pair_request(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    let code = state.generate_pair_code();
-    Json(serde_json::json!({
-        "code": code,
-        "expires_in_seconds": crate::state::PAIR_CODE_TTL.as_secs(),
-    }))
+    Json(serde_json::json!(
+        PairingService::new(&state).request_code()
+    ))
 }
 
 /// JSON body for `POST /pair/confirm`.
@@ -1468,13 +882,12 @@ pub async fn pair_confirm(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<PairConfirmRequest>,
 ) -> Json<serde_json::Value> {
-    if state.confirm_pair_code(&body.code, body.chat_id) {
-        Json(serde_json::json!({ "success": true, "chat_id": body.chat_id }))
-    } else {
-        Json(serde_json::json!({
+    match PairingService::new(&state).confirm(&body.code, body.chat_id) {
+        Ok(()) => Json(serde_json::json!({ "success": true, "chat_id": body.chat_id })),
+        Err(_) => Json(serde_json::json!({
             "success": false,
             "error": "invalid or expired code",
-        }))
+        })),
     }
 }
 
@@ -1491,828 +904,24 @@ pub async fn pair_confirm(
     responses((status = 200, description = "Pairing status (paired flag and chat id)"))
 )]
 pub async fn pair_status(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    let chat_id = state.paired_chat_id();
-    Json(serde_json::json!({
-        "paired": chat_id.is_some(),
-        "chat_id": chat_id,
-    }))
+    Json(serde_json::json!(PairingService::new(&state).status()))
 }
 
-/// Parse a UUID string into a `SessionId`, mapping failure to `400`.
-fn parse_id(raw: &str) -> Result<SessionId, StatusCode> {
+/// Parse a UUID string into a `SessionId`, mapping failure to a `400`-mapped
+/// [`DaemonError::InvalidRequest`].
+fn parse_id(raw: &str) -> Result<SessionId, DaemonError> {
     uuid::Uuid::parse_str(raw)
         .map(SessionId)
-        .map_err(|_| StatusCode::BAD_REQUEST)
+        .map_err(|_| DaemonError::InvalidRequest(format!("malformed session id: {raw}")))
 }
 
+/// Handler unit tests.
+///
+/// Why: the suite is large enough that keeping it in `api.rs` pushed the file
+/// past a maintainable size; a `#[path]`-linked sibling keeps the handler
+/// surface readable while the tests still see the private helpers via
+/// `super::*`.
+/// Test: this *is* the test module.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use trusty_mpm_core::session::{ControlModel, Session, SessionStatus};
-
-    fn state_with_session() -> (Arc<DaemonState>, SessionId) {
-        let state = DaemonState::shared();
-        let id = SessionId::new();
-        let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux);
-        session.status = SessionStatus::Active;
-        state.register_session(session);
-        (state, id)
-    }
-
-    #[tokio::test]
-    async fn health_endpoint_responds() {
-        assert_eq!(health().await, "ok");
-    }
-
-    #[tokio::test]
-    async fn list_sessions_returns_state() {
-        let (state, _) = state_with_session();
-        let Json(body) = list_sessions(State(state), Query(SessionQuery::default())).await;
-        assert_eq!(body["sessions"].as_array().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn register_and_list_projects() {
-        // `POST /projects` registers a project; `GET /projects` lists it.
-        let state = DaemonState::shared();
-        let Json(info) = register_project(
-            State(Arc::clone(&state)),
-            Json(RegisterProject {
-                path: "/work/demo".into(),
-            }),
-        )
-        .await;
-        assert_eq!(info["name"], "demo");
-        assert_eq!(info["path"], "/work/demo");
-
-        let Json(body) = list_projects(State(state)).await;
-        assert_eq!(body["projects"].as_array().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn current_project_found_and_missing() {
-        // `GET /projects/current` returns the project for a registered path
-        // and `404` for an unregistered one.
-        let state = DaemonState::shared();
-        let _ = register_project(
-            State(Arc::clone(&state)),
-            Json(RegisterProject {
-                path: "/work/demo".into(),
-            }),
-        )
-        .await;
-
-        let ok = current_project(
-            State(Arc::clone(&state)),
-            Query(CurrentProjectQuery {
-                path: "/work/demo".into(),
-            }),
-        )
-        .await;
-        assert!(ok.is_ok());
-
-        let err = current_project(
-            State(state),
-            Query(CurrentProjectQuery {
-                path: "/work/missing".into(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn register_session_associates_project() {
-        // A `POST /sessions` body carrying `project_path` must associate the
-        // new session with that project.
-        let state = DaemonState::shared();
-        let Json(body) = register_session(
-            State(Arc::clone(&state)),
-            Json(RegisterSession {
-                workdir: "/work/demo".into(),
-                project_path: Some("/work/demo".into()),
-            }),
-        )
-        .await;
-        let id = body["id"].as_str().unwrap().to_string();
-        let listed = state.list_sessions();
-        let session = listed
-            .iter()
-            .find(|s| s.id.0.to_string() == id)
-            .expect("session registered");
-        assert_eq!(session.project_path, Some(PathBuf::from("/work/demo")));
-    }
-
-    #[tokio::test]
-    async fn list_sessions_filters_by_project() {
-        // `GET /sessions?project=<path>` returns only sessions of that project.
-        let state = DaemonState::shared();
-        let _ = register_session(
-            State(Arc::clone(&state)),
-            Json(RegisterSession {
-                workdir: "/work/demo".into(),
-                project_path: Some("/work/demo".into()),
-            }),
-        )
-        .await;
-        let _ = register_session(
-            State(Arc::clone(&state)),
-            Json(RegisterSession {
-                workdir: "/work/other".into(),
-                project_path: Some("/work/other".into()),
-            }),
-        )
-        .await;
-
-        let Json(all) =
-            list_sessions(State(Arc::clone(&state)), Query(SessionQuery::default())).await;
-        assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
-
-        let Json(scoped) = list_sessions(
-            State(state),
-            Query(SessionQuery {
-                project: Some("/work/demo".into()),
-            }),
-        )
-        .await;
-        assert_eq!(scoped["sessions"].as_array().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn hook_relay_ingests_known_event() {
-        let (state, id) = state_with_session();
-        let post = HookPost {
-            session_id: id.0.to_string(),
-            event: "PostToolUse".into(),
-            payload: serde_json::json!({"tool": "Edit"}),
-        };
-        let result = ingest_hook(State(state.clone()), Json(post)).await;
-        assert!(result.is_ok());
-        assert_eq!(state.recent_hook_events().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn hook_relay_rejects_unknown_event() {
-        let (state, id) = state_with_session();
-        let post = HookPost {
-            session_id: id.0.to_string(),
-            event: "Bogus".into(),
-            payload: serde_json::Value::Null,
-        };
-        let err = ingest_hook(State(state), Json(post)).await.unwrap_err();
-        assert_eq!(err, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn register_and_remove_session() {
-        let state = DaemonState::shared();
-        let Json(body) = register_session(
-            State(state.clone()),
-            Json(RegisterSession {
-                workdir: "/tmp/new".into(),
-                project_path: None,
-            }),
-        )
-        .await;
-        let id = body["id"].as_str().unwrap().to_string();
-        assert_eq!(state.list_sessions().len(), 1);
-        // Removing it succeeds; removing again is a 404.
-        assert!(
-            remove_session(State(state.clone()), Path(id.clone()))
-                .await
-                .is_ok()
-        );
-        let err = remove_session(State(state), Path(id)).await.unwrap_err();
-        assert_eq!(err, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn registered_session_has_friendly_tmux_name() {
-        // A registered session must carry a `tmpm-<adj>-<noun>` tmux name
-        // derived from its UUID, not the legacy `trusty-mpm-<uuid>` form.
-        let state = DaemonState::shared();
-        let Json(body) = register_session(
-            State(Arc::clone(&state)),
-            Json(RegisterSession {
-                workdir: "/tmp/friendly".into(),
-                project_path: None,
-            }),
-        )
-        .await;
-        let id = body["id"].as_str().unwrap().to_string();
-        let listed = state.list_sessions();
-        let session = listed
-            .iter()
-            .find(|s| s.id.0.to_string() == id)
-            .expect("session registered");
-        assert!(
-            session.tmux_name.starts_with("tmpm-"),
-            "friendly name: {}",
-            session.tmux_name
-        );
-        assert!(session.tmux_name.len() <= 25);
-    }
-
-    #[tokio::test]
-    async fn reap_sessions_returns_removed_count() {
-        // `DELETE /sessions/dead` always returns a well-formed `{ "removed": N }`
-        // body. The exact count depends on whether tmux is installed: with tmux
-        // the lone test session (no live tmux session named `tmpm-*`) is reaped
-        // (1); without tmux nothing is reaped (0). Either way the registry must
-        // not contain a session that is missing from tmux afterwards.
-        let (state, _) = state_with_session();
-        let Json(body) = reap_sessions(State(Arc::clone(&state))).await;
-        let removed = body["removed"].as_u64().expect("removed is a number");
-        assert!(removed <= 1, "at most the one test session is reaped");
-        assert_eq!(state.list_sessions().len() as u64, 1 - removed);
-    }
-
-    #[tokio::test]
-    async fn register_session_returns_id_even_without_tmux() {
-        // Graceful-degradation invariant: tmux is unavailable in CI, yet
-        // `POST /sessions` must still return a JSON body carrying an `id`, and
-        // that id must be visible in the subsequent `GET /sessions` snapshot.
-        let state = DaemonState::shared();
-        let Json(body) = register_session(
-            State(Arc::clone(&state)),
-            Json(RegisterSession {
-                workdir: "/tmp/no-tmux".into(),
-                project_path: None,
-            }),
-        )
-        .await;
-        let id_str = body
-            .get("id")
-            .and_then(|v| v.as_str())
-            .expect("response body must contain an `id` string");
-        let listed = state.list_sessions();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id.0.to_string(), id_str);
-    }
-
-    #[tokio::test]
-    async fn hook_relay_rejects_bad_session_id() {
-        let (state, _) = state_with_session();
-        let post = HookPost {
-            session_id: "not-a-uuid".into(),
-            event: "Stop".into(),
-            payload: serde_json::Value::Null,
-        };
-        let err = ingest_hook(State(state), Json(post)).await.unwrap_err();
-        assert_eq!(err, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn get_overseer_returns_status() {
-        // `GET /overseer` must return 200 with the enabled flag and handler.
-        // With no framework installed the overseer is disabled by default.
-        let state = DaemonState::shared();
-        let Json(body) = get_overseer(State(state)).await;
-        assert_eq!(body["overseer"]["enabled"], false);
-        assert_eq!(body["overseer"]["handler"], "deterministic");
-    }
-
-    #[tokio::test]
-    async fn hook_relay_runs_with_disabled_overseer() {
-        // With the overseer disabled (the default), a PreToolUse event must
-        // still be ingested normally — the overseer fast-path allows it.
-        let (state, id) = state_with_session();
-        let post = HookPost {
-            session_id: id.0.to_string(),
-            event: "PreToolUse".into(),
-            payload: serde_json::json!({"tool": "Bash", "input": {"command": "ls"}}),
-        };
-        let result = ingest_hook(State(state.clone()), Json(post)).await;
-        assert!(result.is_ok());
-        assert_eq!(state.recent_hook_events().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn session_events_returns_empty_initially() {
-        // A freshly-registered session has no hook events; `GET
-        // /sessions/{id}/events` must return 200 with an empty array.
-        let (state, id) = state_with_session();
-        let result = session_events(State(state), Path(id.0.to_string())).await;
-        let Json(body) = result.expect("valid session id resolves");
-        assert_eq!(body["events"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn recent_events_returns_ring_buffer() {
-        // A valid hook event posted via `POST /hooks` must appear in the
-        // `GET /events` ring-buffer feed.
-        let (state, id) = state_with_session();
-        let post = HookPost {
-            session_id: id.0.to_string(),
-            event: "PreToolUse".into(),
-            payload: serde_json::json!({"tool": "Read"}),
-        };
-        let _ = ingest_hook(State(Arc::clone(&state)), Json(post))
-            .await
-            .expect("known event ingests");
-
-        let Json(body) = recent_events(State(state)).await;
-        let events = body["events"].as_array().expect("events is an array");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["session"], id.0.to_string());
-        assert_eq!(events[0]["event"], "PreToolUse");
-    }
-
-    #[tokio::test]
-    async fn openapi_spec_is_valid() {
-        // `GET /api-docs/openapi.json` must return 200 with a document that
-        // carries the `openapi` version key and the daemon's title.
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let app = router(DaemonState::shared());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api-docs/openapi.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let spec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            spec.get("openapi").is_some(),
-            "spec must have an openapi key"
-        );
-        assert!(
-            spec["info"]["title"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("trusty-mpm"),
-            "spec title must mention trusty-mpm"
-        );
-    }
-
-    #[tokio::test]
-    async fn breakers_endpoint_returns_200() {
-        // `GET /breakers` must return 200 with a well-formed `breakers` array,
-        // even when no breakers have been created yet.
-        let state = DaemonState::shared();
-        let Json(body) = breakers(State(state)).await;
-        assert!(body["breakers"].is_array());
-    }
-
-    #[tokio::test]
-    async fn pause_then_resume_round_trips() {
-        // Pausing flips a session to `Paused`; resuming flips it back to
-        // `Active` and clears the pause metadata.
-        let (state, id) = state_with_session();
-        let Json(body) = pause_session(
-            State(Arc::clone(&state)),
-            Path(id.0.to_string()),
-            Json(PauseRequest {
-                summary: Some("mid-task".into()),
-            }),
-        )
-        .await
-        .expect("pause succeeds");
-        assert_eq!(body["paused"], true);
-        assert_eq!(body["summary"], "mid-task");
-
-        let paused = state.session(id).expect("session exists");
-        assert_eq!(paused.status, SessionStatus::Paused);
-        assert_eq!(paused.pause_summary.as_deref(), Some("mid-task"));
-        assert!(paused.paused_at.is_some());
-
-        let Json(resumed) = resume_session(State(Arc::clone(&state)), Path(id.0.to_string()))
-            .await
-            .expect("resume succeeds");
-        assert_eq!(resumed["resumed"], true);
-
-        let active = state.session(id).expect("session exists");
-        assert_eq!(active.status, SessionStatus::Active);
-        assert_eq!(active.paused_at, None);
-        assert_eq!(active.pause_summary, None);
-    }
-
-    #[tokio::test]
-    async fn pause_unknown_session_is_404() {
-        let state = DaemonState::shared();
-        let err = pause_session(
-            State(state),
-            Path(SessionId::new().0.to_string()),
-            Json(PauseRequest::default()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn resume_unpaused_session_is_409() {
-        // A session that was never paused cannot be resumed.
-        let (state, id) = state_with_session();
-        let err = resume_session(State(state), Path(id.0.to_string()))
-            .await
-            .unwrap_err();
-        assert_eq!(err, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn send_command_returns_output_shape() {
-        // The command endpoint always returns `{ sent, output }`; tmux errors
-        // are swallowed so the output may simply be empty.
-        let (state, id) = state_with_session();
-        let Json(body) = send_command(
-            State(state),
-            Path(id.0.to_string()),
-            Query(CommandQuery::default()),
-            Json(CommandRequest {
-                command: "help".into(),
-            }),
-        )
-        .await
-        .expect("command sent");
-        assert_eq!(body["sent"], true);
-        assert!(body["output"].is_string());
-    }
-
-    #[tokio::test]
-    async fn command_to_stopped_session_is_409() {
-        let state = DaemonState::shared();
-        let id = SessionId::new();
-        let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux);
-        session.status = SessionStatus::Stopped;
-        state.register_session(session);
-
-        let err = send_command(
-            State(state),
-            Path(id.0.to_string()),
-            Query(CommandQuery::default()),
-            Json(CommandRequest {
-                command: "help".into(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn get_output_returns_output_shape() {
-        let (state, id) = state_with_session();
-        let Json(body) = get_output(
-            State(state),
-            Path(id.0.to_string()),
-            Query(OutputQuery {
-                lines: Some(25),
-                compress: None,
-            }),
-        )
-        .await
-        .expect("output captured");
-        assert!(body["output"].is_string());
-        assert_eq!(body["lines"], 25);
-    }
-
-    #[tokio::test]
-    async fn output_unknown_session_is_404() {
-        let state = DaemonState::shared();
-        let err = get_output(
-            State(state),
-            Path(SessionId::new().0.to_string()),
-            Query(OutputQuery::default()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn pause_resolves_session_by_friendly_name() {
-        // The pause endpoint accepts a friendly tmux name, not just a UUID.
-        let (state, id) = state_with_session();
-        let name = state.session(id).expect("session").tmux_name;
-        let Json(body) = pause_session(
-            State(Arc::clone(&state)),
-            Path(name),
-            Json(PauseRequest::default()),
-        )
-        .await
-        .expect("pause by name succeeds");
-        assert_eq!(body["paused"], true);
-    }
-
-    #[tokio::test]
-    async fn get_optimizer_returns_default() {
-        let state = DaemonState::shared();
-        let Json(body) = get_optimizer(State(state)).await;
-        assert_eq!(body["optimizer"]["default_level"], "trim");
-        assert_eq!(body["optimizer"]["suppress_redundant_reads"], true);
-    }
-
-    #[test]
-    fn send_command_compress_query_defaults_off() {
-        // A `CommandQuery` with no `compress` field deserializes to `None`, so
-        // omitting `?compress=` defaults to no compression.
-        let query: CommandQuery = serde_json::from_str("{}").expect("empty query deserializes");
-        assert_eq!(query.compress, None);
-    }
-
-    #[test]
-    fn output_query_defaults() {
-        // An `OutputQuery` with no fields set has neither a line count nor a
-        // compression level.
-        let query: OutputQuery = serde_json::from_str("{}").expect("empty query deserializes");
-        assert_eq!(query.lines, None);
-        assert_eq!(query.compress, None);
-    }
-
-    #[test]
-    fn compress_level_roundtrips_serde() {
-        // `CompressionLevel::Summarise` serializes to the lowercase wire name
-        // `"summarise"` and deserializes back to the same variant.
-        let json = serde_json::to_string(&CompressionLevel::Summarise).expect("serialize");
-        assert_eq!(json, "\"summarise\"");
-        let parsed: CompressionLevel = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed, CompressionLevel::Summarise);
-    }
-
-    #[test]
-    fn compress_level_label_matches_serde() {
-        // The lowercase label helper agrees with serde's wire representation.
-        assert_eq!(compression_level_label(CompressionLevel::Off), "off");
-        assert_eq!(compression_level_label(CompressionLevel::Trim), "trim");
-        assert_eq!(
-            compression_level_label(CompressionLevel::Summarise),
-            "summarise"
-        );
-        assert_eq!(
-            compression_level_label(CompressionLevel::Caveman),
-            "caveman"
-        );
-    }
-
-    #[test]
-    fn apply_compression_off_is_passthrough() {
-        // With no level, the text is returned unchanged and there is no label.
-        let result = apply_compression(None, "raw pane text");
-        assert_eq!(result.text, "raw pane text");
-        assert_eq!(result.level_label, None);
-    }
-
-    #[test]
-    fn apply_compression_summarise() {
-        // With a level set, the label is recorded and stats reflect the input.
-        let raw = "x".repeat(100);
-        let result = apply_compression(Some(CompressionLevel::Summarise), &raw);
-        assert_eq!(result.level_label.as_deref(), Some("summarise"));
-        assert_eq!(result.stats.original_bytes, 100);
-    }
-
-    #[tokio::test]
-    async fn list_tmux_sessions_returns_array() {
-        // `GET /tmux/sessions` always returns a well-formed `sessions` array
-        // (empty when tmux is unavailable in CI).
-        let state = DaemonState::shared();
-        let Json(body) = list_tmux_sessions(State(state)).await;
-        assert!(body["sessions"].is_array());
-    }
-
-    #[tokio::test]
-    async fn adopt_tmux_session_handles_missing() {
-        // Adopting a session that does not exist (or with tmux absent) is 404.
-        let state = DaemonState::shared();
-        let result = adopt_tmux_session(
-            State(state),
-            Json(AdoptRequest {
-                session: "trusty-mpm-no-such-session-xyz".into(),
-            }),
-        )
-        .await;
-        assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn tmux_snapshot_unknown_session_is_404() {
-        let state = DaemonState::shared();
-        let result = tmux_snapshot(State(state), Path("no-such-session-xyz".into())).await;
-        assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn get_claude_config_returns_shape() {
-        // `GET /claude-config` returns a `config` object and a
-        // `recommendations` array. The exact recommendations depend on the
-        // host's real `~/.claude` (user-level settings are merged in), so the
-        // test asserts only the response *shape*, not specific entries.
-        let dir = tempfile::tempdir().unwrap();
-        let state = DaemonState::shared();
-        let Json(body) = get_claude_config(
-            State(state),
-            Query(ClaudeConfigQuery {
-                project: dir.path().to_path_buf(),
-            }),
-        )
-        .await;
-        assert!(body["config"].is_object());
-        assert!(body["recommendations"].is_array());
-    }
-
-    #[tokio::test]
-    async fn list_checkpoints_returns_array() {
-        // `GET /claude-config/checkpoints` returns a well-formed array even for
-        // a project with no checkpoints yet.
-        let dir = tempfile::tempdir().unwrap();
-        let state = DaemonState::shared();
-        let Json(body) = list_checkpoints(
-            State(state),
-            Query(CheckpointQuery {
-                project: dir.path().to_path_buf(),
-            }),
-        )
-        .await;
-        assert!(body["checkpoints"].is_array());
-    }
-
-    #[tokio::test]
-    async fn create_checkpoint_returns_id() {
-        // `POST /claude-config/checkpoints` returns an `id` and the checkpoint
-        // is then visible via the list endpoint.
-        let dir = tempfile::tempdir().unwrap();
-        let state = DaemonState::shared();
-        let Json(body) = create_checkpoint(
-            State(Arc::clone(&state)),
-            Json(CreateCheckpointRequest {
-                project: dir.path().to_path_buf(),
-                label: Some("manual".into()),
-            }),
-        )
-        .await
-        .expect("create succeeds");
-        assert!(body["id"].as_str().is_some());
-
-        let Json(listed) = list_checkpoints(
-            State(state),
-            Query(CheckpointQuery {
-                project: dir.path().to_path_buf(),
-            }),
-        )
-        .await;
-        assert_eq!(listed["checkpoints"].as_array().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn restore_unknown_checkpoint_is_500() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = DaemonState::shared();
-        let err = restore_checkpoint(
-            State(state),
-            Json(RestoreRequest {
-                project: dir.path().to_path_buf(),
-                checkpoint_id: "no-such-checkpoint".into(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn delete_unknown_checkpoint_is_404() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = DaemonState::shared();
-        let err = delete_checkpoint(
-            State(state),
-            Path("no-such-checkpoint".into()),
-            Query(CheckpointQuery {
-                project: dir.path().to_path_buf(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn list_profiles_returns_builtins() {
-        // `GET /claude-config/profiles` lists the three built-in profiles.
-        let state = DaemonState::shared();
-        let Json(body) = list_profiles(State(state)).await;
-        let profiles = body["profiles"].as_array().expect("profiles array");
-        assert_eq!(profiles.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn deploy_profile_returns_checkpoint_id() {
-        // `POST /claude-config/deploy` deploys a built-in profile and returns a
-        // checkpoint id for undo.
-        let dir = tempfile::tempdir().unwrap();
-        let state = DaemonState::shared();
-        let Json(body) = deploy_profile(
-            State(state),
-            Json(DeployProfileRequest {
-                project: dir.path().to_path_buf(),
-                profile_name: "minimal".into(),
-                target: None,
-            }),
-        )
-        .await
-        .expect("deploy succeeds");
-        assert_eq!(body["deployed"], "minimal");
-        assert!(body["checkpoint_id"].as_str().is_some());
-    }
-
-    #[tokio::test]
-    async fn deploy_unknown_profile_is_404() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = DaemonState::shared();
-        let err = deploy_profile(
-            State(state),
-            Json(DeployProfileRequest {
-                project: dir.path().to_path_buf(),
-                profile_name: "no-such-profile".into(),
-                target: None,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn pair_request_returns_code() {
-        // `POST /pair/request` returns a six-character code and a TTL.
-        let state = DaemonState::shared();
-        let Json(body) = pair_request(State(state)).await;
-        let code = body["code"].as_str().expect("code is a string");
-        assert_eq!(code.len(), 6);
-        assert_eq!(body["expires_in_seconds"], 300);
-    }
-
-    #[tokio::test]
-    async fn pair_confirm_validates_code() {
-        // A code from `/pair/request` confirms successfully, and `/pair/status`
-        // then reports the daemon as paired with that chat.
-        let state = DaemonState::shared();
-        let Json(req) = pair_request(State(Arc::clone(&state))).await;
-        let code = req["code"].as_str().unwrap().to_string();
-        let Json(confirm) = pair_confirm(
-            State(Arc::clone(&state)),
-            Json(PairConfirmRequest { code, chat_id: 777 }),
-        )
-        .await;
-        assert_eq!(confirm["success"], true);
-        assert_eq!(confirm["chat_id"], 777);
-
-        let Json(status) = pair_status(State(state)).await;
-        assert_eq!(status["paired"], true);
-        assert_eq!(status["chat_id"], 777);
-    }
-
-    #[tokio::test]
-    async fn pair_confirm_rejects_bad_code() {
-        // A code that was never issued must not pair the daemon.
-        let state = DaemonState::shared();
-        let _ = pair_request(State(Arc::clone(&state))).await;
-        let Json(confirm) = pair_confirm(
-            State(Arc::clone(&state)),
-            Json(PairConfirmRequest {
-                code: "ZZZZZZ".into(),
-                chat_id: 777,
-            }),
-        )
-        .await;
-        assert_eq!(confirm["success"], false);
-        assert!(confirm["error"].as_str().unwrap().contains("invalid"));
-
-        let Json(status) = pair_status(State(state)).await;
-        assert_eq!(status["paired"], false);
-        assert!(status["chat_id"].is_null());
-    }
-
-    #[tokio::test]
-    async fn pair_status_reports_unpaired() {
-        let state = DaemonState::shared();
-        let Json(status) = pair_status(State(state)).await;
-        assert_eq!(status["paired"], false);
-    }
-
-    #[tokio::test]
-    async fn apply_claude_config_unknown_rec_is_404() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = DaemonState::shared();
-        let result = apply_claude_config(
-            State(state),
-            Json(ApplyConfigRequest {
-                project: dir.path().to_path_buf(),
-                recommendation_id: "no-such-recommendation".into(),
-            }),
-        )
-        .await;
-        assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
-    }
-}
+#[path = "api_tests.rs"]
+mod tests;
