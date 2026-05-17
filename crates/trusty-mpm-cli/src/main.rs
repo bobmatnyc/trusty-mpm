@@ -962,7 +962,7 @@ async fn connect_cmd(
                 id: v["id"].as_str()?.to_string(),
                 name: v["tmux_name"].as_str().map(str::to_string),
                 workdir: v["workdir"].as_str().unwrap_or("").to_string(),
-                last_active: v["last_active"].as_u64().unwrap_or(0),
+                last_active: v["last_seen"]["secs_since_epoch"].as_u64().unwrap_or(0),
             })
         })
         .collect();

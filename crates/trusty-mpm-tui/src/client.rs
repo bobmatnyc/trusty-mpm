@@ -41,6 +41,26 @@ pub struct SessionRow {
     /// Test: `session_row_deserializes_tmux_name`.
     #[serde(default)]
     pub tmux_name: String,
+    /// Last-seen timestamp from the daemon, serialized as
+    /// `{"secs_since_epoch": u64, "nanos_since_epoch": u32}`.
+    ///
+    /// Why: `resolve_target` uses this for workdir-prefix recency tie-breaking
+    /// so `/connect <path>` picks the most recently active session when
+    /// multiple sessions share the same workdir prefix.
+    /// What: deserialized from the daemon's `SystemTime` serde output;
+    /// defaults to `{"secs_since_epoch":0}` when absent.
+    #[serde(default)]
+    pub last_seen: LastSeen,
+}
+
+/// Serde shape for `SystemTime` as emitted by the daemon.
+///
+/// Why: `serde` serializes `SystemTime` as a struct, not a plain integer;
+/// we extract only the seconds component for recency comparison.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LastSeen {
+    #[serde(default)]
+    pub secs_since_epoch: u64,
 }
 
 /// One hook-event row as returned by `GET /events`.

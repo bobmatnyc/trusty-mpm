@@ -297,6 +297,7 @@ mod tests {
                 status: serde_json::json!("active"),
                 active_delegations: 0,
                 tmux_name: "tmpm-quiet-falcon".into(),
+                last_seen: Default::default(),
             }],
             ..DashboardState::default()
         }

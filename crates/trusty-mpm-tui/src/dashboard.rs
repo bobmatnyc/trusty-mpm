@@ -140,9 +140,9 @@ impl DashboardState {
     /// type; the dashboard's `SessionRow` carries extra render-only fields, so a
     /// projection is needed before resolution.
     /// What: maps each polled `SessionRow` to a `SessionSummary` — UUID string,
-    /// friendly `tmux_name`, and `workdir`; `last_active` is unavailable in the
-    /// dashboard wire shape, so it defaults to `0` (recency tie-breaking is only
-    /// reached for workdir-prefix matches).
+    /// friendly `tmux_name`, `workdir`, and `last_seen` (as Unix seconds) so
+    /// workdir-prefix recency tie-breaking in `resolve_target` picks the most
+    /// recently active session.
     /// Test: covered indirectly by `submit_connect_*` tests.
     fn session_summaries(&self) -> Vec<trusty_mpm_core::SessionSummary> {
         self.sessions
@@ -152,7 +152,7 @@ impl DashboardState {
                     id: s.id.as_str()?.to_string(),
                     name: Some(s.tmux_name.clone()).filter(|n| !n.is_empty()),
                     workdir: s.workdir.clone(),
-                    last_active: 0,
+                    last_active: s.last_seen.secs_since_epoch,
                 })
             })
             .collect()
@@ -632,6 +632,7 @@ mod tests {
             status: serde_json::json!(status),
             active_delegations: 0,
             tmux_name: name.into(),
+            last_seen: Default::default(),
         }
     }
 
@@ -651,6 +652,7 @@ mod tests {
                 status: serde_json::json!("active"),
                 active_delegations: 2,
                 tmux_name: "tmpm-quiet-falcon".into(),
+                last_seen: Default::default(),
             }],
             ..DashboardState::default()
         };
