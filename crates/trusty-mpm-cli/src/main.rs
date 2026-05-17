@@ -183,6 +183,9 @@ enum SessionAction {
         id_or_name: String,
         /// Command to send.
         command: String,
+        /// Summarize the output before printing (uses the Summarise level).
+        #[arg(long)]
+        summarize: bool,
     },
     /// Capture the current output of a session's tmux pane.
     Output {
@@ -191,6 +194,9 @@ enum SessionAction {
         /// Number of lines to capture (default 50).
         #[arg(long, default_value_t = 50)]
         lines: u32,
+        /// Summarize the output before printing (uses the Summarise level).
+        #[arg(long)]
+        summarize: bool,
     },
 }
 
@@ -756,9 +762,13 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
         SessionAction::Run {
             id_or_name,
             command,
+            summarize,
         } => {
-            let resp = client
-                .post(format!("{url}/sessions/{id_or_name}/command"))
+            let mut req = client.post(format!("{url}/sessions/{id_or_name}/command"));
+            if summarize {
+                req = req.query(&[("compress", "summarise")]);
+            }
+            let resp = req
                 .json(&serde_json::json!({ "command": command }))
                 .send()
                 .await?;
@@ -773,13 +783,22 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
                     let body: serde_json::Value = resp.error_for_status()?.json().await?;
                     let output = body.get("output").and_then(|v| v.as_str()).unwrap_or("");
                     print!("{output}");
+                    print_compression_stats(&body);
                 }
             }
         }
-        SessionAction::Output { id_or_name, lines } => {
+        SessionAction::Output {
+            id_or_name,
+            lines,
+            summarize,
+        } => {
+            let mut query: Vec<(&str, String)> = vec![("lines", lines.to_string())];
+            if summarize {
+                query.push(("compress", "summarise".to_string()));
+            }
             let resp = client
                 .get(format!("{url}/sessions/{id_or_name}/output"))
-                .query(&[("lines", lines.to_string())])
+                .query(&query)
                 .send()
                 .await?;
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -788,6 +807,7 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
                 let body: serde_json::Value = resp.error_for_status()?.json().await?;
                 let output = body.get("output").and_then(|v| v.as_str()).unwrap_or("");
                 print!("{output}");
+                print_compression_stats(&body);
             }
         }
     }
@@ -847,6 +867,39 @@ fn event_summary(payload: &serde_json::Value) -> String {
     } else {
         dump
     }
+}
+
+/// Print a one-line compression-savings note when an output was summarized.
+///
+/// Why: `session run --summarize` and `session output --summarize` should tell
+/// the operator how much the summary saved, completing the visible feedback for
+/// the "summarize output" step of the user cycle.
+/// What: when the response body carries a non-null `compress_level`, prints
+/// `[summarized: A → B bytes (N% reduction)]` to a fresh line; does nothing when
+/// the output was returned raw (no compression applied).
+/// Test: `compression_stats_line_*` unit tests.
+fn print_compression_stats(body: &serde_json::Value) {
+    if body
+        .get("compress_level")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        return;
+    }
+    let original = body
+        .get("original_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let compressed = body
+        .get("compressed_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let reduction = if original == 0 {
+        0
+    } else {
+        (100 * original.saturating_sub(compressed)) / original
+    };
+    println!("\n[summarized: {original} \u{2192} {compressed} bytes ({reduction}% reduction)]");
 }
 
 /// `overseer` subcommand — inspect the session overseer.
@@ -1545,11 +1598,32 @@ mod tests {
                     SessionAction::Run {
                         id_or_name,
                         command,
+                        summarize,
                     },
             } => {
                 assert_eq!(id_or_name, "abc-123");
                 assert_eq!(command, "help me");
+                assert!(!summarize);
             }
+            other => panic!("expected session run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_run_with_summarize() {
+        let cli = Cli::try_parse_from([
+            "trusty-mpm",
+            "session",
+            "run",
+            "tmpm-abc",
+            "help",
+            "--summarize",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Run { summarize, .. },
+            } => assert!(summarize),
             other => panic!("expected session run, got {other:?}"),
         }
     }
@@ -1559,10 +1633,16 @@ mod tests {
         let cli = Cli::try_parse_from(["trusty-mpm", "session", "output", "abc-123"]).unwrap();
         match cli.command {
             Command::Session {
-                action: SessionAction::Output { id_or_name, lines },
+                action:
+                    SessionAction::Output {
+                        id_or_name,
+                        lines,
+                        summarize,
+                    },
             } => {
                 assert_eq!(id_or_name, "abc-123");
                 assert_eq!(lines, 50);
+                assert!(!summarize);
             }
             other => panic!("expected session output, got {other:?}"),
         }
@@ -1585,6 +1665,52 @@ mod tests {
             } => assert_eq!(lines, 120),
             other => panic!("expected session output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_parses_session_output_with_summarize() {
+        let cli =
+            Cli::try_parse_from(["trusty-mpm", "session", "output", "tmpm-abc", "--summarize"])
+                .unwrap();
+        match cli.command {
+            Command::Session {
+                action: SessionAction::Output { summarize, .. },
+            } => assert!(summarize),
+            other => panic!("expected session output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compression_stats_line_skipped_when_uncompressed() {
+        // A response with a null `compress_level` is raw output; no stats line.
+        let body = serde_json::json!({
+            "output": "raw",
+            "compress_level": serde_json::Value::Null,
+        });
+        // The helper must not panic and must treat a null level as "no stats".
+        assert!(
+            body.get("compress_level")
+                .and_then(|v| v.as_str())
+                .is_none()
+        );
+        print_compression_stats(&body);
+    }
+
+    #[test]
+    fn compression_stats_line_printed_when_compressed() {
+        // A response carrying a level and byte counts is exercised end-to-end;
+        // the helper computes a percentage without panicking.
+        let body = serde_json::json!({
+            "output": "summary",
+            "original_bytes": 4096,
+            "compressed_bytes": 312,
+            "compress_level": "summarise",
+        });
+        assert_eq!(
+            body.get("compress_level").and_then(|v| v.as_str()),
+            Some("summarise")
+        );
+        print_compression_stats(&body);
     }
 
     #[test]

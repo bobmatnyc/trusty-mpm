@@ -131,9 +131,11 @@ async fn full_user_cycle() {
         "post-start status: {status}"
     );
 
-    // 3. Send a command. tmux errors are swallowed by the handler.
+    // 3. Send a command, requesting a summarized capture. tmux errors are
+    //    swallowed by the handler; the `?compress=summarise` query exercises the
+    //    "summarize output" step of the full user cycle.
     let cmd = client
-        .post(server.url(&format!("/sessions/{name}/command")))
+        .post(server.url(&format!("/sessions/{name}/command?compress=summarise")))
         .json(&json!({ "command": "help" }))
         .send()
         .await
@@ -142,6 +144,15 @@ async fn full_user_cycle() {
     let cmd_body: Value = cmd.json().await.expect("command body");
     assert_eq!(cmd_body["sent"], true);
     assert!(cmd_body["output"].is_string());
+    // A summarized command response carries the compression byte counts.
+    assert!(
+        cmd_body.get("original_bytes").is_some(),
+        "original_bytes key present"
+    );
+    assert!(
+        cmd_body.get("compressed_bytes").is_some(),
+        "compressed_bytes key present"
+    );
 
     // 4. Capture output.
     let out = client

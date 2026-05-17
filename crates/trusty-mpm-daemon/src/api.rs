@@ -23,6 +23,7 @@ use serde_json::Value;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use trusty_mpm_core::compress::{CompressionLevel, compress_output};
 use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
 use trusty_mpm_core::overseer::{OverseerContext, OverseerDecision};
 use trusty_mpm_core::project::ProjectInfo;
@@ -293,6 +294,65 @@ fn capture_pane(session: &Session, lines: u32) -> String {
     }
 }
 
+/// Result of applying an optional compression level to captured output.
+///
+/// Why: the command and output endpoints share the same compress-then-return
+/// shape; bundling the text and stats lets one helper produce both.
+/// What: the (possibly compressed) text, the byte stats, and the level as a
+/// lowercase wire string (`None` when no compression was applied).
+/// Test: `apply_compression_off_is_passthrough`, `apply_compression_summarise`.
+struct CompressedOutput {
+    /// The output text after compression (or unchanged when off).
+    text: String,
+    /// Byte counts before and after compression.
+    stats: trusty_mpm_core::compress::CompressionStats,
+    /// Lowercase wire name of the level applied, or `None` when uncompressed.
+    level_label: Option<String>,
+}
+
+/// Apply an optional compression level to captured pane output.
+///
+/// Why: `POST .../command` and `GET .../output` both accept an optional
+/// `?compress=` query param; doing the compress-or-passthrough decision once
+/// keeps the two handlers identical.
+/// What: when `level` is `Some`, runs [`compress_output`] and records the
+/// level's lowercase label; when `None`, returns the raw text with empty stats
+/// and no label.
+/// Test: `apply_compression_off_is_passthrough`, `apply_compression_summarise`.
+fn apply_compression(level: Option<CompressionLevel>, raw: &str) -> CompressedOutput {
+    match level {
+        Some(level) => {
+            let (text, stats) = compress_output(raw, level);
+            CompressedOutput {
+                text,
+                stats,
+                level_label: Some(compression_level_label(level)),
+            }
+        }
+        None => CompressedOutput {
+            text: raw.to_string(),
+            stats: trusty_mpm_core::compress::CompressionStats::default(),
+            level_label: None,
+        },
+    }
+}
+
+/// Lowercase wire name for a [`CompressionLevel`].
+///
+/// Why: API responses report the applied level as a stable lowercase string,
+/// matching the `snake_case` serde representation of the enum.
+/// What: maps each variant to its `serde` wire name.
+/// Test: `compress_level_label_matches_serde`.
+fn compression_level_label(level: CompressionLevel) -> String {
+    match level {
+        CompressionLevel::Off => "off",
+        CompressionLevel::Trim => "trim",
+        CompressionLevel::Summarise => "summarise",
+        CompressionLevel::Caveman => "caveman",
+    }
+    .to_string()
+}
+
 /// JSON body for `POST /sessions/{id}/pause`.
 ///
 /// Why: a pause may carry an optional operator note describing where the
@@ -312,8 +372,9 @@ pub struct PauseRequest {
 /// off" note that survives a daemon restart.
 /// What: resolves the session by UUID or friendly name, captures the last 50
 /// pane lines, sets `status = Paused` / `paused_at = now` / `pause_summary`
-/// (the request note, or the first 200 chars of captured output), and mirrors
-/// the pause record to disk via `session_store::save_pause`.
+/// (the request note, or the first 500 chars of the `Summarise`-compressed
+/// captured output), and mirrors the pause record to disk via
+/// `session_store::save_pause`.
 /// Test: `pause_then_resume_round_trips`, `pause_unknown_session_is_404`.
 #[utoipa::path(
     post,
@@ -333,9 +394,13 @@ pub async fn pause_session(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let session = resolve_session(&state, &id)?;
     let captured = capture_pane(&session, 50);
-    let summary = body
-        .summary
-        .unwrap_or_else(|| captured.chars().take(200).collect::<String>());
+    let summary = body.summary.unwrap_or_else(|| {
+        // No operator note: derive a cleaner auto-summary by running the
+        // captured pane text through `Summarise` compression (strips ANSI,
+        // collapses blank lines) and keeping the first 500 chars.
+        let (compressed, _) = compress_output(&captured, CompressionLevel::Summarise);
+        compressed.chars().take(500).collect::<String>()
+    });
     let now = std::time::SystemTime::now();
 
     state.update_session(&session.id, |s| {
@@ -414,20 +479,39 @@ pub struct CommandRequest {
     pub command: String,
 }
 
+/// Query parameters for `POST /sessions/{id}/command`.
+///
+/// Why: the caller may want the captured output summarised before it returns,
+/// completing the "summarize output" step of the full user cycle.
+/// What: an optional compression level (`off`, `trim`, `summarise`,
+/// `caveman`); when absent the raw pane capture is returned unchanged.
+/// Test: `send_command_compress_query_defaults_off`.
+#[derive(serde::Deserialize, Default)]
+pub struct CommandQuery {
+    /// Compression level to apply to the captured output before returning.
+    /// Values: off, trim, summarise, caveman. Defaults to none (raw output).
+    #[serde(default)]
+    pub compress: Option<CompressionLevel>,
+}
+
 /// `POST /sessions/{id}/command` — send a command to a session's tmux pane.
 ///
 /// Why: remote control of a running session — type a line, let it run, read
 /// back what happened.
 /// What: resolves the session (`404` if missing, `409` if `Stopped`), sends the
 /// command via `TmuxDriver::send_line`, waits 500ms for output to settle, then
-/// captures the last 100 pane lines. tmux errors are logged, not fatal — the
-/// endpoint still returns `200` with whatever output was captured.
+/// captures the last 100 pane lines. When `?compress=` is supplied the capture
+/// is compressed at that level before returning. tmux errors are logged, not
+/// fatal — the endpoint still returns `200` with whatever output was captured.
 /// Test: `send_command_returns_output_shape`, `command_to_stopped_session_is_409`.
 #[utoipa::path(
     post,
     path = "/sessions/{id}/command",
     tag = "sessions",
-    params(("id" = String, Path, description = "Session UUID or friendly name")),
+    params(
+        ("id" = String, Path, description = "Session UUID or friendly name"),
+        ("compress" = Option<String>, Query, description = "Compression level: off, trim, summarise, caveman"),
+    ),
     request_body = CommandRequest,
     responses(
         (status = 200, description = "Command sent; returns captured pane output"),
@@ -438,6 +522,7 @@ pub struct CommandRequest {
 pub async fn send_command(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
+    Query(query): Query<CommandQuery>,
     Json(body): Json<CommandRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let session = resolve_session(&state, &id)?;
@@ -463,22 +548,34 @@ pub async fn send_command(
 
     // Give the pane a moment to render the command's output before capturing.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let output = capture_pane(&session, 100);
+    let raw = capture_pane(&session, 100);
+    let compressed = apply_compression(query.compress, &raw);
 
-    Ok(Json(serde_json::json!({ "sent": true, "output": output })))
+    Ok(Json(serde_json::json!({
+        "sent": true,
+        "output": compressed.text,
+        "original_bytes": compressed.stats.original_bytes,
+        "compressed_bytes": compressed.stats.compressed_bytes,
+        "compress_level": compressed.level_label,
+    })))
 }
 
 /// Query parameters for `GET /sessions/{id}/output`.
 ///
-/// Why: the caller chooses how much scrollback to capture; a default keeps the
-/// endpoint usable with no query string.
-/// What: an optional line count, defaulting to 50.
-/// Test: `get_output_returns_output_shape`.
-#[derive(serde::Deserialize)]
+/// Why: the caller chooses how much scrollback to capture and whether to
+/// summarise it; defaults keep the endpoint usable with no query string.
+/// What: an optional line count (defaulting to 50 when absent) and an optional
+/// compression level applied to the capture before returning.
+/// Test: `get_output_returns_output_shape`, `output_query_defaults`.
+#[derive(serde::Deserialize, Default)]
 pub struct OutputQuery {
-    /// Number of trailing pane lines to capture (default 50).
-    #[serde(default = "default_output_lines")]
-    pub lines: u32,
+    /// Number of trailing pane lines to capture (default 50 when absent).
+    #[serde(default)]
+    pub lines: Option<u32>,
+    /// Compression level to apply to the captured output before returning.
+    /// Values: off, trim, summarise, caveman. Defaults to none (raw output).
+    #[serde(default)]
+    pub compress: Option<CompressionLevel>,
 }
 
 /// Default trailing-line count for `GET /sessions/{id}/output`.
@@ -491,7 +588,8 @@ fn default_output_lines() -> u32 {
 /// Why: the dashboard and the Telegram bot show a session's recent output
 /// without sending it a command.
 /// What: resolves the session (`404` if missing), captures the last `?lines=N`
-/// pane lines (default 50), and returns `{ "output": <text>, "lines": N }`.
+/// pane lines (default 50), optionally compresses it at `?compress=`, and
+/// returns `{ output, lines, original_bytes, compressed_bytes, compress_level }`.
 /// tmux being unavailable yields an empty `output` rather than an error.
 /// Test: `get_output_returns_output_shape`, `output_unknown_session_is_404`.
 #[utoipa::path(
@@ -501,6 +599,7 @@ fn default_output_lines() -> u32 {
     params(
         ("id" = String, Path, description = "Session UUID or friendly name"),
         ("lines" = Option<u32>, Query, description = "Trailing lines to capture (default 50)"),
+        ("compress" = Option<String>, Query, description = "Compression level: off, trim, summarise, caveman"),
     ),
     responses(
         (status = 200, description = "Captured pane output"),
@@ -513,10 +612,15 @@ pub async fn get_output(
     Query(query): Query<OutputQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let session = resolve_session(&state, &id)?;
-    let output = capture_pane(&session, query.lines);
+    let lines = query.lines.unwrap_or_else(default_output_lines);
+    let raw = capture_pane(&session, lines);
+    let compressed = apply_compression(query.compress, &raw);
     Ok(Json(serde_json::json!({
-        "output": output,
-        "lines": query.lines,
+        "output": compressed.text,
+        "lines": lines,
+        "original_bytes": compressed.stats.original_bytes,
+        "compressed_bytes": compressed.stats.compressed_bytes,
+        "compress_level": compressed.level_label,
     })))
 }
 
@@ -1227,6 +1331,7 @@ mod tests {
         let Json(body) = send_command(
             State(state),
             Path(id.0.to_string()),
+            Query(CommandQuery::default()),
             Json(CommandRequest {
                 command: "help".into(),
             }),
@@ -1248,6 +1353,7 @@ mod tests {
         let err = send_command(
             State(state),
             Path(id.0.to_string()),
+            Query(CommandQuery::default()),
             Json(CommandRequest {
                 command: "help".into(),
             }),
@@ -1263,7 +1369,10 @@ mod tests {
         let Json(body) = get_output(
             State(state),
             Path(id.0.to_string()),
-            Query(OutputQuery { lines: 25 }),
+            Query(OutputQuery {
+                lines: Some(25),
+                compress: None,
+            }),
         )
         .await
         .expect("output captured");
@@ -1277,7 +1386,7 @@ mod tests {
         let err = get_output(
             State(state),
             Path(SessionId::new().0.to_string()),
-            Query(OutputQuery { lines: 50 }),
+            Query(OutputQuery::default()),
         )
         .await
         .unwrap_err();
@@ -1305,5 +1414,64 @@ mod tests {
         let Json(body) = get_optimizer(State(state)).await;
         assert_eq!(body["optimizer"]["default_level"], "trim");
         assert_eq!(body["optimizer"]["suppress_redundant_reads"], true);
+    }
+
+    #[test]
+    fn send_command_compress_query_defaults_off() {
+        // A `CommandQuery` with no `compress` field deserializes to `None`, so
+        // omitting `?compress=` defaults to no compression.
+        let query: CommandQuery = serde_json::from_str("{}").expect("empty query deserializes");
+        assert_eq!(query.compress, None);
+    }
+
+    #[test]
+    fn output_query_defaults() {
+        // An `OutputQuery` with no fields set has neither a line count nor a
+        // compression level.
+        let query: OutputQuery = serde_json::from_str("{}").expect("empty query deserializes");
+        assert_eq!(query.lines, None);
+        assert_eq!(query.compress, None);
+    }
+
+    #[test]
+    fn compress_level_roundtrips_serde() {
+        // `CompressionLevel::Summarise` serializes to the lowercase wire name
+        // `"summarise"` and deserializes back to the same variant.
+        let json = serde_json::to_string(&CompressionLevel::Summarise).expect("serialize");
+        assert_eq!(json, "\"summarise\"");
+        let parsed: CompressionLevel = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, CompressionLevel::Summarise);
+    }
+
+    #[test]
+    fn compress_level_label_matches_serde() {
+        // The lowercase label helper agrees with serde's wire representation.
+        assert_eq!(compression_level_label(CompressionLevel::Off), "off");
+        assert_eq!(compression_level_label(CompressionLevel::Trim), "trim");
+        assert_eq!(
+            compression_level_label(CompressionLevel::Summarise),
+            "summarise"
+        );
+        assert_eq!(
+            compression_level_label(CompressionLevel::Caveman),
+            "caveman"
+        );
+    }
+
+    #[test]
+    fn apply_compression_off_is_passthrough() {
+        // With no level, the text is returned unchanged and there is no label.
+        let result = apply_compression(None, "raw pane text");
+        assert_eq!(result.text, "raw pane text");
+        assert_eq!(result.level_label, None);
+    }
+
+    #[test]
+    fn apply_compression_summarise() {
+        // With a level set, the label is recorded and stats reflect the input.
+        let raw = "x".repeat(100);
+        let result = apply_compression(Some(CompressionLevel::Summarise), &raw);
+        assert_eq!(result.level_label.as_deref(), Some("summarise"));
+        assert_eq!(result.stats.original_bytes, 100);
     }
 }
