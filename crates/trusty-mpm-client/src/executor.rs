@@ -127,8 +127,8 @@ impl CommandExecutor {
             Ok(rows) => CommandResult::Sessions(
                 rows.into_iter()
                     .map(|s| SessionSummary {
-                        id: s.id.as_str().unwrap_or("?").to_string(),
-                        status: s.status.as_str().unwrap_or("unknown").to_string(),
+                        id: s.id.0.to_string(),
+                        status: status_label(s.status),
                         workdir: s.workdir,
                     })
                     .collect(),
@@ -146,7 +146,7 @@ impl CommandExecutor {
                     .rev()
                     .take(5)
                     .rev()
-                    .map(|e| e.event.clone())
+                    .map(|e| e.event.wire_name().to_string())
                     .collect();
                 CommandResult::SessionDetail {
                     id: session_id.to_string(),
@@ -168,7 +168,7 @@ impl CommandExecutor {
     /// Test: `execute_approve_unknown_session_errors`.
     async fn decide(&self, session_id: &str, approved: bool) -> CommandResult {
         let exists = match self.client.sessions().await {
-            Ok(rows) => rows.iter().any(|s| s.id.as_str() == Some(session_id)),
+            Ok(rows) => rows.iter().any(|s| s.id.0.to_string() == session_id),
             Err(e) => return CommandResult::Error(format!("daemon unreachable: {e}")),
         };
         if !exists {
@@ -273,6 +273,19 @@ impl CommandExecutor {
             Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
         }
     }
+}
+
+/// Render a [`SessionStatus`] as its wire label.
+///
+/// Why: `SessionSummary.status` is a display string; serializing the typed
+/// status keeps the label identical to the daemon's JSON wire form.
+/// What: serializes the status via serde and strips the surrounding quotes.
+/// Test: covered by `execute_sessions_against_test_daemon`.
+fn status_label(status: trusty_mpm_core::session::SessionStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]

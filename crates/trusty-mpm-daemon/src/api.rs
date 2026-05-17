@@ -41,6 +41,14 @@ use crate::tmux::TmuxDriver;
 pub mod claude_config_routes;
 pub use claude_config_routes::*;
 
+/// Typed HTTP response bodies for every endpoint.
+///
+/// Why: keeping the response structs in their own module keeps `api.rs`
+/// focused on routing and handler logic. Re-exported so handlers and tests
+/// refer to them as `crate::api::<Type>`.
+pub mod types;
+pub use types::*;
+
 /// Build the daemon's HTTP router with shared state injected.
 ///
 /// Why: one place wires every route so `main` stays a thin bootstrap.
@@ -126,12 +134,12 @@ pub struct SessionQuery {
 pub async fn list_sessions(
     State(state): State<Arc<DaemonState>>,
     Query(query): Query<SessionQuery>,
-) -> Json<serde_json::Value> {
+) -> Json<SessionsResponse> {
     let sessions = match query.project {
         Some(path) => state.list_sessions_for_project(&path),
         None => state.list_sessions(),
     };
-    Json(serde_json::json!({ "sessions": sessions }))
+    Json(SessionsResponse { sessions })
 }
 
 /// `GET /events` — recent hook events across all sessions (dashboard feed).
@@ -141,8 +149,10 @@ pub async fn list_sessions(
     tag = "events",
     responses((status = 200, description = "Recent hook events across all sessions"))
 )]
-pub async fn recent_events(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "events": state.recent_hook_events() }))
+pub async fn recent_events(State(state): State<Arc<DaemonState>>) -> Json<EventsResponse> {
+    Json(EventsResponse {
+        events: state.recent_hook_events(),
+    })
 }
 
 /// JSON body for registering a session via `POST /sessions`.
@@ -181,7 +191,7 @@ pub struct RegisterSession {
 pub async fn register_session(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RegisterSession>,
-) -> Json<serde_json::Value> {
+) -> Json<RegisterSessionResponse> {
     let mut session = Session::new(SessionId::new(), body.workdir.clone(), ControlModel::Tmux);
     session.project_path = body.project_path.clone();
     let id = session.id;
@@ -210,7 +220,10 @@ pub async fn register_session(
         }
     }
 
-    Json(serde_json::json!({ "id": id, "name": tmux_name }))
+    Json(RegisterSessionResponse {
+        id,
+        name: tmux_name,
+    })
 }
 
 /// `DELETE /sessions/:id` — deregister a session.
@@ -227,10 +240,10 @@ pub async fn register_session(
 pub async fn remove_session(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<RemoveSessionResponse>, DaemonError> {
     let session = parse_id(&id)?;
     match state.remove_session(session) {
-        Some(_) => Ok(Json(serde_json::json!({ "removed": id }))),
+        Some(_) => Ok(Json(RemoveSessionResponse { removed: id })),
         None => Err(DaemonError::SessionNotFound { id }),
     }
 }
@@ -249,9 +262,11 @@ pub async fn remove_session(
     tag = "sessions",
     responses((status = 200, description = "Dead sessions reaped; returns the removed count"))
 )]
-pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<ReapResponse> {
     let result = SessionService::new(&state).reap();
-    Json(serde_json::json!({ "removed": result.reaped }))
+    Json(ReapResponse {
+        removed: result.reaped,
+    })
 }
 
 /// `GET /sessions/:id/events` — recent hook events for one session.
@@ -268,11 +283,11 @@ pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_
 pub async fn session_events(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<EventsResponse>, DaemonError> {
     let session = parse_id(&id)?;
-    Ok(Json(serde_json::json!({
-        "events": state.hook_events_for(session),
-    })))
+    Ok(Json(EventsResponse {
+        events: state.hook_events_for(session),
+    }))
 }
 
 /// Result of applying an optional compression level to captured output.
@@ -372,13 +387,13 @@ pub async fn pause_session(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     Json(body): Json<PauseRequest>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<PauseResponse>, DaemonError> {
     let result = SessionService::new(&state).pause(&id, body.summary)?;
-    Ok(Json(serde_json::json!({
-        "paused": true,
-        "session_id": result.session_id,
-        "summary": result.summary,
-    })))
+    Ok(Json(PauseResponse {
+        paused: true,
+        session_id: result.session_id,
+        summary: result.summary,
+    }))
 }
 
 /// `POST /sessions/{id}/resume` — resume a previously-paused session.
@@ -403,9 +418,9 @@ pub async fn pause_session(
 pub async fn resume_session(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<ResumeResponse>, DaemonError> {
     SessionService::new(&state).resume(&id)?;
-    Ok(Json(serde_json::json!({ "resumed": true })))
+    Ok(Json(ResumeResponse { resumed: true }))
 }
 
 /// JSON body for `POST /sessions/{id}/command`.
@@ -465,7 +480,7 @@ pub async fn send_command(
     Path(id): Path<String>,
     Query(query): Query<CommandQuery>,
     Json(body): Json<CommandRequest>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<CommandResponse>, DaemonError> {
     let session = SessionService::new(&state).command_target(&id)?;
     TmuxService::send_command(&session, &body.command);
 
@@ -474,13 +489,13 @@ pub async fn send_command(
     let raw = TmuxService::capture(&session, 100);
     let compressed = apply_compression(query.compress, &raw);
 
-    Ok(Json(serde_json::json!({
-        "sent": true,
-        "output": compressed.text,
-        "original_bytes": compressed.stats.original_bytes,
-        "compressed_bytes": compressed.stats.compressed_bytes,
-        "compress_level": compressed.level_label,
-    })))
+    Ok(Json(CommandResponse {
+        sent: true,
+        output: compressed.text,
+        original_bytes: compressed.stats.original_bytes,
+        compressed_bytes: compressed.stats.compressed_bytes,
+        compress_level: compressed.level_label,
+    }))
 }
 
 /// Query parameters for `GET /sessions/{id}/output`.
@@ -533,18 +548,18 @@ pub async fn get_output(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     Query(query): Query<OutputQuery>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<OutputResponse>, DaemonError> {
     let session = SessionService::new(&state).resolve(&id)?;
     let lines = query.lines.unwrap_or_else(default_output_lines);
     let raw = TmuxService::capture(&session, lines);
     let compressed = apply_compression(query.compress, &raw);
-    Ok(Json(serde_json::json!({
-        "output": compressed.text,
-        "lines": lines,
-        "original_bytes": compressed.stats.original_bytes,
-        "compressed_bytes": compressed.stats.compressed_bytes,
-        "compress_level": compressed.level_label,
-    })))
+    Ok(Json(OutputResponse {
+        output: compressed.text,
+        lines,
+        original_bytes: compressed.stats.original_bytes,
+        compressed_bytes: compressed.stats.compressed_bytes,
+        compress_level: compressed.level_label,
+    }))
 }
 
 /// `GET /breakers` — every agent's circuit-breaker state.
@@ -554,13 +569,13 @@ pub async fn get_output(
     tag = "config",
     responses((status = 200, description = "Array of per-agent circuit-breaker states"))
 )]
-pub async fn breakers(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    let breakers: Vec<_> = state
+pub async fn breakers(State(state): State<Arc<DaemonState>>) -> Json<BreakersResponse> {
+    let breakers = state
         .all_breakers()
         .into_iter()
-        .map(|(agent, cb)| serde_json::json!({ "agent": agent, "breaker": cb }))
+        .map(|(agent, breaker)| BreakerEntry { agent, breaker })
         .collect();
-    Json(serde_json::json!({ "breakers": breakers }))
+    Json(BreakersResponse { breakers })
 }
 
 /// JSON body for the universal hook relay endpoint.
@@ -573,8 +588,11 @@ pub async fn breakers(State(state): State<Arc<DaemonState>>) -> Json<serde_json:
 pub struct HookPost {
     /// Session the event came from (UUID string).
     pub session_id: String,
-    /// Claude Code event name, e.g. `PreToolUse`.
-    pub event: String,
+    /// Claude Code event, e.g. `PreToolUse`. Deserialization rejects any name
+    /// that is not a known [`HookEvent`] variant, so an unknown event is a
+    /// `400` before the handler runs.
+    #[schema(value_type = String)]
+    pub event: HookEvent,
     /// Raw event payload (shape varies per event).
     #[serde(default)]
     #[schema(value_type = Object)]
@@ -606,15 +624,14 @@ pub struct HookPost {
 pub async fn ingest_hook(
     State(state): State<Arc<DaemonState>>,
     Json(post): Json<HookPost>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<HookAcceptedResponse>, DaemonError> {
     let session = parse_id(&post.session_id)?;
-    let event = HookEvent::from_wire(&post.event).ok_or_else(|| {
-        DaemonError::InvalidRequest(format!("unknown hook event: {}", post.event))
-    })?;
 
-    match HookService::new(&state).process(session, event, post.payload) {
+    match HookService::new(&state).process(session, post.event, post.payload) {
         HookDecision::Block { reason } => Err(DaemonError::OverseerBlocked { reason }),
-        _ => Ok(Json(serde_json::json!({ "accepted": post.event }))),
+        _ => Ok(Json(HookAcceptedResponse {
+            accepted: post.event,
+        })),
     }
 }
 
@@ -631,13 +648,13 @@ pub async fn ingest_hook(
     tag = "config",
     responses((status = 200, description = "Overseer enabled flag and handler type"))
 )]
-pub async fn get_overseer(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "overseer": {
-            "enabled": state.overseer().is_enabled(),
-            "handler": state.overseer_handler(),
-        }
-    }))
+pub async fn get_overseer(State(state): State<Arc<DaemonState>>) -> Json<OverseerResponse> {
+    Json(OverseerResponse {
+        overseer: OverseerStatus {
+            enabled: state.overseer().is_enabled(),
+            handler: state.overseer_handler().to_string(),
+        },
+    })
 }
 
 /// `GET /optimizer` — current token-use optimizer configuration.
@@ -653,8 +670,10 @@ pub async fn get_overseer(State(state): State<Arc<DaemonState>>) -> Json<serde_j
     tag = "config",
     responses((status = 200, description = "Current token-use optimizer configuration"))
 )]
-pub async fn get_optimizer(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "optimizer": state.optimizer_config() }))
+pub async fn get_optimizer(State(state): State<Arc<DaemonState>>) -> Json<OptimizerResponse> {
+    Json(OptimizerResponse {
+        optimizer: state.optimizer_config(),
+    })
 }
 
 /// JSON body for registering a project via `POST /projects`.
@@ -687,9 +706,8 @@ pub struct RegisterProject {
 pub async fn register_project(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RegisterProject>,
-) -> Json<serde_json::Value> {
-    let info = state.register_project(body.path);
-    Json(serde_json::json!(info))
+) -> Json<ProjectInfo> {
+    Json(state.register_project(body.path))
 }
 
 /// `GET /projects` — snapshot of every registered project.
@@ -699,8 +717,10 @@ pub async fn register_project(
     tag = "projects",
     responses((status = 200, description = "Array of registered projects", body = [ProjectInfo]))
 )]
-pub async fn list_projects(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "projects": state.list_projects() }))
+pub async fn list_projects(State(state): State<Arc<DaemonState>>) -> Json<ProjectsResponse> {
+    Json(ProjectsResponse {
+        projects: state.list_projects(),
+    })
 }
 
 /// Query parameters for `GET /projects/current`.
@@ -735,9 +755,9 @@ pub struct CurrentProjectQuery {
 pub async fn current_project(
     State(state): State<Arc<DaemonState>>,
     Query(query): Query<CurrentProjectQuery>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<ProjectInfo>, DaemonError> {
     match state.project(&query.path) {
-        Some(info) => Ok(Json(serde_json::json!(info))),
+        Some(info) => Ok(Json(info)),
         None => Err(DaemonError::SessionNotFound {
             id: query.path.display().to_string(),
         }),
@@ -761,8 +781,12 @@ pub async fn current_project(
     tag = "tmux",
     responses((status = 200, description = "All tmux sessions with origin labels"))
 )]
-pub async fn list_tmux_sessions(State(_state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "sessions": TmuxService::list_all() }))
+pub async fn list_tmux_sessions(
+    State(_state): State<Arc<DaemonState>>,
+) -> Json<TmuxSessionsResponse> {
+    Json(TmuxSessionsResponse {
+        sessions: TmuxService::list_all(),
+    })
 }
 
 /// `GET /tmux/sessions/{name}/snapshot` — capture any session's current state.
@@ -785,9 +809,9 @@ pub async fn list_tmux_sessions(State(_state): State<Arc<DaemonState>>) -> Json<
 pub async fn tmux_snapshot(
     State(_state): State<Arc<DaemonState>>,
     Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<TmuxSnapshotResponse>, DaemonError> {
     let snapshot = TmuxService::snapshot(&name, 100)?;
-    Ok(Json(serde_json::json!({ "snapshot": snapshot })))
+    Ok(Json(TmuxSnapshotResponse { snapshot }))
 }
 
 /// JSON body for `POST /tmux/adopt`.
@@ -822,9 +846,9 @@ pub struct AdoptRequest {
 pub async fn adopt_tmux_session(
     State(_state): State<Arc<DaemonState>>,
     Json(body): Json<AdoptRequest>,
-) -> Result<Json<serde_json::Value>, DaemonError> {
+) -> Result<Json<AdoptResponse>, DaemonError> {
     let adopted = TmuxService::adopt(&body.session)?;
-    Ok(Json(serde_json::json!({ "adopted": adopted })))
+    Ok(Json(AdoptResponse { adopted }))
 }
 
 // ---- bot pairing --------------------------------------------------------
@@ -843,10 +867,10 @@ pub async fn adopt_tmux_session(
     tag = "config",
     responses((status = 200, description = "A one-time pairing code and its TTL"))
 )]
-pub async fn pair_request(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!(
-        PairingService::new(&state).request_code()
-    ))
+pub async fn pair_request(
+    State(state): State<Arc<DaemonState>>,
+) -> Json<crate::services::PairCode> {
+    Json(PairingService::new(&state).request_code())
 }
 
 /// JSON body for `POST /pair/confirm`.
@@ -881,13 +905,18 @@ pub struct PairConfirmRequest {
 pub async fn pair_confirm(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<PairConfirmRequest>,
-) -> Json<serde_json::Value> {
+) -> Json<PairConfirmResponse> {
     match PairingService::new(&state).confirm(&body.code, body.chat_id) {
-        Ok(()) => Json(serde_json::json!({ "success": true, "chat_id": body.chat_id })),
-        Err(_) => Json(serde_json::json!({
-            "success": false,
-            "error": "invalid or expired code",
-        })),
+        Ok(()) => Json(PairConfirmResponse {
+            success: true,
+            chat_id: Some(body.chat_id),
+            error: None,
+        }),
+        Err(_) => Json(PairConfirmResponse {
+            success: false,
+            chat_id: None,
+            error: Some("invalid or expired code".to_string()),
+        }),
     }
 }
 
@@ -903,8 +932,10 @@ pub async fn pair_confirm(
     tag = "config",
     responses((status = 200, description = "Pairing status (paired flag and chat id)"))
 )]
-pub async fn pair_status(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!(PairingService::new(&state).status()))
+pub async fn pair_status(
+    State(state): State<Arc<DaemonState>>,
+) -> Json<crate::services::PairStatus> {
+    Json(PairingService::new(&state).status())
 }
 
 /// Parse a UUID string into a `SessionId`, mapping failure to a `400`-mapped

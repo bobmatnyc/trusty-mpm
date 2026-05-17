@@ -26,3 +26,7 @@ crossterm.workspace = true
 clap.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+
+[dev-dependencies]
+# Tests build `SessionId` values directly to exercise the typed `SessionRow`.
+uuid.workspace = true

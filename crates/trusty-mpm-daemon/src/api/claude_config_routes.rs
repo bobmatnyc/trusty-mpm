@@ -20,6 +20,11 @@ use axum::{
     http::StatusCode,
 };
 
+use crate::api::types::{
+    ApplyConfigResponse, CheckpointsResponse, ClaudeConfigResponse, CreateCheckpointResponse,
+    DeleteCheckpointResponse, DeployProfileResponse, ProfilesResponse, RestartResponse,
+    RestoreResponse,
+};
 use crate::state::DaemonState;
 
 // ---- Claude Code configuration analyzer ---------------------------------
@@ -52,15 +57,15 @@ pub struct ClaudeConfigQuery {
 pub async fn get_claude_config(
     State(_state): State<Arc<DaemonState>>,
     Query(query): Query<ClaudeConfigQuery>,
-) -> Json<serde_json::Value> {
+) -> Json<ClaudeConfigResponse> {
     use trusty_mpm_core::claude_config::ClaudeConfigReader;
     let paths = ClaudeConfigReader::paths_for_project(&query.project);
     let config = crate::claude_config::ClaudeConfigAnalyzer::read_config(&paths);
     let recommendations = crate::claude_config::ClaudeConfigAnalyzer::analyze(&config);
-    Json(serde_json::json!({
-        "config": config,
-        "recommendations": recommendations,
-    }))
+    Json(ClaudeConfigResponse {
+        config,
+        recommendations,
+    })
 }
 
 /// JSON body for `POST /claude-config/apply`.
@@ -99,7 +104,7 @@ pub struct ApplyConfigRequest {
 pub async fn apply_claude_config(
     State(_state): State<Arc<DaemonState>>,
     Json(body): Json<ApplyConfigRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<ApplyConfigResponse>, StatusCode> {
     use trusty_mpm_core::claude_config::ClaudeConfigReader;
     let paths = ClaudeConfigReader::paths_for_project(&body.project);
     let config = crate::claude_config::ClaudeConfigAnalyzer::read_config(&paths);
@@ -117,11 +122,11 @@ pub async fn apply_claude_config(
         tracing::warn!("applying recommendation {} failed: {e}", rec.id);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(serde_json::json!({
-        "applied": true,
-        "recommendation_id": body.recommendation_id,
-        "checkpoint_id": checkpoint_id,
-    })))
+    Ok(Json(ApplyConfigResponse {
+        applied: true,
+        recommendation_id: body.recommendation_id,
+        checkpoint_id,
+    }))
 }
 
 // ---- checkpoints & deployment profiles ----------------------------------
@@ -153,13 +158,13 @@ pub struct CheckpointQuery {
 pub async fn list_checkpoints(
     State(_state): State<Arc<DaemonState>>,
     Query(query): Query<CheckpointQuery>,
-) -> Json<serde_json::Value> {
+) -> Json<CheckpointsResponse> {
     let checkpoints = crate::claude_config::ConfigCheckpointer::list(&query.project)
         .unwrap_or_else(|e| {
             tracing::warn!("listing checkpoints failed: {e}");
             Vec::new()
         });
-    Json(serde_json::json!({ "checkpoints": checkpoints }))
+    Json(CheckpointsResponse { checkpoints })
 }
 
 /// JSON body for `POST /claude-config/checkpoints`.
@@ -195,7 +200,7 @@ pub struct CreateCheckpointRequest {
 pub async fn create_checkpoint(
     State(_state): State<Arc<DaemonState>>,
     Json(body): Json<CreateCheckpointRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<CreateCheckpointResponse>, StatusCode> {
     use trusty_mpm_core::claude_config::ClaudeConfigReader;
     let paths = ClaudeConfigReader::paths_for_project(&body.project);
     let id = crate::claude_config::ConfigCheckpointer::create(
@@ -207,7 +212,7 @@ pub async fn create_checkpoint(
         tracing::warn!("creating checkpoint failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(serde_json::json!({ "id": id })))
+    Ok(Json(CreateCheckpointResponse { id }))
 }
 
 /// JSON body for `POST /claude-config/restore`.
@@ -243,17 +248,17 @@ pub struct RestoreRequest {
 pub async fn restore_checkpoint(
     State(_state): State<Arc<DaemonState>>,
     Json(body): Json<RestoreRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<RestoreResponse>, StatusCode> {
     crate::claude_config::ConfigCheckpointer::restore(&body.project, &body.checkpoint_id).map_err(
         |e| {
             tracing::warn!("restoring checkpoint {} failed: {e}", body.checkpoint_id);
             StatusCode::INTERNAL_SERVER_ERROR
         },
     )?;
-    Ok(Json(serde_json::json!({
-        "restored": true,
-        "checkpoint_id": body.checkpoint_id,
-    })))
+    Ok(Json(RestoreResponse {
+        restored: true,
+        checkpoint_id: body.checkpoint_id,
+    }))
 }
 
 /// `DELETE /claude-config/checkpoints/{id}?project=<path>` — delete a checkpoint.
@@ -278,12 +283,12 @@ pub async fn delete_checkpoint(
     State(_state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     Query(query): Query<CheckpointQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<DeleteCheckpointResponse>, StatusCode> {
     crate::claude_config::ConfigCheckpointer::delete(&query.project, &id).map_err(|e| {
         tracing::warn!("deleting checkpoint {id} failed: {e}");
         StatusCode::NOT_FOUND
     })?;
-    Ok(Json(serde_json::json!({ "deleted": id })))
+    Ok(Json(DeleteCheckpointResponse { deleted: id }))
 }
 
 /// `GET /claude-config/profiles` — list the built-in deployment profiles.
@@ -297,9 +302,9 @@ pub async fn delete_checkpoint(
     tag = "claude-config",
     responses((status = 200, description = "Built-in deployment profiles"))
 )]
-pub async fn list_profiles(State(_state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+pub async fn list_profiles(State(_state): State<Arc<DaemonState>>) -> Json<ProfilesResponse> {
     let profiles = crate::claude_config::ProfileDeployer::builtin_profiles();
-    Json(serde_json::json!({ "profiles": profiles }))
+    Json(ProfilesResponse { profiles })
 }
 
 /// JSON body for `POST /claude-config/deploy`.
@@ -343,7 +348,7 @@ pub struct DeployProfileRequest {
 pub async fn deploy_profile(
     State(_state): State<Arc<DaemonState>>,
     Json(body): Json<DeployProfileRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<DeployProfileResponse>, StatusCode> {
     use trusty_mpm_core::claude_config::ClaudeConfigReader;
     let mut profile = crate::claude_config::ProfileDeployer::builtin_profiles()
         .into_iter()
@@ -360,10 +365,10 @@ pub async fn deploy_profile(
                 StatusCode::INTERNAL_SERVER_ERROR
             },
         )?;
-    Ok(Json(serde_json::json!({
-        "deployed": body.profile_name,
-        "checkpoint_id": checkpoint_id,
-    })))
+    Ok(Json(DeployProfileResponse {
+        deployed: body.profile_name,
+        checkpoint_id,
+    }))
 }
 
 /// JSON body for `POST /claude-config/restart`.
@@ -397,12 +402,14 @@ pub struct RestartRequest {
 pub async fn restart_claude_code(
     State(_state): State<Arc<DaemonState>>,
     Json(body): Json<RestartRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<RestartResponse>, StatusCode> {
     crate::claude_config::ClaudeCodeRestarter::restart_in_session(&body.tmux_session).map_err(
         |e| {
             tracing::warn!("restart in {} failed: {e}", body.tmux_session);
             StatusCode::INTERNAL_SERVER_ERROR
         },
     )?;
-    Ok(Json(serde_json::json!({ "restarted": body.tmux_session })))
+    Ok(Json(RestartResponse {
+        restarted: body.tmux_session,
+    }))
 }

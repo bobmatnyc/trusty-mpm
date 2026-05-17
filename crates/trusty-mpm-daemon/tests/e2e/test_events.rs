@@ -86,7 +86,11 @@ async fn hook_rejects_invalid_session() {
     assert_eq!(resp.status(), 400);
 }
 
-/// `POST /hooks` with an unknown event name is rejected with `400`.
+/// `POST /hooks` with an unknown event name is rejected with `422`.
+///
+/// Why: `HookPost.event` is a typed `HookEvent`, so an unrecognized event name
+/// fails JSON deserialization in axum's `Json` extractor before the handler
+/// runs — the contract is enforced by the type system, surfacing as a `422`.
 #[tokio::test]
 async fn hook_rejects_unknown_event_type() {
     let daemon = TestDaemon::spawn().await;
@@ -101,5 +105,5 @@ async fn hook_rejects_unknown_event_type() {
         .send()
         .await
         .expect("hook post");
-    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.status(), 422);
 }

@@ -292,9 +292,9 @@ mod tests {
         DashboardState {
             iterm2_mode,
             sessions: vec![SessionRow {
-                id: serde_json::json!("abcd1234-5678-90ab-cdef-1234567890ab"),
+                id: trusty_mpm_core::session::SessionId(uuid::Uuid::nil()),
                 workdir: "/tmp/proj".into(),
-                status: serde_json::json!("active"),
+                status: trusty_mpm_core::session::SessionStatus::Active,
                 active_delegations: 0,
                 tmux_name: "tmpm-quiet-falcon".into(),
                 last_seen: Default::default(),

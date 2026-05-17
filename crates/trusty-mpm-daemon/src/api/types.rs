@@ -1,0 +1,268 @@
+//! Typed HTTP API response bodies.
+//!
+//! Why: handlers previously returned `Json<serde_json::Value>` built by
+//! `json!` macros, so the response shape was only checked at runtime by a
+//! large suite of string-indexing contract tests. Naming each response as a
+//! `#[derive(Serialize, Deserialize)]` struct moves that contract to the type
+//! system — a misnamed or missing field is now a compile error.
+//! What: one struct per HTTP endpoint that returns a JSON object, mirroring the
+//! exact field names the `json!` macros produced so the wire format is
+//! unchanged.
+//! Test: `cargo test -p trusty-mpm-daemon` drives the handlers and reads typed
+//! fields directly; `cargo check` proves the structs match the handler bodies.
+
+use serde::{Deserialize, Serialize};
+
+use trusty_mpm_core::circuit::CircuitBreaker;
+use trusty_mpm_core::claude_config::{ClaudeConfig, ConfigRecommendation, DeploymentProfile};
+use trusty_mpm_core::external_session::ExternalSession;
+use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
+use trusty_mpm_core::session::Session;
+
+use crate::optimizer::OptimizerConfig;
+use crate::tmux::{AdoptedSession, SessionSnapshot};
+
+/// Response of `GET /sessions`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionsResponse {
+    /// Snapshot of managed sessions.
+    pub sessions: Vec<Session>,
+}
+
+/// Response of `GET /events` and `GET /sessions/{id}/events`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventsResponse {
+    /// Recent hook events.
+    pub events: Vec<HookEventRecord>,
+}
+
+/// Response of `POST /sessions`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterSessionResponse {
+    /// The new session's id.
+    pub id: trusty_mpm_core::session::SessionId,
+    /// The session's friendly tmux name.
+    pub name: String,
+}
+
+/// Response of `DELETE /sessions/{id}`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RemoveSessionResponse {
+    /// The id of the removed session.
+    pub removed: String,
+}
+
+/// Response of `DELETE /sessions/dead`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReapResponse {
+    /// Number of dead sessions reaped.
+    pub removed: usize,
+}
+
+/// Response of `POST /sessions/{id}/pause`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PauseResponse {
+    /// Always `true` — the session is now paused.
+    pub paused: bool,
+    /// The resolved session id.
+    pub session_id: String,
+    /// The pause summary (operator note or auto-derived).
+    pub summary: String,
+}
+
+/// Response of `POST /sessions/{id}/resume`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResumeResponse {
+    /// Always `true` — the session is now active.
+    pub resumed: bool,
+}
+
+/// Response of `POST /sessions/{id}/command`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommandResponse {
+    /// Always `true` — the command was sent.
+    pub sent: bool,
+    /// Captured pane output (possibly compressed).
+    pub output: String,
+    /// Output size in bytes before compression.
+    pub original_bytes: usize,
+    /// Output size in bytes after compression.
+    pub compressed_bytes: usize,
+    /// Applied compression level label, or `null` when uncompressed.
+    pub compress_level: Option<String>,
+}
+
+/// Response of `GET /sessions/{id}/output`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OutputResponse {
+    /// Captured pane output (possibly compressed).
+    pub output: String,
+    /// Number of trailing pane lines captured.
+    pub lines: u32,
+    /// Output size in bytes before compression.
+    pub original_bytes: usize,
+    /// Output size in bytes after compression.
+    pub compressed_bytes: usize,
+    /// Applied compression level label, or `null` when uncompressed.
+    pub compress_level: Option<String>,
+}
+
+/// Response of `GET /projects`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectsResponse {
+    /// Registered projects.
+    pub projects: Vec<trusty_mpm_core::project::ProjectInfo>,
+}
+
+/// One agent's circuit-breaker row in [`BreakersResponse`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BreakerEntry {
+    /// Agent name the breaker guards.
+    pub agent: String,
+    /// The breaker's current state.
+    pub breaker: CircuitBreaker,
+}
+
+/// Response of `GET /breakers`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BreakersResponse {
+    /// Per-agent circuit-breaker states.
+    pub breakers: Vec<BreakerEntry>,
+}
+
+/// Response of `POST /hooks`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HookAcceptedResponse {
+    /// The hook event that was accepted.
+    pub accepted: HookEvent,
+}
+
+/// The overseer status block in [`OverseerResponse`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OverseerStatus {
+    /// Whether the overseer is enabled.
+    pub enabled: bool,
+    /// The active overseer strategy name.
+    pub handler: String,
+}
+
+/// Response of `GET /overseer`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OverseerResponse {
+    /// The overseer configuration and status.
+    pub overseer: OverseerStatus,
+}
+
+/// Response of `GET /optimizer`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OptimizerResponse {
+    /// The current token-use optimizer configuration.
+    pub optimizer: OptimizerConfig,
+}
+
+/// Response of `GET /tmux/sessions`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TmuxSessionsResponse {
+    /// All tmux sessions on the host with origin labels.
+    pub sessions: Vec<ExternalSession>,
+}
+
+/// Response of `GET /tmux/sessions/{name}/snapshot`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TmuxSnapshotResponse {
+    /// The captured session snapshot.
+    pub snapshot: SessionSnapshot,
+}
+
+/// Response of `POST /tmux/adopt`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdoptResponse {
+    /// The adopted session's captured state.
+    pub adopted: AdoptedSession,
+}
+
+/// Response of `GET /claude-config`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaudeConfigResponse {
+    /// The merged Claude Code configuration.
+    pub config: ClaudeConfig,
+    /// Recommended configuration changes.
+    pub recommendations: Vec<ConfigRecommendation>,
+}
+
+/// Response of `POST /claude-config/apply`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApplyConfigResponse {
+    /// Always `true` — the recommendation was applied.
+    pub applied: bool,
+    /// The id of the applied recommendation.
+    pub recommendation_id: String,
+    /// Checkpoint id created before applying, for undo.
+    pub checkpoint_id: String,
+}
+
+/// Response of `GET /claude-config/checkpoints`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckpointsResponse {
+    /// Config checkpoints, newest first.
+    pub checkpoints: Vec<trusty_mpm_core::claude_config::ConfigCheckpoint>,
+}
+
+/// Response of `POST /claude-config/checkpoints`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateCheckpointResponse {
+    /// The new checkpoint's id.
+    pub id: String,
+}
+
+/// Response of `POST /claude-config/restore`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RestoreResponse {
+    /// Always `true` — the config was restored.
+    pub restored: bool,
+    /// The id of the restored checkpoint.
+    pub checkpoint_id: String,
+}
+
+/// Response of `DELETE /claude-config/checkpoints/{id}`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeleteCheckpointResponse {
+    /// The id of the deleted checkpoint.
+    pub deleted: String,
+}
+
+/// Response of `GET /claude-config/profiles`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfilesResponse {
+    /// The built-in deployment profiles.
+    pub profiles: Vec<DeploymentProfile>,
+}
+
+/// Response of `POST /claude-config/deploy`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeployProfileResponse {
+    /// The name of the deployed profile.
+    pub deployed: String,
+    /// Checkpoint id created before deploying, for undo.
+    pub checkpoint_id: String,
+}
+
+/// Response of `POST /claude-config/restart`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RestartResponse {
+    /// The tmux session Claude Code was restarted in.
+    pub restarted: String,
+}
+
+/// Response of `POST /pair/confirm`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairConfirmResponse {
+    /// Whether the code was valid and the chat is now paired.
+    pub success: bool,
+    /// The registered chat id, when `success` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<i64>,
+    /// Failure reason, when `success` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}

@@ -126,7 +126,7 @@ impl DashboardState {
     /// selection untouched and returns `false` when no session matches.
     /// Test: `focus_on_selects_matching_session`, `focus_on_missing_is_noop`.
     pub fn focus_on(&mut self, id: &str) -> bool {
-        if let Some(idx) = self.sessions.iter().position(|s| s.id.as_str() == Some(id)) {
+        if let Some(idx) = self.sessions.iter().position(|s| s.id.0.to_string() == id) {
             self.selected_session = idx;
             true
         } else {
@@ -147,13 +147,11 @@ impl DashboardState {
     fn session_summaries(&self) -> Vec<trusty_mpm_core::SessionSummary> {
         self.sessions
             .iter()
-            .filter_map(|s| {
-                Some(trusty_mpm_core::SessionSummary {
-                    id: s.id.as_str()?.to_string(),
-                    name: Some(s.tmux_name.clone()).filter(|n| !n.is_empty()),
-                    workdir: s.workdir.clone(),
-                    last_active: s.last_seen.secs_since_epoch,
-                })
+            .map(|s| trusty_mpm_core::SessionSummary {
+                id: s.id.0.to_string(),
+                name: Some(s.tmux_name.clone()).filter(|n| !n.is_empty()),
+                workdir: s.workdir.clone(),
+                last_active: s.last_seen.secs_since_epoch,
             })
             .collect()
     }
@@ -242,6 +240,24 @@ fn session_status_color(status: &str) -> Color {
     }
 }
 
+/// Render a [`SessionStatus`] as a lowercase display label.
+///
+/// Why: the session table shows a short status word and colours it via
+/// [`session_status_color`], which keys on lowercase names.
+/// What: maps each status variant to its lowercase name.
+/// Test: `session_rows_format_each_session`.
+fn status_label(status: trusty_mpm_core::session::SessionStatus) -> &'static str {
+    use trusty_mpm_core::session::SessionStatus;
+    match status {
+        SessionStatus::Starting => "starting",
+        SessionStatus::Active => "active",
+        SessionStatus::AwaitingApproval => "awaiting_approval",
+        SessionStatus::Detached => "detached",
+        SessionStatus::Paused => "paused",
+        SessionStatus::Stopped => "stopped",
+    }
+}
+
 /// Pick the display colour for a circuit-breaker state string.
 ///
 /// Why: an at-a-glance colour for breaker state surfaces open breakers
@@ -316,12 +332,9 @@ pub fn session_rows(state: &DashboardState, selected: usize) -> Vec<Row<'static>
         .iter()
         .enumerate()
         .map(|(idx, s)| {
-            let id =
-                s.id.as_str()
-                    .map(|v| v.chars().take(8).collect::<String>())
-                    .unwrap_or_else(|| "????????".to_string());
-            let status = s.status.as_str().unwrap_or("unknown").to_string();
-            let status_color = session_status_color(&status);
+            let id = s.id.0.to_string().chars().take(8).collect::<String>();
+            let status = status_label(s.status);
+            let status_color = session_status_color(status);
             Row::new(vec![
                 Cell::from(id),
                 Cell::from(s.workdir.clone()),
@@ -354,18 +367,14 @@ pub fn breaker_rows(state: &DashboardState) -> Vec<Row<'static>> {
         .collect()
 }
 
-/// Render a `SessionId` newtype JSON value into a short, human id.
+/// Render a [`SessionId`] into a short, human id.
 ///
-/// Why: the daemon serializes `SessionId` as `{"0": "<uuid>"}`; the dashboard
-/// shows only the first 8 characters so rows and event lines stay compact.
-/// What: extracts the inner UUID string and truncates it to 8 chars, falling
-/// back to a placeholder when the shape is unexpected.
-/// Test: `short_session_extracts_prefix`, `short_session_handles_missing_key`.
-pub(crate) fn short_session(val: &serde_json::Value) -> String {
-    val.get("0")
-        .and_then(|v| v.as_str())
-        .map(|s| s.chars().take(8).collect::<String>())
-        .unwrap_or_else(|| "????????".to_string())
+/// Why: the dashboard shows only the first 8 characters of a session UUID so
+/// rows and event lines stay compact.
+/// What: truncates the UUID string to its first 8 characters.
+/// Test: `short_session_extracts_prefix`.
+pub(crate) fn short_session(id: &trusty_mpm_core::session::SessionId) -> String {
+    id.0.to_string().chars().take(8).collect()
 }
 
 /// Build the formatted lines for the recent-events panel.
@@ -380,7 +389,7 @@ pub fn event_lines(state: &DashboardState) -> Vec<String> {
         .iter()
         .map(|e| {
             let session = short_session(&e.session);
-            format!("{:<22} {:<10} {}", e.event, session, e.at)
+            format!("{:<22} {:<10} {}", e.event.wire_name(), session, e.at)
         })
         .collect()
 }
@@ -624,12 +633,33 @@ pub fn connect_prompt_line(buffer: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A deterministic test [`SessionId`] derived from a short label.
+    ///
+    /// Why: `SessionId` is a real UUID newtype, so tests need a stable UUID per
+    /// label to assert against in `focus_on` / `submit_connect`.
+    /// What: copies the label's bytes into a fixed 16-byte UUID buffer.
+    /// Test: used by the dashboard test suite.
+    fn sid(label: &str) -> trusty_mpm_core::session::SessionId {
+        let mut bytes = [0u8; 16];
+        for (slot, b) in bytes.iter_mut().zip(label.bytes()) {
+            *slot = b;
+        }
+        trusty_mpm_core::session::SessionId(uuid::Uuid::from_bytes(bytes))
+    }
+
     /// Build a `SessionRow` for tests.
     fn session(id: &str, workdir: &str, status: &str, name: &str) -> SessionRow {
+        use trusty_mpm_core::session::SessionStatus;
+        let status = match status {
+            "active" => SessionStatus::Active,
+            "paused" => SessionStatus::Paused,
+            "stopped" => SessionStatus::Stopped,
+            other => panic!("unhandled test status: {other}"),
+        };
         SessionRow {
-            id: serde_json::json!(id),
+            id: sid(id),
             workdir: workdir.into(),
-            status: serde_json::json!(status),
+            status,
             active_delegations: 0,
             tmux_name: name.into(),
             last_seen: Default::default(),
@@ -644,16 +674,11 @@ mod tests {
 
     #[test]
     fn session_rows_format_each_session() {
+        let mut row = session("abcd1234", "/tmp/proj", "active", "tmpm-quiet-falcon");
+        row.active_delegations = 2;
         let state = DashboardState {
             daemon_reachable: true,
-            sessions: vec![SessionRow {
-                id: serde_json::json!("abcd1234-5678-90ab-cdef-1234567890ab"),
-                workdir: "/tmp/proj".into(),
-                status: serde_json::json!("active"),
-                active_delegations: 2,
-                tmux_name: "tmpm-quiet-falcon".into(),
-                last_seen: Default::default(),
-            }],
+            sessions: vec![row],
             ..DashboardState::default()
         };
         let rows = session_rows(&state, 0);
@@ -807,10 +832,10 @@ mod tests {
     }
 
     /// Build an `EventRow` for tests with a null payload.
-    fn event(name: &str, at: &str) -> EventRow {
+    fn event(event: trusty_mpm_core::hook::HookEvent, at: &str) -> EventRow {
         EventRow {
-            session: serde_json::json!({"0": "abcd1234-5678-90ab-cdef-1234567890ab"}),
-            event: name.into(),
+            session: sid("evt"),
+            event,
             at: at.into(),
             payload: serde_json::Value::Null,
         }
@@ -819,19 +844,28 @@ mod tests {
     #[test]
     fn event_lines_format_recent_events() {
         let state = DashboardState {
-            events: vec![event("PreToolUse", "2024-01-01T00:00:00Z")],
+            events: vec![event(
+                trusty_mpm_core::hook::HookEvent::PreToolUse,
+                "2024-01-01T00:00:00Z",
+            )],
             ..DashboardState::default()
         };
         let lines = event_lines(&state);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("PreToolUse"));
-        assert!(lines[0].contains("abcd1234"));
+        assert!(lines[0].contains(&short_session(&sid("evt"))));
     }
 
     #[test]
     fn event_lines_cap_at_twenty() {
         let state = DashboardState {
-            events: vec![event("Stop", "2024-01-01T00:00:00Z"); 50],
+            events: vec![
+                event(
+                    trusty_mpm_core::hook::HookEvent::Stop,
+                    "2024-01-01T00:00:00Z"
+                );
+                50
+            ],
             ..DashboardState::default()
         };
         assert_eq!(event_lines(&state).len(), 20);
@@ -839,15 +873,10 @@ mod tests {
 
     #[test]
     fn short_session_extracts_prefix() {
-        let val = serde_json::json!({"0": "abcd1234-5678-90ab-cdef-1234567890ab"});
-        assert_eq!(short_session(&val), "abcd1234");
-    }
-
-    #[test]
-    fn short_session_handles_missing_key() {
-        // Missing `0` key or a null value → the placeholder.
-        assert_eq!(short_session(&serde_json::json!({})), "????????");
-        assert_eq!(short_session(&serde_json::Value::Null), "????????");
+        let id = trusty_mpm_core::session::SessionId(
+            uuid::Uuid::parse_str("abcd1234-5678-90ab-cdef-1234567890ab").unwrap(),
+        );
+        assert_eq!(short_session(&id), "abcd1234");
     }
 
     #[test]
@@ -883,18 +912,19 @@ mod tests {
     fn event_lines_newest_at_bottom() {
         // Events are stored oldest-first; the formatted lines preserve that
         // order so the newest event renders last.
+        use trusty_mpm_core::hook::HookEvent;
         let state = DashboardState {
             events: vec![
-                event("oldest", "2024-01-01T00:00:00Z"),
-                event("middle", "2024-01-01T00:00:01Z"),
-                event("newest", "2024-01-01T00:00:02Z"),
+                event(HookEvent::SessionStart, "2024-01-01T00:00:00Z"),
+                event(HookEvent::PreToolUse, "2024-01-01T00:00:01Z"),
+                event(HookEvent::SessionEnd, "2024-01-01T00:00:02Z"),
             ],
             ..DashboardState::default()
         };
         let lines = event_lines(&state);
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].contains("oldest"));
-        assert!(lines[2].contains("newest"));
+        assert!(lines[0].contains("SessionStart"));
+        assert!(lines[2].contains("SessionEnd"));
     }
 
     #[test]
@@ -929,7 +959,7 @@ mod tests {
             ],
             ..DashboardState::default()
         };
-        assert!(state.focus_on("bbb"));
+        assert!(state.focus_on(&sid("bbb").0.to_string()));
         assert_eq!(state.selected_session, 1);
     }
 
@@ -985,7 +1015,10 @@ mod tests {
         state.submit_connect();
         assert!(state.connect_prompt.is_none());
         assert_eq!(state.selected_session, 0);
-        assert_eq!(state.last_action.as_deref(), Some("Connected to aaa"));
+        assert_eq!(
+            state.last_action.as_deref(),
+            Some(format!("Connected to {}", sid("aaa").0).as_str())
+        );
     }
 
     #[test]

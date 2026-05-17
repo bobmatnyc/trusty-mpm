@@ -14,6 +14,8 @@
 
 use serde::Deserialize;
 
+use trusty_mpm_core::session::{SessionId, SessionStatus};
+
 /// HTTP client for one trusty-mpm daemon.
 ///
 /// Why: a thin wrapper so any UI can be pointed at any daemon address.
@@ -36,11 +38,11 @@ pub struct DaemonClient {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionRow {
     /// Session id (UUID), serialized by the daemon as a bare string.
-    pub id: serde_json::Value,
+    pub id: SessionId,
     /// Working directory.
     pub workdir: String,
-    /// Lifecycle status string.
-    pub status: serde_json::Value,
+    /// Lifecycle status.
+    pub status: SessionStatus,
     /// Number of active delegations.
     #[serde(default)]
     pub active_delegations: u32,
@@ -82,10 +84,10 @@ pub struct LastSeen {
 /// Test: `events_deserialize_from_record_shape`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EventRow {
-    /// Originating session (`SessionId` newtype JSON: `{"0": "<uuid>"}`).
-    pub session: serde_json::Value,
-    /// Claude Code wire event name (e.g. `PreToolUse`).
-    pub event: String,
+    /// Originating session id (UUID, serialized by the daemon as a bare string).
+    pub session: SessionId,
+    /// Claude Code hook event (e.g. `PreToolUse`).
+    pub event: trusty_mpm_core::hook::HookEvent,
     /// RFC3339 timestamp the daemon received the event.
     pub at: String,
     /// Opaque event payload; defaults to `Null` when the daemon omits it.
@@ -669,7 +671,7 @@ mod tests {
         let json = serde_json::json!({
             "id": "abcd1234-5678-90ab-cdef-1234567890ab",
             "workdir": "/tmp/proj",
-            "status": "active",
+            "status": "Active",
             "active_delegations": 1,
             "tmux_name": "tmpm-quiet-falcon"
         });
@@ -682,7 +684,7 @@ mod tests {
         let json = serde_json::json!({
             "id": "abcd1234-5678-90ab-cdef-1234567890ab",
             "workdir": "/tmp/proj",
-            "status": "active"
+            "status": "Active"
         });
         let row: SessionRow = serde_json::from_value(json).unwrap();
         assert_eq!(row.tmux_name, "");
@@ -692,20 +694,20 @@ mod tests {
     #[test]
     fn events_deserialize_from_record_shape() {
         let json = serde_json::json!({
-            "session": {"0": "abcd1234-5678-90ab-cdef-1234567890ab"},
+            "session": "abcd1234-5678-90ab-cdef-1234567890ab",
             "event": "PreToolUse",
             "at": "2024-01-01T00:00:00Z",
             "payload": {}
         });
         let row: EventRow = serde_json::from_value(json).unwrap();
-        assert_eq!(row.event, "PreToolUse");
+        assert_eq!(row.event, trusty_mpm_core::hook::HookEvent::PreToolUse);
         assert_eq!(row.at, "2024-01-01T00:00:00Z");
     }
 
     #[test]
     fn events_default_payload_when_absent() {
         let json = serde_json::json!({
-            "session": {"0": "abcd1234-5678-90ab-cdef-1234567890ab"},
+            "session": "abcd1234-5678-90ab-cdef-1234567890ab",
             "event": "Stop",
             "at": "2024-01-01T00:00:00Z"
         });
