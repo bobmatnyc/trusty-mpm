@@ -114,6 +114,32 @@ pub struct ProjectsResponse {
     pub projects: Vec<trusty_mpm_core::project::ProjectInfo>,
 }
 
+/// One discovered Claude Code project in [`DiscoverProjectsResponse`].
+///
+/// Why: `GET /projects/discover` reports projects mined from
+/// `~/.claude/projects/`; each row needs the decoded path, how many sessions
+/// were recorded, and when the project was last used.
+/// What: the absolute project path, the `.jsonl` transcript count, and the
+/// most-recent session time as an ISO-8601 string (`None` when the project has
+/// no transcripts).
+/// Test: `cargo test -p trusty-mpm-daemon` drives `discover_projects`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiscoveredProjectInfo {
+    /// Absolute path to the project's working directory.
+    pub path: String,
+    /// Number of `.jsonl` session transcripts recorded for the project.
+    pub session_count: usize,
+    /// ISO-8601 timestamp of the most recent session, or `null` when none.
+    pub last_session: Option<String>,
+}
+
+/// Response of `GET /projects/discover`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiscoverProjectsResponse {
+    /// Projects discovered under `~/.claude/projects/`, newest-session first.
+    pub projects: Vec<DiscoveredProjectInfo>,
+}
+
 /// One agent's circuit-breaker row in [`BreakersResponse`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BreakerEntry {

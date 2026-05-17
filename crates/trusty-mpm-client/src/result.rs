@@ -43,13 +43,33 @@ pub struct DecisionCounts {
 
 /// One tmux session summary for command results.
 ///
-/// Why: the `/tmux` result lists tmux session names.
-/// What: just the session name.
+/// Why: the `/tmux` result lists tmux session names; the `/tmux` keyboard also
+/// offers an "Adopt" button for sessions trusty-mpm does not yet manage.
+/// What: the session name and whether trusty-mpm already manages it (internal
+/// `tmpm-*` / `trusty-mpm-*` sessions) versus an external one.
 /// Test: covered by the executor's tmux test.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxSessionSummary {
     /// tmux session name.
     pub name: String,
+    /// True when trusty-mpm created/manages the session; false when external.
+    pub managed: bool,
+}
+
+/// One discovered Claude Code project for command results.
+///
+/// Why: the `/projects` result lists projects mined from `~/.claude/projects/`
+/// so the operator can register one with a tap.
+/// What: the project path, its recorded session count, and the last-used date.
+/// Test: covered by the executor's projects test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredProjectSummary {
+    /// Absolute project path.
+    pub path: String,
+    /// Number of recorded Claude Code sessions for the project.
+    pub session_count: usize,
+    /// ISO-8601 last-session timestamp, or `None` when the project has none.
+    pub last_session: Option<String>,
 }
 
 /// One Claude Code config recommendation summary.
@@ -95,6 +115,18 @@ pub enum CommandResult {
     },
     /// `/tmux` — every tmux session on the daemon host.
     TmuxSessions(Vec<TmuxSessionSummary>),
+    /// `/projects` — projects discovered from the Claude Code configuration.
+    DiscoveredProjects(Vec<DiscoveredProjectSummary>),
+    /// `/adopt` — an external tmux session was adopted for oversight.
+    Adopted {
+        /// The tmux session name that was adopted.
+        session: String,
+    },
+    /// A discovered project was registered with the daemon ("Set Active").
+    ProjectRegistered {
+        /// The absolute path of the registered project.
+        path: String,
+    },
     /// `/config` — Claude Code config analyzer recommendations.
     ConfigAnalysis {
         /// Project directory analyzed.

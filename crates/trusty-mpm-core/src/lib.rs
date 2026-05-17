@@ -35,6 +35,7 @@ pub mod overseer;
 pub mod overseer_config;
 pub mod paths;
 pub mod project;
+pub mod project_discovery;
 pub mod session;
 pub mod session_store;
 pub mod tmux;

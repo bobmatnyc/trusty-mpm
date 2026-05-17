@@ -68,6 +68,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/sessions/{id}/output", get(get_output))
         .route("/projects", get(list_projects).post(register_project))
         .route("/projects/current", get(current_project))
+        .route("/projects/discover", get(discover_projects))
         .route("/events", get(recent_events))
         .route("/hooks", post(ingest_hook))
         .route("/breakers", get(breakers))
@@ -762,6 +763,48 @@ pub async fn current_project(
             id: query.path.display().to_string(),
         }),
     }
+}
+
+/// `GET /projects/discover` — projects mined from `~/.claude/projects/`.
+///
+/// Why: rather than register every repo by hand, the operator wants trusty-mpm
+/// to enumerate the projects Claude Code already knows about and offer them for
+/// one-tap registration (the Telegram `/projects` command consumes this).
+/// What: runs [`ProjectDiscovery::discover`], maps each row to a
+/// [`DiscoveredProjectInfo`] (path as a string, last-session time as an
+/// ISO-8601 string), and returns them newest-session-first. The discovery
+/// itself never fails — an absent directory yields an empty list.
+/// Test: `discover_projects_returns_array`.
+#[utoipa::path(
+    get,
+    path = "/projects/discover",
+    tag = "projects",
+    responses((status = 200, description = "Projects discovered from Claude Code config"))
+)]
+pub async fn discover_projects(
+    State(_state): State<Arc<DaemonState>>,
+) -> Json<DiscoverProjectsResponse> {
+    let projects = trusty_mpm_core::project_discovery::ProjectDiscovery::discover()
+        .into_iter()
+        .map(|p| DiscoveredProjectInfo {
+            path: p.path.display().to_string(),
+            session_count: p.session_count,
+            last_session: p.last_session.map(system_time_to_iso8601),
+        })
+        .collect();
+    Json(DiscoverProjectsResponse { projects })
+}
+
+/// Render a `SystemTime` as an ISO-8601 / RFC3339 UTC string.
+///
+/// Why: the discovery endpoint reports session times as human- and
+/// machine-readable strings; `SystemTime` has no wire-stable serde form.
+/// What: converts via `chrono::DateTime<Utc>`, falling back to the Unix epoch
+/// for the (unreachable in practice) pre-1970 case.
+/// Test: covered by `discover_projects_returns_array`.
+fn system_time_to_iso8601(time: std::time::SystemTime) -> String {
+    let datetime: chrono::DateTime<chrono::Utc> = time.into();
+    datetime.to_rfc3339()
 }
 
 // ---- universal tmux session management ---------------------------------

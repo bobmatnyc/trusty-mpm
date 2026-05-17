@@ -50,6 +50,18 @@ async fn current_project_found_and_missing() {
 }
 
 #[tokio::test]
+async fn discover_projects_returns_array() {
+    // `GET /projects/discover` always answers with a (possibly empty) array;
+    // it must never error even when `~/.claude/projects/` is absent.
+    let state = DaemonState::shared();
+    let resp = discover_projects(State(state)).await;
+    // The discovered list is well-formed; on CI it is typically empty.
+    for project in &resp.0.projects {
+        assert!(!project.path.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn register_session_associates_project() {
     // A `POST /sessions` body carrying `project_path` must associate the
     // new session with that project.

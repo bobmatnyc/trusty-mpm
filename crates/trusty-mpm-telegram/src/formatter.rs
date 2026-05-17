@@ -9,7 +9,7 @@
 //! Test: `cargo test -p trusty-mpm-telegram` covers each variant's rendering.
 
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
-use trusty_mpm_client::CommandResult;
+use trusty_mpm_client::{CommandResult, DiscoveredProjectSummary};
 
 /// How many characters of a session id to show in chat output.
 ///
@@ -85,10 +85,24 @@ impl TelegramFormatter {
                 }
                 let lines = sessions
                     .iter()
-                    .map(|s| format!("• <code>{}</code>", s.name))
+                    .map(|s| {
+                        let tag = if s.managed {
+                            "🟢 managed"
+                        } else {
+                            "⚪ external"
+                        };
+                        format!("• <code>{}</code> — {tag}", s.name)
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!("<b>tmux sessions</b>\n{lines}")
+            }
+            CommandResult::DiscoveredProjects(projects) => format_discovered_projects(projects),
+            CommandResult::Adopted { session } => {
+                format!("✅ Adopted tmux session <code>{session}</code> for oversight")
+            }
+            CommandResult::ProjectRegistered { path } => {
+                format!("✅ Registered project <code>{path}</code>")
             }
             CommandResult::ConfigAnalysis {
                 project,
@@ -161,11 +175,15 @@ impl TelegramFormatter {
 
     /// Build the inline keyboard for a [`CommandResult`], if it warrants one.
     ///
-    /// Why: the `/sessions` list decorates each session with `[Status]
-    /// [Approve] [Deny]` action buttons; other results have no keyboard.
-    /// What: returns one button row per session for [`CommandResult::Sessions`],
-    /// `None` for every other variant.
-    /// Test: `keyboard_for_sessions_has_rows`, `keyboard_for_help_is_none`.
+    /// Why: several lists decorate their rows with action buttons — `/sessions`
+    /// gets `[Status] [Approve] [Deny]`, `/projects` gets a `[Set Active]`
+    /// button per project, and `/tmux` gets an `[Adopt]` button for each
+    /// unmanaged session.
+    /// What: returns one button row per item for the list variants above,
+    /// `None` for every other variant. Callback data is `verb:arg` so the
+    /// callback handler can route the tap.
+    /// Test: `keyboard_for_sessions_has_rows`, `keyboard_for_projects_has_rows`,
+    /// `keyboard_for_tmux_adopts_external`, `keyboard_for_help_is_none`.
     pub fn keyboard_for(result: &CommandResult) -> Option<InlineKeyboardMarkup> {
         match result {
             CommandResult::Sessions(sessions) if !sessions.is_empty() => {
@@ -184,9 +202,94 @@ impl TelegramFormatter {
                     .collect();
                 Some(InlineKeyboardMarkup::new(rows))
             }
+            CommandResult::DiscoveredProjects(projects) if !projects.is_empty() => {
+                let rows: Vec<Vec<InlineKeyboardButton>> = projects
+                    .iter()
+                    .filter(|p| callback_fits(&p.path))
+                    .map(|p| {
+                        vec![InlineKeyboardButton::callback(
+                            format!("📁 Set Active — {}", project_basename(&p.path)),
+                            format!("setproj:{}", p.path),
+                        )]
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    None
+                } else {
+                    Some(InlineKeyboardMarkup::new(rows))
+                }
+            }
+            CommandResult::TmuxSessions(sessions) => {
+                let rows: Vec<Vec<InlineKeyboardButton>> = sessions
+                    .iter()
+                    .filter(|s| !s.managed && callback_fits(&s.name))
+                    .map(|s| {
+                        vec![InlineKeyboardButton::callback(
+                            format!("➕ Adopt — {}", s.name),
+                            format!("adopt:{}", s.name),
+                        )]
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    None
+                } else {
+                    Some(InlineKeyboardMarkup::new(rows))
+                }
+            }
             _ => None,
         }
     }
+}
+
+/// Render a discovered-project list as a Telegram HTML message body.
+///
+/// Why: the `/projects` command lists projects mined from `~/.claude/projects/`;
+/// keeping the rendering as a free function lets it be unit-tested and reused.
+/// What: returns a placeholder line when the list is empty, otherwise one line
+/// per project showing the path, recorded session count, and last-used date.
+/// Test: `format_discovered_projects_lists_each`, `format_discovered_projects_empty`.
+pub fn format_discovered_projects(projects: &[DiscoveredProjectSummary]) -> String {
+    if projects.is_empty() {
+        return "No projects discovered in Claude Code config.".to_string();
+    }
+    let mut text = String::from("<b>Discovered projects</b>\n");
+    for p in projects {
+        let last = p
+            .last_session
+            .as_deref()
+            .map(|s| s.split('T').next().unwrap_or(s).to_string())
+            .unwrap_or_else(|| "never".to_string());
+        text.push_str(&format!(
+            "\n📁 <code>{}</code>\n  {} session(s) · last used {last}\n",
+            p.path, p.session_count,
+        ));
+    }
+    text
+}
+
+/// True when a string fits within Telegram's 64-byte callback-data budget.
+///
+/// Why: Telegram rejects inline-keyboard callback data over 64 bytes; a `verb:`
+/// prefix (≤8 bytes) plus the argument must stay under the limit, so a button
+/// is omitted rather than crashing the bot when the argument is too long.
+/// What: returns true when `arg`'s byte length leaves room for the prefix.
+/// Test: covered by `keyboard_for_projects_has_rows`.
+fn callback_fits(arg: &str) -> bool {
+    arg.len() <= 55
+}
+
+/// Extract the final path component for a compact button label.
+///
+/// Why: a full project path is too long for an inline-keyboard button label;
+/// the directory name alone identifies the project at a glance.
+/// What: returns the last `/`-separated component, or the whole string when it
+/// has no separator.
+/// Test: covered by `keyboard_for_projects_has_rows`.
+fn project_basename(path: &str) -> &str {
+    path.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
 }
 
 /// Shorten a session id for compact chat display.
@@ -219,7 +322,8 @@ fn html_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use trusty_mpm_client::{
-        DecisionCounts, RecommendationSummary, SessionSummary, TmuxSessionSummary,
+        DecisionCounts, DiscoveredProjectSummary, RecommendationSummary, SessionSummary,
+        TmuxSessionSummary,
     };
 
     #[test]
@@ -313,8 +417,11 @@ mod tests {
     fn format_tmux_and_config() {
         let tmux = CommandResult::TmuxSessions(vec![TmuxSessionSummary {
             name: "tmpm-a".into(),
+            managed: true,
         }]);
-        assert!(TelegramFormatter::format(&tmux).contains("tmpm-a"));
+        let text = TelegramFormatter::format(&tmux);
+        assert!(text.contains("tmpm-a"));
+        assert!(text.contains("managed"));
 
         let config = CommandResult::ConfigAnalysis {
             project: "/p".into(),
@@ -324,6 +431,87 @@ mod tests {
             }],
         };
         assert!(TelegramFormatter::format(&config).contains("enable hooks"));
+    }
+
+    #[test]
+    fn format_tmux_marks_external() {
+        let tmux = CommandResult::TmuxSessions(vec![TmuxSessionSummary {
+            name: "vim".into(),
+            managed: false,
+        }]);
+        assert!(TelegramFormatter::format(&tmux).contains("external"));
+    }
+
+    #[test]
+    fn keyboard_for_tmux_adopts_external() {
+        // Only the unmanaged session gets an [Adopt] button.
+        let tmux = CommandResult::TmuxSessions(vec![
+            TmuxSessionSummary {
+                name: "tmpm-a".into(),
+                managed: true,
+            },
+            TmuxSessionSummary {
+                name: "vim".into(),
+                managed: false,
+            },
+        ]);
+        let keyboard = TelegramFormatter::keyboard_for(&tmux).expect("keyboard");
+        assert_eq!(keyboard.inline_keyboard.len(), 1);
+        // All-managed sessions yield no keyboard.
+        let managed_only = CommandResult::TmuxSessions(vec![TmuxSessionSummary {
+            name: "tmpm-a".into(),
+            managed: true,
+        }]);
+        assert!(TelegramFormatter::keyboard_for(&managed_only).is_none());
+    }
+
+    #[test]
+    fn format_discovered_projects_empty() {
+        let text = TelegramFormatter::format(&CommandResult::DiscoveredProjects(vec![]));
+        assert!(text.contains("No projects discovered"));
+    }
+
+    #[test]
+    fn format_discovered_projects_lists_each() {
+        let projects = vec![DiscoveredProjectSummary {
+            path: "/work/demo".into(),
+            session_count: 3,
+            last_session: Some("2026-05-17T10:00:00+00:00".into()),
+        }];
+        let text = format_discovered_projects(&projects);
+        assert!(text.contains("/work/demo"));
+        assert!(text.contains("3 session(s)"));
+        assert!(text.contains("2026-05-17"));
+    }
+
+    #[test]
+    fn keyboard_for_projects_has_rows() {
+        let projects = CommandResult::DiscoveredProjects(vec![DiscoveredProjectSummary {
+            path: "/work/demo".into(),
+            session_count: 1,
+            last_session: None,
+        }]);
+        let keyboard = TelegramFormatter::keyboard_for(&projects).expect("keyboard");
+        assert_eq!(keyboard.inline_keyboard.len(), 1);
+        assert_eq!(keyboard.inline_keyboard[0].len(), 1);
+    }
+
+    #[test]
+    fn adopted_and_registered_format() {
+        let adopted = CommandResult::Adopted {
+            session: "vim".into(),
+        };
+        assert!(TelegramFormatter::format(&adopted).contains("vim"));
+        let registered = CommandResult::ProjectRegistered {
+            path: "/work/demo".into(),
+        };
+        assert!(TelegramFormatter::format(&registered).contains("/work/demo"));
+    }
+
+    #[test]
+    fn project_basename_extracts_dir_name() {
+        assert_eq!(project_basename("/work/demo"), "demo");
+        assert_eq!(project_basename("solo"), "solo");
     }
 
     #[test]

@@ -279,10 +279,13 @@ async fn dispatch_command(
 
 /// teloxide callback-query handler for inline-keyboard buttons.
 ///
-/// Why: the `/sessions` list attaches `[Status] [Approve] [Deny]` buttons whose
-/// taps arrive as callback queries rather than messages.
-/// What: parses the `verb:id` callback data into a [`TrustyCommand`], executes
-/// it, answers the callback (to clear the client spinner), and posts the reply.
+/// Why: the `/sessions`, `/projects`, and `/tmux` lists attach action buttons
+/// (`[Status] [Approve] [Deny]`, `[Set Active]`, `[Adopt]`) whose taps arrive
+/// as callback queries rather than messages.
+/// What: parses the `verb:arg` callback data, runs the matching action through
+/// the shared executor (project registration and tmux adoption have their own
+/// executor methods), answers the callback to clear the client spinner, and
+/// posts the reply.
 /// Test: callback dispatch reuses the shared executor, covered by its tests.
 async fn on_callback(
     bot: Bot,
@@ -305,21 +308,44 @@ async fn on_callback(
         return Ok(());
     };
 
-    let cmd = match data.split_once(':') {
-        Some(("status", id)) => Some(TrustyCommand::Status {
-            session_id: id.to_string(),
-        }),
-        Some(("approve", id)) => Some(TrustyCommand::Approve {
-            session_id: id.to_string(),
-        }),
-        Some(("deny", id)) => Some(TrustyCommand::Deny {
-            session_id: id.to_string(),
-        }),
+    let result = match data.split_once(':') {
+        Some(("status", id)) => Some(
+            executor
+                .execute(TrustyCommand::Status {
+                    session_id: id.to_string(),
+                })
+                .await,
+        ),
+        Some(("approve", id)) => Some(
+            executor
+                .execute(TrustyCommand::Approve {
+                    session_id: id.to_string(),
+                })
+                .await,
+        ),
+        Some(("deny", id)) => Some(
+            executor
+                .execute(TrustyCommand::Deny {
+                    session_id: id.to_string(),
+                })
+                .await,
+        ),
+        // `[Adopt]` on an external tmux session in the `/tmux` list.
+        Some(("adopt", session)) => Some(
+            executor
+                .execute(TrustyCommand::Adopt {
+                    session: session.to_string(),
+                })
+                .await,
+        ),
+        // `[Set Active]` on a discovered project in the `/projects` list.
+        // Project registration carries a path, not a `TrustyCommand`, so it
+        // routes through the executor's dedicated `register_project` method.
+        Some(("setproj", path)) => Some(executor.register_project(path).await),
         _ => None,
     };
 
-    if let Some(cmd) = cmd {
-        let result = executor.execute(cmd).await;
+    if let Some(result) = result {
         bot.send_message(chat_id, TelegramFormatter::format(&result))
             .parse_mode(ParseMode::Html)
             .await?;

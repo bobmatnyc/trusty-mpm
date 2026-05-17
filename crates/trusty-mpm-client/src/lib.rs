@@ -20,11 +20,12 @@ pub mod executor;
 pub mod result;
 
 pub use client::{
-    BreakerRow, ConfigRecommendation, DaemonClient, EventRow, LastSeen, OverseerSnapshot,
-    PairConfirm, PairRequest, PairStatus, SessionRow, TmuxSessionRow,
+    BreakerRow, ConfigRecommendation, DaemonClient, DiscoveredProjectRow, EventRow, LastSeen,
+    OverseerSnapshot, PairConfirm, PairRequest, PairStatus, SessionRow, TmuxSessionRow,
 };
 pub use command::TrustyCommand;
 pub use executor::CommandExecutor;
 pub use result::{
-    CommandResult, DecisionCounts, RecommendationSummary, SessionSummary, TmuxSessionSummary,
+    CommandResult, DecisionCounts, DiscoveredProjectSummary, RecommendationSummary, SessionSummary,
+    TmuxSessionSummary,
 };

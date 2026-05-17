@@ -14,7 +14,8 @@
 use crate::client::DaemonClient;
 use crate::command::{TrustyCommand, help_text};
 use crate::result::{
-    CommandResult, DecisionCounts, RecommendationSummary, SessionSummary, TmuxSessionSummary,
+    CommandResult, DecisionCounts, DiscoveredProjectSummary, RecommendationSummary, SessionSummary,
+    TmuxSessionSummary,
 };
 
 /// Translates [`TrustyCommand`]s into daemon HTTP calls.
@@ -72,6 +73,8 @@ impl CommandExecutor {
             TrustyCommand::Deny { session_id } => self.decide(&session_id, false).await,
             TrustyCommand::Overseer => self.overseer().await,
             TrustyCommand::Tmux => self.tmux().await,
+            TrustyCommand::Projects => self.projects().await,
+            TrustyCommand::Adopt { session } => self.adopt(&session).await,
             TrustyCommand::Config { project } => self.config(&project).await,
             TrustyCommand::Snapshot { session } => self.snapshot(&session).await,
             TrustyCommand::Kill { session_id } => self.kill(&session_id).await,
@@ -217,9 +220,69 @@ impl CommandExecutor {
         match self.client.tmux_sessions().await {
             Ok(rows) => CommandResult::TmuxSessions(
                 rows.into_iter()
-                    .map(|r| TmuxSessionSummary { name: r.name })
+                    .map(|r| TmuxSessionSummary {
+                        name: r.name,
+                        managed: r.managed,
+                    })
                     .collect(),
             ),
+            Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
+        }
+    }
+
+    /// `/projects` — discover projects from the Claude Code configuration.
+    ///
+    /// Why: lets the operator browse projects Claude Code already knows about
+    /// and register one without typing its path.
+    /// What: calls `GET /projects/discover` and maps each row to a
+    /// [`DiscoveredProjectSummary`].
+    /// Test: `execute_projects_against_test_daemon`.
+    async fn projects(&self) -> CommandResult {
+        match self.client.discover_projects().await {
+            Ok(rows) => CommandResult::DiscoveredProjects(
+                rows.into_iter()
+                    .map(|r| DiscoveredProjectSummary {
+                        path: r.path,
+                        session_count: r.session_count,
+                        last_session: r.last_session,
+                    })
+                    .collect(),
+            ),
+            Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
+        }
+    }
+
+    /// `/adopt` — adopt an external tmux session for oversight.
+    ///
+    /// Why: brings a session trusty-mpm did not create under management with a
+    /// single command.
+    /// What: calls `POST /tmux/adopt`; returns [`CommandResult::Adopted`] on
+    /// success, an `Error` when the session is unknown or the daemon is down.
+    /// Test: `execute_adopt_unknown_session_errors`.
+    async fn adopt(&self, session: &str) -> CommandResult {
+        match self.client.adopt_tmux_session(session).await {
+            Ok(true) => CommandResult::Adopted {
+                session: session.to_string(),
+            },
+            Ok(false) => CommandResult::Error(format!("tmux session {session} not found")),
+            Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
+        }
+    }
+
+    /// Register a discovered project with the daemon.
+    ///
+    /// Why: the Telegram `/projects` keyboard's "Set Active" button registers a
+    /// project by path; that does not fit the pure `TrustyCommand` shape (the
+    /// path is keyboard callback data), so the bot adapter calls this directly.
+    /// What: calls `POST /projects`; returns [`CommandResult::DiscoveredProjects`]
+    /// is not appropriate here, so a confirmation is reported via the registered
+    /// path. Returns an `Error` when the daemon is unreachable.
+    /// Test: `register_project_succeeds`.
+    pub async fn register_project(&self, path: &str) -> CommandResult {
+        match self.client.register_project(path).await {
+            Ok(()) => CommandResult::ProjectRegistered {
+                path: path.to_string(),
+            },
             Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
         }
     }
@@ -412,6 +475,51 @@ mod tests {
         {
             CommandResult::Approved { session_id } => assert_eq!(session_id, id.0.to_string()),
             other => panic!("expected Approved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_projects_against_test_daemon() {
+        // `/projects` returns a well-formed (possibly empty) discovered list.
+        let (_state, url) = spawn_test_daemon().await;
+        let executor = CommandExecutor::new(url);
+        match executor.execute(TrustyCommand::Projects).await {
+            CommandResult::DiscoveredProjects(list) => {
+                for p in &list {
+                    assert!(!p.path.is_empty());
+                }
+            }
+            other => panic!("expected DiscoveredProjects, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_adopt_unknown_session_errors() {
+        // Adopting a session that does not exist (or with tmux unavailable on
+        // CI) reports an error rather than a success.
+        let (_state, url) = spawn_test_daemon().await;
+        let executor = CommandExecutor::new(url);
+        match executor
+            .execute(TrustyCommand::Adopt {
+                session: "no-such-session-xyz".into(),
+            })
+            .await
+        {
+            CommandResult::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_project_succeeds() {
+        // The `[Set Active]` flow registers a project by path.
+        let (_state, url) = spawn_test_daemon().await;
+        let executor = CommandExecutor::new(url);
+        match executor.register_project("/work/discovered-demo").await {
+            CommandResult::ProjectRegistered { path } => {
+                assert_eq!(path, "/work/discovered-demo");
+            }
+            other => panic!("expected ProjectRegistered, got {other:?}"),
         }
     }
 

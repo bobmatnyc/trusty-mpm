@@ -112,14 +112,37 @@ pub struct BreakerRow {
 
 /// One tmux session row as returned by `GET /tmux/sessions`.
 ///
-/// Why: the Telegram `/tmux` command lists every tmux session on the host.
-/// What: the session name; the daemon's payload may be a plain string or an
-/// object carrying a `name` field, so both shapes are accepted on parse.
+/// Why: the Telegram `/tmux` command lists every tmux session on the host and
+/// offers an "Adopt" button for the ones trusty-mpm does not yet manage.
+/// What: the session name plus whether trusty-mpm manages it. The daemon's
+/// payload may be a plain string or an origin-tagged object; both are accepted,
+/// with a plain string treated as external (`managed = false`).
 /// Test: `tmux_session_row_accepts_name`.
 #[derive(Debug, Clone)]
 pub struct TmuxSessionRow {
     /// tmux session name.
     pub name: String,
+    /// True when the session's origin is `trusty_mpm` (already managed).
+    pub managed: bool,
+}
+
+/// One discovered Claude Code project as returned by `GET /projects/discover`.
+///
+/// Why: the Telegram `/projects` command lists projects mined from
+/// `~/.claude/projects/` for one-tap registration.
+/// What: the absolute project path, its recorded session count, and the
+/// ISO-8601 last-session time when present.
+/// Test: covered by the executor's projects test.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoveredProjectRow {
+    /// Absolute project path.
+    pub path: String,
+    /// Number of recorded Claude Code sessions for the project.
+    #[serde(default)]
+    pub session_count: usize,
+    /// ISO-8601 last-session timestamp, or `None` when the project has none.
+    #[serde(default)]
+    pub last_session: Option<String>,
 }
 
 /// One Claude Code config recommendation from `GET /claude-config`.
@@ -413,9 +436,11 @@ impl DaemonClient {
 
     /// List every tmux session on the daemon host via `GET /tmux/sessions`.
     ///
-    /// Why: the `/tmux` command lists internal and external tmux sessions.
+    /// Why: the `/tmux` command lists internal and external tmux sessions and
+    /// flags which are already managed so it can offer to adopt the rest.
     /// What: returns one [`TmuxSessionRow`] per session; the daemon payload may
-    /// be plain strings or objects, both of which are accepted.
+    /// be plain strings or origin-tagged objects, both of which are accepted. A
+    /// session is `managed` when its `origin` field is `trusty_mpm`.
     /// Test: `tmux_session_row_accepts_name`.
     pub async fn tmux_sessions(&self) -> anyhow::Result<Vec<TmuxSessionRow>> {
         let url = format!("{}/tmux/sessions", self.base);
@@ -428,11 +453,49 @@ impl DaemonClient {
                     .get("name")
                     .and_then(|v| v.as_str())
                     .or_else(|| s.as_str())?;
+                let managed = s.get("origin").and_then(|v| v.as_str()) == Some("trusty_mpm");
                 Some(TmuxSessionRow {
                     name: name.to_string(),
+                    managed,
                 })
             })
             .collect())
+    }
+
+    /// Discover Claude Code projects via `GET /projects/discover`.
+    ///
+    /// Why: the `/projects` command lists projects mined from
+    /// `~/.claude/projects/` so an operator can register one without typing a
+    /// path.
+    /// What: `GET /projects/discover`, returns the `projects` array deserialized
+    /// into [`DiscoveredProjectRow`]s.
+    /// Test: covered by the executor's projects test.
+    pub async fn discover_projects(&self) -> anyhow::Result<Vec<DiscoveredProjectRow>> {
+        #[derive(Deserialize)]
+        struct Body {
+            #[serde(default)]
+            projects: Vec<DiscoveredProjectRow>,
+        }
+        let url = format!("{}/projects/discover", self.base);
+        let body: Body = self.http.get(&url).send().await?.json().await?;
+        Ok(body.projects)
+    }
+
+    /// Register a project via `POST /projects`.
+    ///
+    /// Why: the `/projects` keyboard's "Set Active" button registers a
+    /// discovered project with the daemon.
+    /// What: POSTs `{"path": <path>}`; returns `Ok(())` on a 2xx response.
+    /// Test: covered by the executor's projects test.
+    pub async fn register_project(&self, path: &str) -> anyhow::Result<()> {
+        let url = format!("{}/projects", self.base);
+        self.http
+            .post(&url)
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     /// Capture a tmux pane snapshot via `GET /tmux/sessions/{name}/snapshot`.

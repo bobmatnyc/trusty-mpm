@@ -43,6 +43,7 @@ use utoipa::OpenApi;
         crate::api::list_projects,
         crate::api::register_project,
         crate::api::current_project,
+        crate::api::discover_projects,
         crate::api::breakers,
         crate::api::get_optimizer,
         crate::api::get_overseer,

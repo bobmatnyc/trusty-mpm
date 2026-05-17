@@ -41,6 +41,13 @@ pub enum TrustyCommand {
     Overseer,
     /// List all tmux sessions (trusty-mpm and external).
     Tmux,
+    /// Discover projects from the Claude Code configuration.
+    Projects,
+    /// Adopt an external tmux session for oversight.
+    Adopt {
+        /// tmux session name to adopt.
+        session: String,
+    },
     /// Analyze Claude Code config for a project.
     Config {
         /// Project directory path.
@@ -86,6 +93,8 @@ pub fn help_text() -> &'static str {
      /deny <id> — deny a pending permission request\n\
      /overseer — show overseer status\n\
      /tmux — list all tmux sessions\n\
+     /projects — discover projects from Claude Code config\n\
+     /adopt <session> — adopt an external tmux session\n\
      /config <path> — analyze Claude Code config for a project\n\
      /snapshot <session> — capture a tmux pane\n\
      /kill <id> — kill a session\n\
@@ -109,6 +118,8 @@ mod tests {
             "/deny",
             "/overseer",
             "/tmux",
+            "/projects",
+            "/adopt",
             "/config",
             "/snapshot",
             "/kill",

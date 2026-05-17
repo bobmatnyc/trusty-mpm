@@ -1327,7 +1327,44 @@ async fn run_daemon(addr: SocketAddr, tailscale: bool, mcp: bool) -> anyhow::Res
         std::process::exit(0);
     });
 
+    // Auto-start the Telegram bot alongside the daemon when a bot token is
+    // configured. `resolve_token` honours `.env.local` → `.env` → the process
+    // environment, so a single dotenv file configures both the daemon and the
+    // bot. Without a token the daemon runs normally; only a warning is logged.
+    spawn_telegram_bot(&base_url);
+
     trusty_mpm_daemon::serve_http(state, listener).await
+}
+
+/// Spawn the Telegram bot as a background task when a token is configured.
+///
+/// Why: an operator who has set `TELEGRAM_BOT_TOKEN` expects the bot to come up
+/// with the daemon — not as a separate process they must remember to start.
+/// What: resolves the token via `trusty_mpm_telegram::resolve_token` (which
+/// reads `.env.local`, then `.env`, then the environment). When a token is
+/// found the bot's `run` is spawned on a tokio task pointed at `base_url`; when
+/// absent a single warning is logged and the daemon continues.
+/// Test: token resolution is covered by `trusty-mpm-telegram`'s
+/// `resolve_token_*` tests; the spawn path is exercised by running the daemon.
+fn spawn_telegram_bot(base_url: &str) {
+    match trusty_mpm_telegram::resolve_token("TELEGRAM_BOT_TOKEN") {
+        Some(token) => {
+            tracing::info!("TELEGRAM_BOT_TOKEN found — starting Telegram bot");
+            let url = base_url.to_string();
+            tokio::spawn(async move {
+                let options = trusty_mpm_telegram::BotOptions::default();
+                if let Err(e) = trusty_mpm_telegram::run(url, Some(token), false, options).await {
+                    tracing::warn!("Telegram bot exited: {e}");
+                }
+            });
+        }
+        None => {
+            tracing::warn!(
+                "TELEGRAM_BOT_TOKEN not set — Telegram bot not started \
+                 (set it in .env.local to enable)"
+            );
+        }
+    }
 }
 
 /// Detect the Tailscale IPv4 address by running `tailscale ip -4`.
