@@ -21,8 +21,27 @@ use ratatui::{
 use crate::client::{BreakerRow, EventRow, SessionRow};
 
 /// One-line key hint shown in the status bar before any action is taken.
-pub const KEY_HINT: &str =
-    "keys: ↑↓ navigate | p pause | r resume | x stop | o iTerm2 tab | c connect | ? help | q quit";
+pub const KEY_HINT: &str = "keys: ↑↓ navigate | p pause | r resume | x stop | o iTerm2 tab | c connect | / command | ? help | q quit";
+
+/// A pairing overlay's display contents.
+///
+/// Why: when the operator runs `/pair`, the dashboard must show the returned
+/// code (or an error) in a prominent, dismissible overlay; holding the rendered
+/// strings here keeps overlay state out of the render path.
+/// What: either a successful code with its TTL, or a failure message.
+/// Test: `pair_overlay_lines_show_code`, `pair_overlay_lines_show_error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairDisplay {
+    /// A pairing code was issued; carries the code and its lifetime in seconds.
+    Code {
+        /// One-time pairing code from `POST /pair/request`.
+        code: String,
+        /// Seconds until the code expires.
+        expires_in_seconds: u64,
+    },
+    /// The pairing request failed; carries the human-readable reason.
+    Error(String),
+}
 
 /// Snapshot of everything the dashboard renders this frame.
 ///
@@ -74,6 +93,22 @@ pub struct DashboardState {
     /// What: `None` when the prompt is closed, `Some(buffer)` while editing.
     /// Test: `connect_prompt_open_close`, `connect_prompt_edits_buffer`.
     pub connect_prompt: Option<String>,
+    /// Current contents of the inline `command>` prompt, if it is open.
+    ///
+    /// Why: the `/` key opens a slash-command bar where the operator types a
+    /// command name (e.g. `pair`); while it is `Some` the event loop routes
+    /// every keystroke to the prompt instead of navigation/action keys.
+    /// What: `None` when the prompt is closed, `Some(buffer)` while editing.
+    /// Test: `command_prompt_open_close`, `command_prompt_edits_buffer`.
+    pub command_prompt: Option<String>,
+    /// The pairing overlay's contents, when it is visible.
+    ///
+    /// Why: `/pair` requests a Telegram pairing code from the daemon; the result
+    /// must stay on screen long enough for the operator to read and type it into
+    /// their bot, then be dismissible with Esc/Enter.
+    /// What: `None` when no overlay is shown, `Some(PairDisplay)` otherwise.
+    /// Test: `pair_overlay_open_close`, `pair_overlay_lines_show_code`.
+    pub pair_overlay: Option<PairDisplay>,
 }
 
 impl DashboardState {
@@ -224,6 +259,90 @@ impl DashboardState {
             trusty_mpm_core::ResolveResult::NotFound => "No session matched".to_string(),
         });
     }
+
+    /// Open the inline `command>` slash-command prompt with an empty buffer.
+    ///
+    /// Why: the `/` key starts a slash-command flow (e.g. `/pair`) without
+    /// leaving the dashboard.
+    /// What: sets [`Self::command_prompt`] to `Some(String::new())`.
+    /// Test: `command_prompt_open_close`.
+    pub fn open_command_prompt(&mut self) {
+        self.command_prompt = Some(String::new());
+    }
+
+    /// Close the `command>` prompt without dispatching anything (the Esc key).
+    ///
+    /// Why: the operator must be able to abandon a half-typed command.
+    /// What: clears [`Self::command_prompt`] back to `None`.
+    /// Test: `command_prompt_open_close`.
+    pub fn close_command_prompt(&mut self) {
+        self.command_prompt = None;
+    }
+
+    /// Append a character to the open `command>` prompt buffer.
+    ///
+    /// Why: printable keystrokes build up the command string while open.
+    /// What: pushes `c` onto the buffer; a no-op when the prompt is closed.
+    /// Test: `command_prompt_edits_buffer`.
+    pub fn command_prompt_push(&mut self, c: char) {
+        if let Some(buf) = self.command_prompt.as_mut() {
+            buf.push(c);
+        }
+    }
+
+    /// Delete the last character of the open `command>` prompt buffer.
+    ///
+    /// Why: Backspace must edit a mistyped command.
+    /// What: pops the trailing character; a no-op when closed or empty.
+    /// Test: `command_prompt_edits_buffer`.
+    pub fn command_prompt_backspace(&mut self) {
+        if let Some(buf) = self.command_prompt.as_mut() {
+            buf.pop();
+        }
+    }
+
+    /// Show the pairing overlay with a freshly-issued code.
+    ///
+    /// Why: a successful `/pair` request must display the code prominently so
+    /// the operator can read it and type it into their Telegram bot.
+    /// What: sets [`Self::pair_overlay`] to a [`PairDisplay::Code`].
+    /// Test: `pair_overlay_lines_show_code`.
+    pub fn show_pair_code(&mut self, code: String, expires_in_seconds: u64) {
+        self.pair_overlay = Some(PairDisplay::Code {
+            code,
+            expires_in_seconds,
+        });
+    }
+
+    /// Show the pairing overlay with an error message.
+    ///
+    /// Why: a failed `/pair` request must still surface the reason to the
+    /// operator rather than silently doing nothing.
+    /// What: sets [`Self::pair_overlay`] to a [`PairDisplay::Error`].
+    /// Test: `pair_overlay_lines_show_error`.
+    pub fn show_pair_error(&mut self, message: String) {
+        self.pair_overlay = Some(PairDisplay::Error(message));
+    }
+
+    /// Dismiss the pairing overlay (the Esc / Enter keys).
+    ///
+    /// Why: the overlay must clear once the operator has read or copied it.
+    /// What: clears [`Self::pair_overlay`] back to `None`.
+    /// Test: `pair_overlay_open_close`.
+    pub fn close_pair_overlay(&mut self) {
+        self.pair_overlay = None;
+    }
+}
+
+/// Canonicalize a typed slash-command into its bare verb.
+///
+/// Why: the `command>` prompt accepts `/pair`, `pair`, or `  /Pair ` — all the
+/// same intent — so dispatch logic needs one normalized form.
+/// What: trims surrounding whitespace, strips a leading `/`, and lowercases the
+/// result.
+/// Test: `normalize_command_strips_slash_and_case`.
+pub fn normalize_command(input: &str) -> String {
+    input.trim().trim_start_matches('/').trim().to_lowercase()
 }
 
 /// Pick the display colour for a session status string.
@@ -468,10 +587,63 @@ pub fn help_text() -> String {
         "  x         stop selected session",
         "  o         open session in iTerm2 tab",
         "  c         connect to session",
+        "  /         slash command (e.g. /pair)",
         "  ?         toggle this help",
         "  q / Esc   quit",
     ]
     .join("\n")
+}
+
+/// Build the body lines for the pairing overlay.
+///
+/// Why: separating overlay text from the ratatui widget lets a test assert the
+/// content (the code, the TTL, the bot instruction) without a terminal backend.
+/// What: for a [`PairDisplay::Code`], a two-line block showing the code with its
+/// expiry and the `/pair <code>` bot instruction; for [`PairDisplay::Error`], a
+/// single error line.
+/// Test: `pair_overlay_lines_show_code`, `pair_overlay_lines_show_error`.
+pub fn pair_overlay_lines(display: &PairDisplay) -> Vec<String> {
+    match display {
+        PairDisplay::Code {
+            code,
+            expires_in_seconds,
+        } => {
+            let minutes = expires_in_seconds / 60;
+            vec![
+                format!("Telegram pairing code: {code}  (expires in {minutes} min)"),
+                format!("Send /pair {code} to your Telegram bot"),
+            ]
+        }
+        PairDisplay::Error(message) => vec![format!("Pairing failed: {message}")],
+    }
+}
+
+/// Render the dismissible pairing overlay.
+///
+/// Why: `/pair` must show the issued code (or an error) prominently and stay
+/// until the operator dismisses it with Esc/Enter.
+/// What: clears a centred box and draws a bordered `Paragraph` of
+/// [`pair_overlay_lines`]; a code is drawn in green, an error in red.
+/// Test: the line content is covered by `pair_overlay_lines_*`; layout is
+/// exercised by the rendering smoke test.
+fn render_pair_overlay(frame: &mut Frame, display: &PairDisplay) {
+    let area = centered_rect(64, 6, frame.area());
+    let lines = pair_overlay_lines(display);
+    let color = match display {
+        PairDisplay::Code { .. } => Color::Green,
+        PairDisplay::Error(_) => Color::Red,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Telegram Pairing — press Esc or Enter to dismiss"),
+            ),
+        area,
+    );
 }
 
 /// Draw the dashboard frame.
@@ -587,19 +759,39 @@ pub fn render_with_table_state(
     }
 
     if let Some(buffer) = state.connect_prompt.as_deref() {
-        render_connect_prompt(frame, buffer);
+        render_input_prompt(
+            frame,
+            "connect",
+            buffer,
+            "Connect — Enter to resolve, Esc to cancel",
+        );
+    }
+
+    if let Some(buffer) = state.command_prompt.as_deref() {
+        render_input_prompt(
+            frame,
+            "command",
+            buffer,
+            "Command — Enter to run, Esc to cancel",
+        );
+    }
+
+    // The pairing overlay is drawn last so it floats above every other panel.
+    if let Some(display) = state.pair_overlay.as_ref() {
+        render_pair_overlay(frame, display);
     }
 }
 
-/// Render the inline `connect>` prompt at the bottom of the frame.
+/// Render an inline single-line input prompt at the bottom of the frame.
 ///
-/// Why: the `c` key starts a fuzzy session-connect flow; the operator needs a
-/// visible single-line input showing what they have typed so far.
-/// What: clears a one-row-tall bordered box on the bottom line and draws
-/// `connect> <buffer>` inside it.
-/// Test: the prompt text is covered by `connect_prompt_line`; the layout math
-/// is exercised by the rendering smoke test.
-fn render_connect_prompt(frame: &mut Frame, buffer: &str) {
+/// Why: both the `c` (connect) and `/` (slash-command) flows need a visible
+/// single-line input showing what the operator has typed so far; sharing one
+/// renderer keeps the two prompts visually consistent.
+/// What: clears a three-row-tall bordered box on the bottom line and draws
+/// `<prefix>> <buffer>` inside a box titled `title`.
+/// Test: the prompt text is covered by `prompt_line`; the layout math is
+/// exercised by the rendering smoke test.
+fn render_input_prompt(frame: &mut Frame, prefix: &str, buffer: &str, title: &str) {
     let area = frame.area();
     let row = Rect {
         x: area.x,
@@ -609,24 +801,24 @@ fn render_connect_prompt(frame: &mut Frame, buffer: &str) {
     };
     frame.render_widget(Clear, row);
     frame.render_widget(
-        Paragraph::new(connect_prompt_line(buffer))
+        Paragraph::new(prompt_line(prefix, buffer))
             .style(Style::default().fg(Color::White))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Connect — Enter to resolve, Esc to cancel"),
+                    .title(title.to_string()),
             ),
         row,
     );
 }
 
-/// Build the text shown inside the `connect>` prompt.
+/// Build the text shown inside an inline input prompt.
 ///
 /// Why: kept separate so a test can assert the prompt prefix without a frame.
-/// What: returns `connect> <buffer>`.
-/// Test: `connect_prompt_line`.
-pub fn connect_prompt_line(buffer: &str) -> String {
-    format!("connect> {buffer}")
+/// What: returns `<prefix>> <buffer>`.
+/// Test: `prompt_line_has_prefix`.
+pub fn prompt_line(prefix: &str, buffer: &str) -> String {
+    format!("{prefix}> {buffer}")
 }
 
 #[cfg(test)]
@@ -1061,13 +1253,87 @@ mod tests {
     }
 
     #[test]
-    fn connect_prompt_line_has_prefix() {
-        assert_eq!(connect_prompt_line("front"), "connect> front");
+    fn prompt_line_has_prefix() {
+        assert_eq!(prompt_line("connect", "front"), "connect> front");
+        assert_eq!(prompt_line("command", "pair"), "command> pair");
     }
 
     #[test]
     fn help_text_lists_connect_binding() {
         assert!(help_text().contains("connect to session"));
+    }
+
+    #[test]
+    fn help_text_lists_slash_command_binding() {
+        assert!(help_text().contains("/pair"));
+    }
+
+    #[test]
+    fn command_prompt_open_close() {
+        // `/` opens an empty command prompt; Esc closes it.
+        let mut state = DashboardState::default();
+        assert!(state.command_prompt.is_none());
+        state.open_command_prompt();
+        assert_eq!(state.command_prompt.as_deref(), Some(""));
+        state.close_command_prompt();
+        assert!(state.command_prompt.is_none());
+    }
+
+    #[test]
+    fn command_prompt_edits_buffer() {
+        // Printable keys append, Backspace removes the trailing character.
+        let mut state = DashboardState::default();
+        state.open_command_prompt();
+        state.command_prompt_push('p');
+        state.command_prompt_push('a');
+        assert_eq!(state.command_prompt.as_deref(), Some("pa"));
+        state.command_prompt_backspace();
+        assert_eq!(state.command_prompt.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn normalize_command_strips_slash_and_case() {
+        assert_eq!(normalize_command("/pair"), "pair");
+        assert_eq!(normalize_command("pair"), "pair");
+        assert_eq!(normalize_command("  /Pair "), "pair");
+        assert_eq!(normalize_command(""), "");
+    }
+
+    #[test]
+    fn pair_overlay_open_close() {
+        // A code (or error) opens the overlay; closing clears it.
+        let mut state = DashboardState::default();
+        assert!(state.pair_overlay.is_none());
+        state.show_pair_code("ABC123".into(), 300);
+        assert!(state.pair_overlay.is_some());
+        state.close_pair_overlay();
+        assert!(state.pair_overlay.is_none());
+        state.show_pair_error("daemon unreachable".into());
+        assert!(matches!(state.pair_overlay, Some(PairDisplay::Error(_))));
+    }
+
+    #[test]
+    fn pair_overlay_lines_show_code() {
+        // The code overlay shows the code, a minute-rounded TTL, and the bot
+        // instruction line.
+        let display = PairDisplay::Code {
+            code: "ABC123".into(),
+            expires_in_seconds: 300,
+        };
+        let lines = pair_overlay_lines(&display);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("ABC123"));
+        assert!(lines[0].contains("expires in 5 min"));
+        assert!(lines[1].contains("/pair ABC123"));
+    }
+
+    #[test]
+    fn pair_overlay_lines_show_error() {
+        let display = PairDisplay::Error("connection refused".into());
+        let lines = pair_overlay_lines(&display);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("Pairing failed"));
+        assert!(lines[0].contains("connection refused"));
     }
 
     #[test]

@@ -155,6 +155,17 @@ async fn run_loop<B: ratatui::backend::Backend>(
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
         {
+            // Why: the pairing overlay floats above everything; while it is up
+            // it must capture Esc/Enter to dismiss itself so the operator can
+            // read the code without it vanishing on an unrelated key.
+            // What: Esc or Enter clears the overlay; all other keys are ignored.
+            // Test: `dashboard::DashboardState::close_pair_overlay` covers dismissal.
+            if state.pair_overlay.is_some() {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    state.close_pair_overlay();
+                }
+                continue;
+            }
             // Why: while the `connect>` prompt is open it owns every keystroke,
             // so typing a target never triggers navigation or action keys.
             // What: Enter resolves the target, Esc cancels, Backspace edits, and
@@ -170,11 +181,32 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 }
                 continue;
             }
+            // Why: while the `command>` slash-command prompt is open it owns
+            // every keystroke, so typing a command never triggers navigation.
+            // What: Enter dispatches the typed command, Esc cancels, Backspace
+            // edits, and printable characters append to the buffer.
+            // Test: `dispatch_command` covers `/pair` dispatch.
+            if state.command_prompt.is_some() {
+                match key.code {
+                    KeyCode::Esc => state.close_command_prompt(),
+                    KeyCode::Enter => {
+                        let typed = state.command_prompt.take().unwrap_or_default();
+                        dispatch_command(&mut state, client, &typed).await;
+                        poll_daemon(&mut state, client).await;
+                        last_poll = Instant::now();
+                    }
+                    KeyCode::Backspace => state.command_prompt_backspace(),
+                    KeyCode::Char(c) => state.command_prompt_push(c),
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc if !state.show_help => return Ok(()),
                 KeyCode::Esc => state.show_help = false,
                 KeyCode::Char('?') => state.show_help = !state.show_help,
                 KeyCode::Char('c') => state.open_connect_prompt(),
+                KeyCode::Char('/') => state.open_command_prompt(),
                 KeyCode::Up | KeyCode::Char('k') => state.select_up(),
                 KeyCode::Down | KeyCode::Char('j') => state.select_down(),
                 KeyCode::Char('p') => {
@@ -282,6 +314,30 @@ async fn handle_action(state: &mut DashboardState, client: &DaemonClient, action
     });
 }
 
+/// Dispatch a slash command typed into the `command>` prompt.
+///
+/// Why: the `/` key opens a command bar; this is the single place that maps a
+/// typed command verb to a daemon call so adding a command later is one arm.
+/// What: normalizes `typed` (strips a leading `/`, trims, lowercases) and
+/// dispatches. `pair` calls `POST /pair/request` and shows the resulting code
+/// in the dismissible pairing overlay, or an error overlay on failure. An empty
+/// command is a no-op; an unknown command records a status-bar message.
+/// Test: `cargo test -p trusty-mpm-tui` covers normalization and overlay state;
+/// the live HTTP call is covered by the daemon's pairing tests.
+async fn dispatch_command(state: &mut DashboardState, client: &DaemonClient, typed: &str) {
+    let command = dashboard::normalize_command(typed);
+    match command.as_str() {
+        "" => {}
+        "pair" => match client.pair_request().await {
+            Ok(req) => state.show_pair_code(req.code, req.expires_in_seconds),
+            Err(e) => state.show_pair_error(e.to_string()),
+        },
+        other => {
+            state.last_action = Some(format!("unknown command: /{other}"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +383,49 @@ mod tests {
         };
         handle_open_in_iterm2(&mut state);
         assert_eq!(state.last_action.as_deref(), Some("no sessions"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_empty_command_is_noop() {
+        // Why: pressing Enter on an empty `command>` prompt must do nothing.
+        // What: an empty (or whitespace-only) command leaves state untouched.
+        // Test: no overlay opens and no status line is recorded.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "  ").await;
+        assert!(state.pair_overlay.is_none());
+        assert!(state.last_action.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_command_reports_status() {
+        // Why: an unrecognized command must give the operator feedback rather
+        // than failing silently.
+        // What: `/bogus` records an `unknown command` status line, no overlay.
+        // Test: assert the status line and that no overlay opened.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "/bogus").await;
+        assert!(state.pair_overlay.is_none());
+        assert_eq!(
+            state.last_action.as_deref(),
+            Some("unknown command: /bogus")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_pair_command_shows_error_overlay_when_daemon_down() {
+        // Why: `/pair` against an unreachable daemon must surface the failure in
+        // the pairing overlay, not crash or do nothing.
+        // What: a port-0 base URL never connects, so `pair_request` errors and
+        // `dispatch_command` opens an error overlay.
+        // Test: assert the overlay holds a `PairDisplay::Error`.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "/pair").await;
+        assert!(matches!(
+            state.pair_overlay,
+            Some(dashboard::PairDisplay::Error(_))
+        ));
     }
 }
