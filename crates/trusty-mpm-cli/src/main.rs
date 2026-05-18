@@ -753,8 +753,41 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
                 .error_for_status()?
                 .json()
                 .await?;
-            // The daemon returns the friendly `tmpm-<adj>-<noun>` session name.
-            println!("started session {}", body.name);
+
+            // The daemon only registers session state now — it no longer
+            // spawns the tmux host (that caused session proliferation). The
+            // CLI owns the actual launch: create a detached tmux session in
+            // the project directory and start `claude` in it.
+            let workdir = path.to_string_lossy().to_string();
+            let new_session = std::process::Command::new("tmux")
+                .args(["new-session", "-d", "-s", &body.name, "-c", &workdir])
+                .status();
+            match new_session {
+                Ok(status) if status.success() => {
+                    let send = std::process::Command::new("tmux")
+                        .args(["send-keys", "-t", &body.name, "claude", "Enter"])
+                        .status();
+                    match send {
+                        Ok(s) if s.success() => {
+                            println!("started session {} (tmux + claude)", body.name);
+                        }
+                        Ok(_) | Err(_) => {
+                            eprintln!(
+                                "warning: tmux session {} created but failed to start claude",
+                                body.name
+                            );
+                            println!("started session {}", body.name);
+                        }
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    eprintln!(
+                        "warning: failed to create tmux session {}; run `claude` manually in {}",
+                        body.name, workdir
+                    );
+                    println!("started session {}", body.name);
+                }
+            }
         }
         SessionAction::Stop { id_or_name } => {
             let resp = client

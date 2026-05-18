@@ -242,6 +242,62 @@ async fn hook_relay_runs_with_disabled_overseer() {
 }
 
 #[tokio::test]
+async fn session_start_auto_registers_unknown_session() {
+    // A `SessionStart` hook for a session the daemon has never seen must
+    // auto-register it (connection-driven registration), using the incoming
+    // UUID so the session carries the right id.
+    let state = DaemonState::shared();
+    let new_id = trusty_mpm_core::session::SessionId::new();
+    assert!(state.session(new_id).is_none());
+
+    let post = HookPost {
+        session_id: new_id.0.to_string(),
+        event: HookEvent::SessionStart,
+        payload: serde_json::Value::Null,
+    };
+    let result = ingest_hook(State(state.clone()), Json(post)).await;
+    assert!(result.is_ok());
+
+    let registered = state.session(new_id).expect("session auto-registered");
+    assert_eq!(registered.id, new_id);
+    assert_eq!(
+        registered.status,
+        trusty_mpm_core::session::SessionStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn non_session_start_event_does_not_auto_register() {
+    // Only `SessionStart` auto-registers. A non-start event for an unknown
+    // session must not create a session record.
+    let state = DaemonState::shared();
+    let unknown = trusty_mpm_core::session::SessionId::new();
+    let post = HookPost {
+        session_id: unknown.0.to_string(),
+        event: HookEvent::PreToolUse,
+        payload: serde_json::json!({"tool": "Bash"}),
+    };
+    let _ = ingest_hook(State(state.clone()), Json(post)).await;
+    assert!(state.session(unknown).is_none());
+}
+
+#[tokio::test]
+async fn session_start_for_known_session_does_not_duplicate() {
+    // A `SessionStart` for an already-registered session must not create a
+    // second record.
+    let (state, id) = state_with_session();
+    let before = state.list_sessions().len();
+    let post = HookPost {
+        session_id: id.0.to_string(),
+        event: HookEvent::SessionStart,
+        payload: serde_json::Value::Null,
+    };
+    let result = ingest_hook(State(state.clone()), Json(post)).await;
+    assert!(result.is_ok());
+    assert_eq!(state.list_sessions().len(), before);
+}
+
+#[tokio::test]
 async fn llm_chat_without_overseer_is_503() {
     // A default daemon has no OpenRouter key, so `POST /llm/chat` reports the
     // capability as unavailable rather than attempting a network call.

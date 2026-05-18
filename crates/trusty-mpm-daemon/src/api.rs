@@ -25,12 +25,10 @@ use trusty_mpm_core::compress::CompressionLevel;
 use trusty_mpm_core::hook::HookEvent;
 use trusty_mpm_core::project::ProjectInfo;
 use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
-use trusty_mpm_core::tmux::TmuxTarget;
 
 use crate::error::DaemonError;
 use crate::services::{HookDecision, HookService, PairingService, SessionService, TmuxService};
 use crate::state::DaemonState;
-use crate::tmux::TmuxDriver;
 
 /// The Claude Code configuration analyzer routes (`/claude-config/*`).
 ///
@@ -179,11 +177,13 @@ pub struct RegisterSession {
 
 /// `POST /sessions` — register a new managed session, returning its id.
 ///
-/// Why: registering a session should also stand up its tmux host so the
-/// operator gets a live Claude Code session, not just a bookkeeping entry.
-/// What: builds the `Session`, then best-effort launches a detached tmux
-/// session and starts `claude` in it; tmux failures are logged, not fatal —
-/// the session is still registered so the API stays usable without tmux.
+/// Why: registering a session is pure bookkeeping — it records that a session
+/// exists so the dashboard and MCP tools can see it. It does NOT create a tmux
+/// window; spawning a tmux host here caused session proliferation (every call
+/// orphaned a new window). Sessions are instead *discovered* from existing
+/// tmux panes, *auto-registered* on a `SessionStart` hook, or launched by the
+/// `tm session start` CLI which owns the actual `claude` launch.
+/// What: builds the `Session` record and registers it in state.
 /// Test: `register_and_remove_session` covers the bookkeeping path.
 #[utoipa::path(
     post,
@@ -201,28 +201,6 @@ pub async fn register_session(
     let id = session.id;
     let tmux_name = session.tmux_name.clone();
     state.register_session(session);
-
-    // Best-effort: launch the session inside tmux. Any failure is logged and
-    // the session stays registered in the `Starting` state. The session is
-    // hosted under a friendly, deterministic name derived from its UUID.
-    match TmuxDriver::discover() {
-        Ok(driver) => {
-            if let Err(e) = driver.create_session(&tmux_name, Some(&body.workdir)) {
-                tracing::warn!("tmux create_session failed: {e}");
-            } else {
-                let target = TmuxTarget::session(&tmux_name);
-                if let Err(e) = driver.send_line(&target, "claude") {
-                    tracing::warn!("tmux send_line failed: {e}");
-                } else if let Some(mut sess) = state.session(id) {
-                    sess.status = SessionStatus::Active;
-                    state.register_session(sess);
-                }
-            }
-        }
-        Err(_) => {
-            tracing::info!("tmux unavailable; session {id:?} registered without tmux launch");
-        }
-    }
 
     Json(RegisterSessionResponse {
         id,
@@ -633,12 +611,15 @@ pub struct HookPost {
 /// Why: this is how the daemon achieves full observability — a forwarder shim
 /// configured for *all* 32 hook events posts each one here. It is also the
 /// enforcement point for the optional session overseer.
-/// What: parses the session id and event name, runs the overseer on tool-use
-/// events (auditing every decision; a `Block` returns `403` early), compresses
+/// What: parses the session id and event name. On a `SessionStart` event for
+/// an unknown session it auto-registers that session (this is how a claude
+/// session announces itself to the daemon — connection-driven registration,
+/// not `POST /sessions`). It then runs the overseer on tool-use events
+/// (auditing every decision; a `Block` returns `403` early), compresses
 /// `PostToolUse` output, then appends a `HookEventRecord` to the ring buffer.
-/// Rejects unknown events/ids with `400`.
+/// Rejects malformed ids with `400`.
 /// Test: `hook_relay_ingests_known_event`, `hook_relay_rejects_unknown_event`,
-/// `overseer_blocks_pre_tool_use`.
+/// `overseer_blocks_pre_tool_use`, `session_start_auto_registers_session`.
 #[utoipa::path(
     post,
     path = "/hooks",
@@ -655,6 +636,18 @@ pub async fn ingest_hook(
     Json(post): Json<HookPost>,
 ) -> Result<Json<HookAcceptedResponse>, DaemonError> {
     let session = parse_id(&post.session_id)?;
+
+    // Auto-register on SessionStart if not already known. This is how a claude
+    // session connects itself to the daemon: its first hook event registers it
+    // using the incoming UUID, so discovery and `POST /sessions` are not the
+    // only ways a session enters state. The workdir is left empty here and
+    // enriched later by a snapshot or subsequent events.
+    if post.event == HookEvent::SessionStart && state.session(session).is_none() {
+        let mut new_session = Session::new(session, String::new(), ControlModel::Tmux);
+        new_session.status = SessionStatus::Active;
+        state.register_session(new_session);
+        tracing::info!("auto-registered session on SessionStart: {session:?}");
+    }
 
     match HookService::new(&state).process(session, post.event, post.payload) {
         HookDecision::Block { reason } => Err(DaemonError::OverseerBlocked { reason }),
