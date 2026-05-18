@@ -530,17 +530,24 @@ impl DaemonState {
         self.reap_against(&live)
     }
 
-    /// Remove every session whose `tmux_name` is not in `live`.
+    /// Remove every tmux-hosted session whose `tmux_name` is not in `live`.
     ///
     /// Why: separating the set-difference logic from the tmux call makes the
-    /// reaping rule unit-testable without spawning a tmux process.
-    /// What: collects the dead ids, then removes each; returns the count.
-    /// Test: `reap_dead_sessions`.
+    /// reaping rule unit-testable without spawning a tmux process. Native
+    /// (`SessionHost::Native`) sessions have no tmux session, so the tmux
+    /// liveness check must skip them — otherwise every discovered Terminal.app
+    /// process would be reaped the instant after it was discovered.
+    /// What: collects the dead ids of tmux-origin sessions absent from `live`,
+    /// then removes each; returns the count. Native sessions are left untouched.
+    /// Test: `reap_dead_sessions`, `reap_keeps_native_sessions`.
     fn reap_against(&self, live: &std::collections::HashSet<String>) -> usize {
         let dead: Vec<SessionId> = self
             .sessions
             .iter()
-            .filter(|e| !live.contains(&e.value().tmux_name))
+            .filter(|e| {
+                e.value().origin == trusty_mpm_core::session::SessionHost::Tmux
+                    && !live.contains(&e.value().tmux_name)
+            })
             .map(|e| *e.key())
             .collect();
         for id in &dead {
@@ -980,14 +987,37 @@ mod tests {
     }
 
     #[test]
-    fn reap_against_empty_live_removes_all() {
-        // An empty live set (e.g. tmux server fully stopped) drops every entry.
+    fn reap_against_empty_live_removes_all_tmux_sessions() {
+        // An empty live set (e.g. tmux server fully stopped) drops every
+        // tmux-hosted entry.
         let state = DaemonState::new();
         state.register_session(sample_session());
         state.register_session(sample_session());
         let removed = state.reap_against(&std::collections::HashSet::new());
         assert_eq!(removed, 2);
         assert!(state.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn reap_keeps_native_sessions() {
+        // Native (Terminal.app) sessions have no tmux session; the tmux-based
+        // reaper must never delete them, even against an empty live set.
+        let state = DaemonState::new();
+        let mut native = sample_session();
+        native.origin = trusty_mpm_core::session::SessionHost::Native;
+        native.pid = Some(9999);
+        let native_id = native.id;
+        let tmux = sample_session();
+        let tmux_id = tmux.id;
+        state.register_session(native);
+        state.register_session(tmux);
+
+        let removed = state.reap_against(&std::collections::HashSet::new());
+
+        // Only the tmux-hosted session is reaped.
+        assert_eq!(removed, 1);
+        assert!(state.session(native_id).is_some());
+        assert!(state.session(tmux_id).is_none());
     }
 
     #[test]

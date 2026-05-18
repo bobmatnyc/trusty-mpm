@@ -71,6 +71,7 @@ use utoipa::OpenApi;
         trusty_mpm_core::session::SessionStatus,
         trusty_mpm_core::session::SessionId,
         trusty_mpm_core::session::ControlModel,
+        trusty_mpm_core::session::SessionHost,
         trusty_mpm_core::project::ProjectInfo,
         trusty_mpm_core::compress::CompressionLevel,
         trusty_mpm_core::external_session::ExternalSession,

@@ -58,6 +58,25 @@ pub enum ControlModel {
     Sdk,
 }
 
+/// How a managed session was discovered or created.
+///
+/// Why: most Claude Code sessions run in native Terminal.app windows rather
+/// than tmux, so the dashboard and API must distinguish a tmux-discovered
+/// session from a bare OS process so operators know what they can control.
+/// What: [`Tmux`](SessionHost::Tmux) for tmux-hosted sessions (the default,
+/// for backward compatibility), [`Native`](SessionHost::Native) for a
+/// `claude`/`claude-code` OS process discovered via `ps`.
+/// Test: covered by `Session` JSON round-trip tests and the discovery suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionHost {
+    /// Session was created or discovered inside a tmux session.
+    #[default]
+    Tmux,
+    /// Session is a native OS process (e.g. running in Terminal.app).
+    Native,
+}
+
 /// A point-in-time snapshot of a session, returned by the daemon API.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Session {
@@ -108,6 +127,21 @@ pub struct Session {
     /// What: free-form text, cleared to `None` on resume.
     #[serde(default)]
     pub pause_summary: Option<String>,
+    /// How the session was discovered or created.
+    ///
+    /// Why: native Terminal.app `claude` processes are discovered alongside
+    /// tmux sessions; the dashboard shows the origin so operators know whether
+    /// the session is tmux-controllable.
+    /// What: defaults to [`SessionHost::Tmux`] for backward compatibility.
+    #[serde(default)]
+    pub origin: SessionHost,
+    /// OS process id, when the session is a discovered native process.
+    ///
+    /// Why: native sessions are keyed by pid; recording it lets the discovery
+    /// scan skip a process already registered and lets the dashboard show it.
+    /// What: `Some(pid)` for [`SessionHost::Native`] sessions, `None` otherwise.
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 impl Session {
@@ -133,6 +167,8 @@ impl Session {
             project_path: None,
             paused_at: None,
             pause_summary: None,
+            origin: SessionHost::Tmux,
+            pid: None,
         }
     }
 
@@ -208,6 +244,53 @@ mod tests {
         assert_eq!(back.status, SessionStatus::Paused);
         assert!(back.paused_at.is_some());
         assert_eq!(back.pause_summary.as_deref(), Some("mid-task"));
+    }
+
+    #[test]
+    fn new_defaults_to_tmux_host_without_pid() {
+        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        assert_eq!(session.origin, SessionHost::Tmux);
+        assert_eq!(session.pid, None);
+    }
+
+    #[test]
+    fn native_host_state_survives_json_roundtrip() {
+        let mut session = Session::new(SessionId::new(), "/work/proj", ControlModel::Pty);
+        session.origin = SessionHost::Native;
+        session.pid = Some(4242);
+        let json = serde_json::to_string(&session).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin, SessionHost::Native);
+        assert_eq!(back.pid, Some(4242));
+    }
+
+    #[test]
+    fn session_host_label_is_lowercase_in_json() {
+        // The wire form must be a stable lowercase token the dashboard keys on.
+        assert_eq!(
+            serde_json::to_string(&SessionHost::Native).unwrap(),
+            "\"native\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionHost::Tmux).unwrap(),
+            "\"tmux\"",
+        );
+    }
+
+    #[test]
+    fn legacy_session_json_without_origin_defaults_to_tmux() {
+        // Sessions persisted before the `origin`/`pid` fields existed must still
+        // deserialize, defaulting to a tmux host.
+        let legacy = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "workdir": "/tmp/p",
+            "status": "Active",
+            "control": "Tmux",
+            "active_delegations": 0
+        }"#;
+        let back: Session = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.origin, SessionHost::Tmux);
+        assert_eq!(back.pid, None);
     }
 
     #[test]

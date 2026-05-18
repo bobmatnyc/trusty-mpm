@@ -273,15 +273,16 @@ pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<ReapRe
     })
 }
 
-/// `POST /sessions/discover` — auto-discover tmux sessions running Claude Code.
+/// `POST /sessions/discover` — auto-discover Claude Code sessions.
 ///
 /// Why: `GET /sessions` only reports daemon-managed sessions; operators run
-/// `claude` / `claude-code` / `claude-mpm` / `tm` in tmux panes the daemon never
-/// created. This endpoint scans every pane and registers the ones running
-/// Claude Code so they appear in the dashboard and the Telegram bot.
-/// What: runs [`crate::discovery::discover_claude_sessions`] and returns
-/// `{ "discovered": <count>, "sessions": [name, ...] }`. tmux being unavailable
-/// yields a zero count rather than an error.
+/// `claude` / `claude-code` / `claude-mpm` / `tm` in tmux panes — and, more
+/// commonly, in native Terminal.app windows — that the daemon never created.
+/// This endpoint scans both and registers the ones running Claude Code so they
+/// appear in the dashboard and the Telegram bot.
+/// What: runs [`crate::discovery::discover_all`] (tmux panes plus native `ps`
+/// processes) and returns `{ "discovered": <count>, "sessions": [name, ...] }`.
+/// A missing tmux or `ps` yields a zero count rather than an error.
 /// Test: `discover_sessions_returns_count` in `api_tests.rs`.
 #[utoipa::path(
     post,
@@ -290,7 +291,7 @@ pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<ReapRe
     responses((status = 200, description = "tmux sessions running Claude Code, newly registered"))
 )]
 pub async fn discover_sessions(State(state): State<Arc<DaemonState>>) -> Json<DiscoverResponse> {
-    let result = crate::discovery::discover_claude_sessions(&state);
+    let result = crate::discovery::discover_all(&state);
     Json(DiscoverResponse {
         discovered: result.adopted,
         sessions: result.sessions,

@@ -61,11 +61,12 @@ pub enum TelegramCommand {
     #[command(description = "Kill a session")]
     Kill(String),
     /// Send a prompt to a Claude Code session — `/send <session> <prompt>`.
-    ///
-    /// The whole argument tail is captured as one string; the first whitespace-
-    /// separated token is the session, the remainder is the prompt (so a
-    /// multi-word prompt is preserved).
-    #[command(description = "Send a prompt to a Claude Code session")]
+    // The whole argument tail is captured as one string; the first whitespace-
+    // separated token is the session, the remainder is the prompt (so a
+    // multi-word prompt is preserved). A plain `//` comment keeps this note out
+    // of the teloxide-generated command description, which Telegram caps at 256
+    // characters.
+    #[command(description = "Send a prompt to a session")]
     Send(String),
     /// Show alert subscriptions.
     #[command(description = "Show alert subscriptions")]
@@ -201,6 +202,27 @@ mod tests {
         assert!(descriptions.iter().any(|c| c.command == "/adopt"));
         assert!(descriptions.iter().any(|c| c.command == "/send"));
         assert!(descriptions.iter().any(|c| c.command == "/discover"));
+    }
+
+    #[test]
+    fn bot_command_descriptions_fit_telegram_limits() {
+        // Telegram rejects `set_my_commands` if any command name exceeds 32
+        // characters or any description exceeds 256. teloxide concatenates the
+        // doc comment with the `description` attribute, so this guards against
+        // a long doc comment silently re-introducing the startup crash.
+        for cmd in TelegramCommand::bot_commands() {
+            let name = cmd.command.trim_start_matches('/');
+            assert!(
+                (1..=32).contains(&name.chars().count()),
+                "command `{name}` name length out of Telegram's 1..=32 range",
+            );
+            assert!(
+                (3..=256).contains(&cmd.description.chars().count()),
+                "command `{}` description length {} out of Telegram's 3..=256 range",
+                cmd.command,
+                cmd.description.chars().count(),
+            );
+        }
     }
 
     #[test]
