@@ -822,6 +822,63 @@ impl DaemonClient {
         let body: PairStatus = self.http.get(&url).send().await?.json().await?;
         Ok(body)
     }
+
+    /// Launch a fresh claude-mpm session in `workdir`.
+    ///
+    /// Why: the TUI's `/connect <dir>` command is the single entry point for
+    /// "connect to or launch a session for a project" — when no session exists
+    /// for a directory it must start one, mirroring `tm session start`.
+    /// What: POSTs `{workdir, project_path}` to `/sessions`, then creates a
+    /// detached tmux session via `tmux new-session` and starts `claude-mpm` in
+    /// it via `tmux send-keys`. Returns the daemon-assigned tmux session name.
+    /// The daemon only registers session state; the launch (tmux + process) is
+    /// owned by the client, exactly as the CLI does it.
+    /// Test: `launch_session_errors_when_daemon_unreachable`.
+    pub async fn launch_session(&self, workdir: &str) -> anyhow::Result<String> {
+        #[derive(Deserialize)]
+        struct Body {
+            #[serde(default)]
+            name: String,
+        }
+        let url = format!("{}/sessions", self.base);
+        let body: Body = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "workdir": workdir,
+                "project_path": workdir,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let new_session = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &body.name, "-c", workdir])
+            .status();
+        match new_session {
+            Ok(status) if status.success() => {
+                let send = std::process::Command::new("tmux")
+                    .args(["send-keys", "-t", &body.name, "claude-mpm", "Enter"])
+                    .status();
+                if !matches!(send, Ok(s) if s.success()) {
+                    return Err(anyhow::anyhow!(
+                        "tmux session {} created but failed to start claude-mpm",
+                        body.name
+                    ));
+                }
+            }
+            Ok(_) | Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "failed to create tmux session {} in {}",
+                    body.name,
+                    workdir
+                ));
+            }
+        }
+        Ok(body.name)
+    }
 }
 
 /// Render a tmux snapshot JSON value as a flat text block.
@@ -864,6 +921,16 @@ mod tests {
         let mut client = DaemonClient::new("http://127.0.0.1:7880");
         client.set_base_url("http://127.0.0.1:54321");
         assert_eq!(client.base_url(), "http://127.0.0.1:54321");
+    }
+
+    #[tokio::test]
+    async fn launch_session_errors_when_daemon_unreachable() {
+        // Why: `/connect <dir>` launches via `launch_session`; when the daemon
+        // POST fails (port 0 never connects) the error must surface rather than
+        // proceeding to spawn tmux against an unregistered session.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let result = client.launch_session("/tmp/no-such-project").await;
+        assert!(result.is_err(), "expected launch to fail with no daemon");
     }
 
     #[test]

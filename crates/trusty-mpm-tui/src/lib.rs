@@ -508,10 +508,21 @@ async fn dispatch_command(state: &mut DashboardState, client: &DaemonClient, typ
         }
         "connect" => {
             if arg.is_empty() {
-                vec!["connect: usage: /connect <session-id-or-name>".to_string()]
+                vec!["connect: usage: /connect <id|dir>".to_string()]
             } else {
-                let msg = state.resolve_connect(&arg);
-                vec![msg]
+                match state.connect_action(&arg) {
+                    dashboard::ConnectAction::Resolved(msg) => vec![msg],
+                    // A directory with no existing session — launch one. The
+                    // daemon registers state; this client owns the tmux launch.
+                    dashboard::ConnectAction::Launch(dir) => {
+                        match client.launch_session(&dir).await {
+                            Ok(name) => {
+                                vec![format!("Launched claude-mpm session {name} in {dir}")]
+                            }
+                            Err(e) => vec![format!("connect: launch failed: {e}")],
+                        }
+                    }
+                }
             }
         }
         "chat" => {

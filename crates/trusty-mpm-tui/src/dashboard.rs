@@ -449,8 +449,49 @@ impl DashboardState {
     /// Test: `resolve_connect_found`, `resolve_connect_not_found`,
     /// `resolve_connect_ambiguous`.
     pub fn resolve_connect(&mut self, target: &str) -> String {
+        match self.connect_action(target) {
+            ConnectAction::Resolved(msg) => msg,
+            // A launch target with no matching session can't be handled
+            // synchronously — callers that can't launch report the directory.
+            ConnectAction::Launch(dir) => format!("No session for {dir}"),
+        }
+    }
+
+    /// Classify a `/connect <target>` into a synchronous result or a launch.
+    ///
+    /// Why: `/connect` is the single entry point for "connect to or launch a
+    /// session for a project". A plain id/name resolves immediately, but a
+    /// directory target with no existing session needs an async daemon launch
+    /// that `DashboardState` (sync, no client) cannot perform itself.
+    /// What: if `target` looks like a directory (see [`looks_like_dir`]), it is
+    /// expanded (`~` → `$HOME`) and matched against existing session workdirs;
+    /// a match focuses that session, a miss returns [`ConnectAction::Launch`]
+    /// with the expanded directory. Non-directory targets fall back to the
+    /// fuzzy id/name resolver and always return [`ConnectAction::Resolved`].
+    /// Test: `connect_action_focuses_session_with_matching_workdir`,
+    /// `connect_action_routes_unmatched_dir_to_launch`,
+    /// `connect_action_resolves_fuzzy_name`.
+    pub fn connect_action(&mut self, target: &str) -> ConnectAction {
+        let trimmed = target.trim();
+        if looks_like_dir(trimmed) {
+            let dir = expand_dir(trimmed);
+            // A directory target first tries an existing session by workdir;
+            // canonicalize both sides so `/p/a` and `/p/a/` compare equal.
+            let normalized = normalize_workdir(&dir);
+            if let Some(row) = self
+                .sessions
+                .iter()
+                .find(|s| normalize_workdir(&s.workdir) == normalized)
+            {
+                let id = row.id.0.to_string();
+                self.focus_on(&id);
+                return ConnectAction::Resolved(format!("Connected to {id}"));
+            }
+            return ConnectAction::Launch(dir);
+        }
+
         let summaries = self.session_summaries();
-        match trusty_mpm_core::resolve_target(target, &summaries) {
+        let msg = match trusty_mpm_core::resolve_target(trimmed, &summaries) {
             trusty_mpm_core::ResolveResult::Found(id) => {
                 self.focus_on(&id);
                 format!("Connected to {id}")
@@ -459,7 +500,66 @@ impl DashboardState {
                 format!("Ambiguous: {}", ids.join(", "))
             }
             trusty_mpm_core::ResolveResult::NotFound => "No session matched".to_string(),
-        }
+        };
+        ConnectAction::Resolved(msg)
+    }
+}
+
+/// Outcome of classifying a `/connect <target>` argument.
+///
+/// Why: directory targets without an existing session require an async daemon
+/// launch the sync `DashboardState` cannot perform; the dispatcher needs an
+/// explicit signal to either show a message or run the launch.
+/// What: `Resolved` carries a finished status line; `Launch` carries the
+/// expanded directory the caller should start a claude-mpm session in.
+/// Test: `connect_action_*` tests in this module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectAction {
+    /// The command completed synchronously; the string is the status line.
+    Resolved(String),
+    /// No session matched the directory — launch a new one here.
+    Launch(String),
+}
+
+/// Decide whether a `/connect` argument is a directory path.
+///
+/// Why: `/connect` accepts both session ids/names and directory paths; only
+/// paths route to the launch flow. A simple prefix check disambiguates them.
+/// What: returns `true` when the trimmed target starts with `/` (absolute) or
+/// `~` (home-relative).
+/// Test: `looks_like_dir_detects_paths`.
+fn looks_like_dir(target: &str) -> bool {
+    let t = target.trim();
+    t.starts_with('/') || t.starts_with('~')
+}
+
+/// Expand a `~`-prefixed path against `$HOME`.
+///
+/// Why: operators type `~/project`; the daemon and tmux need an absolute path.
+/// What: replaces a leading `~` with `$HOME` when set; otherwise returns the
+/// input unchanged. Absolute paths pass through untouched.
+/// Test: `expand_dir_expands_tilde`.
+fn expand_dir(target: &str) -> String {
+    let t = target.trim();
+    if let Some(rest) = t.strip_prefix('~')
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}{rest}");
+    }
+    t.to_string()
+}
+
+/// Normalize a workdir string for equality comparison.
+///
+/// Why: a session's stored workdir may or may not carry a trailing slash; the
+/// `/connect <dir>` lookup must treat `/p/a` and `/p/a/` as the same project.
+/// What: trims whitespace and a single trailing `/` (but never the root `/`).
+/// Test: `normalize_workdir_strips_trailing_slash`.
+fn normalize_workdir(dir: &str) -> &str {
+    let t = dir.trim();
+    match t.strip_suffix('/') {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => t,
     }
 }
 
@@ -957,7 +1057,7 @@ pub fn command_help_lines() -> Vec<String> {
         "  /tmux             list tmux sessions (managed + external)".to_string(),
         "  /status           show daemon status".to_string(),
         "  /adopt <name>     adopt a tmux session by name".to_string(),
-        "  /connect <id>     focus a session by fuzzy target".to_string(),
+        "  /connect <id|dir>   focus session by id, or launch claude-mpm in dir".to_string(),
         "  /chat <message>   ask the LLM chat assistant".to_string(),
         "  /send <s> <cmd>   send a prompt to a Claude Code session".to_string(),
         "  /discover         auto-discover tmux sessions running Claude Code".to_string(),
@@ -1823,6 +1923,103 @@ mod tests {
             ..DashboardState::default()
         };
         assert!(state.resolve_connect("feature").starts_with("Ambiguous:"));
+    }
+
+    #[test]
+    fn connect_action_focuses_session_with_matching_workdir() {
+        // A directory target matching an existing session's workdir focuses
+        // that session and reports "Connected to" — no launch.
+        let mut state = DashboardState {
+            sessions: vec![
+                session("aaa", "/p/a", "active", "frontend"),
+                session("bbb", "/p/b", "active", "backend"),
+            ],
+            ..DashboardState::default()
+        };
+        let action = state.connect_action("/p/b");
+        assert_eq!(state.selected_session, 1);
+        assert_eq!(
+            action,
+            ConnectAction::Resolved(format!("Connected to {}", sid("bbb").0))
+        );
+    }
+
+    #[test]
+    fn connect_action_matches_workdir_ignoring_trailing_slash() {
+        // `/connect /p/a/` matches a session stored as `/p/a`.
+        let mut state = DashboardState {
+            sessions: vec![session("aaa", "/p/a", "active", "frontend")],
+            ..DashboardState::default()
+        };
+        let action = state.connect_action("/p/a/");
+        assert!(matches!(action, ConnectAction::Resolved(_)));
+        assert_eq!(state.selected_session, 0);
+    }
+
+    #[test]
+    fn connect_action_routes_unmatched_dir_to_launch() {
+        // An absolute path with no matching session routes to the launch path,
+        // carrying the directory through unchanged.
+        let mut state = DashboardState {
+            sessions: vec![session("aaa", "/p/a", "active", "frontend")],
+            ..DashboardState::default()
+        };
+        assert_eq!(
+            state.connect_action("/some/new/project"),
+            ConnectAction::Launch("/some/new/project".to_string())
+        );
+    }
+
+    #[test]
+    fn connect_action_routes_tilde_dir_to_launch() {
+        // A `~`-prefixed path is treated as a directory; with no session match
+        // it routes to launch with `~` expanded against $HOME.
+        // SAFETY: single-threaded test; no other thread reads HOME concurrently.
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+        let mut state = DashboardState::default();
+        assert_eq!(
+            state.connect_action("~/work/proj"),
+            ConnectAction::Launch("/home/tester/work/proj".to_string())
+        );
+    }
+
+    #[test]
+    fn connect_action_resolves_fuzzy_name() {
+        // A non-directory target still uses the fuzzy id/name resolver.
+        let mut state = DashboardState {
+            sessions: vec![session("aaa", "/p/a", "active", "frontend")],
+            ..DashboardState::default()
+        };
+        let action = state.connect_action("front");
+        assert_eq!(
+            action,
+            ConnectAction::Resolved(format!("Connected to {}", sid("aaa").0))
+        );
+    }
+
+    #[test]
+    fn looks_like_dir_detects_paths() {
+        assert!(looks_like_dir("/abs/path"));
+        assert!(looks_like_dir("~/home/path"));
+        assert!(looks_like_dir("  ~/spaced "));
+        assert!(!looks_like_dir("frontend"));
+        assert!(!looks_like_dir("tmpm-abc"));
+    }
+
+    #[test]
+    fn expand_dir_expands_tilde() {
+        // SAFETY: single-threaded test; no concurrent HOME readers.
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+        assert_eq!(expand_dir("~/proj"), "/home/tester/proj");
+        assert_eq!(expand_dir("~"), "/home/tester");
+        assert_eq!(expand_dir("/abs/path"), "/abs/path");
+    }
+
+    #[test]
+    fn normalize_workdir_strips_trailing_slash() {
+        assert_eq!(normalize_workdir("/p/a/"), "/p/a");
+        assert_eq!(normalize_workdir("/p/a"), "/p/a");
+        assert_eq!(normalize_workdir("/"), "/");
     }
 
     #[test]
