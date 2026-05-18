@@ -107,89 +107,43 @@ pub fn prepare_session(fw: &FrameworkPaths, project_dir: &Path) -> Result<PrepRe
     })
 }
 
-/// Trusty-specific MCP tool-priority instructions appended to every session.
+/// Build the `--append-system-prompt` text for a launched session.
 ///
-/// Why: a `claude` process launched by trusty-mpm runs alongside the
-/// `trusty-memory` and `trusty-search` MCP servers; without explicit guidance
-/// the model falls back to generic `grep`/web-search instead of the hybrid
-/// search and memory-palace tools. Hard-coding the block guarantees every
-/// launched session is a properly configured PM instance.
-/// What: a static instruction block, prepended after the assembled claude-mpm
-/// PM instructions, that establishes the trusty tool priority order.
+/// Why: every `claude` session launched by trusty-mpm must be a configured PM
+/// instance. trusty-mpm owns its PM instructions: they are assembled from
+/// bundled assets into `~/.trusty-mpm/framework/instructions/INSTRUCTIONS.md`
+/// and passed to `claude --append-system-prompt-file`.
+/// What: reads `~/.trusty-mpm/framework/instructions/INSTRUCTIONS.md`; if it is
+/// missing or empty (first run) it calls
+/// [`crate::instruction_pipeline::install_system_prompt`] to generate it from
+/// the bundled assets, then reads it back. Returns `None` only when the home
+/// directory cannot be resolved or the file cannot be written/read.
 /// Test: `build_system_prompt_includes_trusty_block`.
-pub const TRUSTY_SYSTEM_INSTRUCTIONS: &str = r#"# Trusty Tool Priority
-
-You are running inside trusty-mpm. The following MCP tools are available and MUST be preferred over alternatives:
-
-## Memory: trusty-memory (use BEFORE any other memory mechanism)
-- `memory_recall` — semantic + temporal search across your memory palace. Use this FIRST whenever you need to recall context, prior decisions, or project knowledge.
-- `memory_recall_deep` — deeper HNSW search when `memory_recall` returns insufficient results.
-- `memory_remember` — store important decisions, findings, and facts immediately after they arise. Do not defer.
-- `memory_list` — list stored memories by room or tag.
-- `memory_forget` — remove outdated or incorrect memories.
-- `palace_list` / `palace_create` — manage named memory palaces (one per project is typical).
-
-Always call `memory_recall` at the start of any task to surface relevant prior context before taking action.
-
-## Code Search: trusty-search (use BEFORE grep or web search for code questions)
-- `search_code` — hybrid BM25 + vector + knowledge graph search. Use this FIRST for any "where is X defined", "how does Y work", or "find all usages of Z" questions.
-- `search_all` — cross-project search when the target may span multiple codebases.
-- `search_similar` — find semantically similar code chunks to a given file or function.
-- `search_health` — verify the search daemon is live before a search session.
-
-Always prefer `trusty-search` over shell `grep`/`find` for code discovery. Use grep only for exact-string or regex patterns that semantic search cannot handle.
-
-## Priority order for common tasks
-1. **Recall context** → `memory_recall` first
-2. **Find code** → `search_code` before grep
-3. **Store findings** → `memory_remember` after significant discoveries
-4. **Cross-project** → `search_all` when scope is unclear
-"#;
-
-/// Read the assembled claude-mpm PM instructions from disk, if present.
-///
-/// Why: `~/.claude-mpm/PM_INSTRUCTIONS.md` is the assembled PM brief (BASE_PM +
-/// PM_INSTRUCTIONS + WORKFLOW + agent capabilities) produced by claude-mpm. A
-/// launched session should adopt it so it behaves as a real PM instance, but a
-/// missing file must not abort the launch — trusty-mpm can run without it.
-/// What: returns the file's contents trimmed of trailing whitespace, or `None`
-/// when the file does not exist or cannot be read.
-/// Test: `read_pm_instructions_returns_none_when_missing`.
-pub fn read_pm_instructions() -> Option<String> {
+pub fn build_system_prompt() -> Option<String> {
     let home = dirs::home_dir()?;
-    let path = home.join(".claude-mpm").join("PM_INSTRUCTIONS.md");
-    let contents = std::fs::read_to_string(&path).ok()?;
+    let path = home
+        .join(".trusty-mpm")
+        .join("framework")
+        .join("instructions")
+        .join("INSTRUCTIONS.md");
+
+    // Use the on-disk file when it is present and non-empty.
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        let trimmed = contents.trim_end();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // First run (or empty file): generate it from the bundled assets, then
+    // read it back so the launch path always uses the same source of truth.
+    let generated = crate::instruction_pipeline::install_system_prompt().ok()?;
+    let contents = std::fs::read_to_string(&generated).ok()?;
     let trimmed = contents.trim_end();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
-    }
-}
-
-/// Build the combined `--append-system-prompt` text for a launched session.
-///
-/// Why: every `claude` session launched by trusty-mpm must be a configured PM
-/// instance — that means the claude-mpm PM instructions (when available) plus
-/// the trusty tool-priority block. Combining them in one place keeps the CLI
-/// and client launch paths from drifting.
-/// What: concatenates [`read_pm_instructions`] (if any) and
-/// [`TRUSTY_SYSTEM_INSTRUCTIONS`], separated by a blank line; returns `None`
-/// only when both parts are empty (never happens while the constant is set).
-/// Test: `build_system_prompt_includes_trusty_block`.
-pub fn build_system_prompt() -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(pm) = read_pm_instructions() {
-        parts.push(pm);
-    }
-    let trusty = TRUSTY_SYSTEM_INSTRUCTIONS.trim();
-    if !trusty.is_empty() {
-        parts.push(trusty.to_string());
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n\n"))
     }
 }
 
@@ -200,21 +154,16 @@ mod tests {
 
     #[test]
     fn build_system_prompt_includes_trusty_block() {
-        // Why: regardless of whether the PM instructions file exists, the
-        // trusty tool-priority block must always be present so a launched
+        // Why: `build_system_prompt` must always yield a prompt — generating
+        // `INSTRUCTIONS.md` from the bundled assets on first run — and that
+        // prompt must include the trusty tool-priority block so a launched
         // session knows to prefer `memory_recall` and `search_code`.
         let prompt = build_system_prompt().expect("trusty block is always present");
         assert!(prompt.contains("# Trusty Tool Priority"));
         assert!(prompt.contains("memory_recall"));
         assert!(prompt.contains("search_code"));
-    }
-
-    #[test]
-    fn read_pm_instructions_returns_none_when_missing() {
-        // Why: a missing `~/.claude-mpm/PM_INSTRUCTIONS.md` must not abort a
-        // launch; the reader degrades gracefully to `None`. This asserts the
-        // function returns a well-typed Option rather than panicking.
-        let _ = read_pm_instructions();
+        // The bundled PM instructions are also part of the assembled prompt.
+        assert!(prompt.contains("# PM Agent -- Claude MPM"));
     }
 
     #[test]

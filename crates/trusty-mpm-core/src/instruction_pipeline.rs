@@ -19,6 +19,65 @@ use crate::delegation_authority::{generate_authority, scan_agents};
 /// Separator placed between the three merged instruction sections.
 const SECTION_SEPARATOR: &str = "\n\n---\n\n";
 
+// ---------------------------------------------------------------------------
+// Bundled system-prompt assembly
+//
+// Why: trusty-mpm must own its own PM instructions rather than reading from a
+// `~/.claude-mpm/` install at runtime. The five source assets below are
+// embedded at compile time and assembled into a single `INSTRUCTIONS.md` that
+// is passed to `claude --append-system-prompt-file` on every session launch.
+// ---------------------------------------------------------------------------
+
+/// Token-optimized PM orchestration instructions (bundled at compile time).
+const PM_INSTRUCTIONS: &str = include_str!("../assets/instructions/PM_INSTRUCTIONS.md");
+/// Non-overridable BASE_PM framework floor (bundled at compile time).
+const BASE_PM: &str = include_str!("../assets/instructions/BASE_PM.md");
+/// 5-phase workflow execution details (bundled at compile time).
+const WORKFLOW: &str = include_str!("../assets/instructions/WORKFLOW.md");
+/// Agent delegation routing table (bundled at compile time).
+const AGENT_DELEGATION: &str = include_str!("../assets/instructions/AGENT_DELEGATION.md");
+/// Trusty MCP tool-priority block (bundled at compile time).
+const TRUSTY_TOOL_PRIORITY: &str = include_str!("../assets/instructions/TRUSTY_TOOL_PRIORITY.md");
+
+/// Assemble the full system prompt from bundled source components.
+///
+/// Why: a launched `claude` session must receive identical, version-controlled
+/// PM instructions every time; embedding the sources and joining them here
+/// removes any dependency on an external `~/.claude-mpm/` install.
+/// What: concatenates the five bundled assets in the fixed order
+/// PM_INSTRUCTIONS → BASE_PM → WORKFLOW → AGENT_DELEGATION → TRUSTY_TOOL_PRIORITY,
+/// separated by a `---` rule.
+/// Test: `assemble_system_prompt_contains_all_sections`.
+pub fn assemble_system_prompt() -> String {
+    [
+        PM_INSTRUCTIONS,
+        BASE_PM,
+        WORKFLOW,
+        AGENT_DELEGATION,
+        TRUSTY_TOOL_PRIORITY,
+    ]
+    .join("\n\n---\n\n")
+}
+
+/// Write the assembled system prompt to the trusty-mpm framework directory.
+///
+/// Why: `tm launch` passes `~/.trusty-mpm/framework/instructions/INSTRUCTIONS.md`
+/// to `claude --append-system-prompt-file`; this regenerates that file from the
+/// bundled assets so it always reflects the current trusty-mpm build.
+/// What: creates `~/.trusty-mpm/framework/instructions/` if needed and writes
+/// the output of [`assemble_system_prompt`] to `INSTRUCTIONS.md`, returning the
+/// path it wrote.
+/// Test: `install_system_prompt_writes_file`.
+pub fn install_system_prompt() -> std::io::Result<std::path::PathBuf> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir"))?;
+    let out_dir = home.join(".trusty-mpm/framework/instructions");
+    std::fs::create_dir_all(&out_dir)?;
+    let out_path = out_dir.join("INSTRUCTIONS.md");
+    std::fs::write(&out_path, assemble_system_prompt())?;
+    Ok(out_path)
+}
+
 /// The CLAUDE.md stub seeded into a project on first session start.
 ///
 /// Why: the project needs a place for project-specific notes; trusty-mpm
@@ -319,6 +378,35 @@ mod tests {
         let on_disk = fs::read_to_string(&input.claude_md_path).unwrap();
         assert_eq!(on_disk, custom, "custom CLAUDE.md must be untouched");
         assert!(out.merged.contains("CUSTOM HAND-WRITTEN CONTENT"));
+    }
+
+    #[test]
+    fn assemble_system_prompt_contains_all_sections() {
+        // Why: the assembled prompt is the contract `claude` receives; every
+        // bundled section must be present and joined with the `---` rule.
+        let prompt = assemble_system_prompt();
+        assert!(prompt.contains("# PM Agent -- Claude MPM"));
+        assert!(prompt.contains("# BASE_PM Framework Floor"));
+        assert!(prompt.contains("# PM Workflow Configuration"));
+        assert!(prompt.contains("# Agent Delegation Routing"));
+        assert!(prompt.contains("# Trusty Tool Priority"));
+        assert!(prompt.contains("\n\n---\n\n"));
+        // Ticketing-specific content was stripped from the bundled assets.
+        assert!(!prompt.contains("mcp__mcp-ticketer__"));
+        assert!(!prompt.contains("ticketing_agent"));
+    }
+
+    #[test]
+    fn install_system_prompt_writes_file() {
+        // Why: `tm launch` depends on `install_system_prompt` regenerating
+        // INSTRUCTIONS.md; this asserts it writes a non-empty file under the
+        // expected `~/.trusty-mpm/framework/instructions/` path.
+        let out = install_system_prompt().expect("install succeeds");
+        assert!(out.ends_with("INSTRUCTIONS.md"));
+        assert!(out.exists());
+        let on_disk = fs::read_to_string(&out).unwrap();
+        assert_eq!(on_disk, assemble_system_prompt());
+        assert!(!on_disk.is_empty());
     }
 
     #[test]

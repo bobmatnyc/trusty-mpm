@@ -1082,9 +1082,20 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
         }
     };
 
-    // 4. Build the combined `--append-system-prompt` text and write it to a
-    //    temp file so `claude` reads it at startup. The file path (when
-    //    written) is surfaced in the banner.
+    // 4. Regenerate `~/.trusty-mpm/framework/instructions/INSTRUCTIONS.md` from
+    //    the bundled assets so the on-disk system prompt always reflects the
+    //    current trusty-mpm build. A failure is logged but not fatal —
+    //    `build_system_prompt` regenerates lazily if the file is missing.
+    let instructions_path = match trusty_mpm_core::instruction_pipeline::install_system_prompt() {
+        Ok(path) => Some(path),
+        Err(err) => {
+            eprintln!("warning: failed to install system prompt: {err}");
+            None
+        }
+    };
+
+    // Build the `--append-system-prompt` text (read from the file installed
+    // above) and write it to a temp file so `claude` reads it at startup.
     let (claude_cmd, prompt_path) = match trusty_mpm_core::session_launch::build_system_prompt() {
         Some(prompt) => {
             let file = std::env::temp_dir().join(format!(
@@ -1105,8 +1116,14 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
         None => ("claude".to_string(), None),
     };
 
-    // 5. Print the summary banner.
-    print_launch_banner(&workdir, &tmux_name, prompt_path.as_deref());
+    // 5. Print the summary banner. The "Prompt:" line shows the canonical
+    //    `~/.trusty-mpm/framework/instructions/INSTRUCTIONS.md` source path
+    //    when it was installed, not the per-session temp copy.
+    print_launch_banner(
+        &workdir,
+        &tmux_name,
+        instructions_path.as_deref().or(prompt_path.as_deref()),
+    );
     println!("Launching claude...");
 
     // 6. Create a detached tmux session in the project directory.
