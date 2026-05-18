@@ -2034,6 +2034,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires bundled framework artifacts (base-agent) — run locally after tm install"]
     fn install_then_deploy_composes_agents() {
         // Installing the bundled agent sources and then deploying them must
         // produce composed, inheritance-flattened files in `.claude/agents/`.
