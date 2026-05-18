@@ -65,4 +65,6 @@ jobs:
           sleep 30
           cargo publish -p trusty-mpm-telegram --no-verify
           sleep 30
-          cargo publish -p trusty-mpm-cli --no-verify
+          # --no-default-features drops the optional `gui` dep: trusty-mpm-gui
+          # is a path-only Tauri crate and is not published to crates.io.
+          cargo publish -p trusty-mpm-cli --no-verify --no-default-features

@@ -350,8 +350,17 @@ async fn main() -> anyhow::Result<()> {
             trusty_mpm_tui::run(resolved, interval_ms).await
         }
         Command::Gui => {
-            trusty_mpm_gui::run();
-            Ok(())
+            #[cfg(feature = "gui")]
+            {
+                trusty_mpm_gui::run();
+                Ok(())
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                anyhow::bail!(
+                    "this build was compiled without GUI support (the `gui` feature is disabled)"
+                )
+            }
         }
         Command::Telegram { cmd } => telegram(&cli.url, cmd).await,
         Command::Install { force } => install(force),

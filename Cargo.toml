@@ -31,8 +31,8 @@ trusty-mpm-client = { path = "crates/trusty-mpm-client" }
 # trusty-mcp-core gives us JSON-RPC 2.0 / MCP envelopes + the stdio loop;
 # trusty-common provides shared utilities. Path deps keep trusty-mpm building
 # against local trusty-common changes without a publish cycle.
-trusty-common = { path = "../trusty-common/crates/trusty-common" }
-trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+trusty-common = { path = "../trusty-common/crates/trusty-common", version = "0.3" }
+trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core", version = "0.1" }
 
 # Async runtime / HTTP
 tokio = { version = "1", features = ["full"] }

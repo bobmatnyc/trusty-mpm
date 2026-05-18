@@ -30,15 +30,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: trusty-mpm
+      # trusty-mpm-gui is a Tauri desktop app; it pulls in glib-sys/gobject-sys
+      # which need GTK native libs absent on CI runners. Exclude it from the
+      # build, and disable the CLI's default `gui` feature so the GUI crate is
+      # not pulled in transitively. Nothing GUI-related runs headlessly anyway.
       - name: Build
         working-directory: trusty-mpm
-        run: cargo build --workspace
+        run: cargo build --workspace --exclude trusty-mpm-gui --no-default-features
       - name: Test
         working-directory: trusty-mpm
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude trusty-mpm-gui --no-default-features
       - name: Clippy
         working-directory: trusty-mpm
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude trusty-mpm-gui --no-default-features --all-targets -- -D warnings
       - name: Fmt
         working-directory: trusty-mpm
         run: cargo fmt --check
@@ -60,4 +64,4 @@ jobs:
           workspaces: trusty-mpm
       - name: cargo check
         working-directory: trusty-mpm
-        run: cargo check --workspace
+        run: cargo check --workspace --exclude trusty-mpm-gui
