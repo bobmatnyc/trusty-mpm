@@ -1051,7 +1051,6 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
         && tmux_has_session(&existing)
     {
         print_launch_banner_reconnecting(&workdir, &existing);
-        println!("Reconnecting to existing session...");
         let status = std::process::Command::new("tmux")
             .args(["attach-session", "-t", &existing])
             .status()?;
@@ -1144,7 +1143,6 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
         &tmux_name,
         instructions_path.as_deref().or(prompt_path.as_deref()),
     );
-    println!("Launching claude...");
 
     // 6. Create a detached tmux session in the project directory.
     let new_session = std::process::Command::new("tmux")
@@ -1184,52 +1182,164 @@ fn fallback_session_name() -> String {
     trusty_mpm_core::names::name_from_uuid(&trusty_mpm_core::session::SessionId::new().0)
 }
 
-/// Print the `tm launch` summary banner using unicode box-drawing characters.
-///
-/// Why: `tm launch` should give the operator an at-a-glance summary of what was
-/// configured before the terminal is taken over by `claude`.
-/// What: prints a fixed-width (53-char interior) box with version, project,
-/// session, memory, search, and prompt fields. Memory/search detection probes
-/// for config directories and binaries on `PATH`.
-/// Test: `launch_banner_does_not_panic`.
-fn print_launch_banner(workdir: &str, tmux_name: &str, prompt_path: Option<&std::path::Path>) {
-    /// Interior width of the banner box, in characters.
-    const WIDTH: usize = 53;
+/// Left indent applied to every line of the full-screen launch banner.
+const BANNER_INDENT: &str = "   ";
 
-    // Render one banner row, truncating then padding `content` to `WIDTH`.
-    let row = |content: String| {
-        let mut text = content;
-        if text.chars().count() > WIDTH {
-            text = text.chars().take(WIDTH).collect();
+/// Width of the session-info separator line drawn in the launch banner.
+const BANNER_SEPARATOR_WIDTH: usize = 53;
+
+/// The ASCII-art robot mascot drawn at the top of the launch banner.
+///
+/// Why: a recognizable centerpiece gives `tm launch` the same "the tool has
+/// taken over the terminal" feel as claude-mpm's startup screen.
+/// What: a multi-line string-art robot; each line is printed verbatim with the
+/// shared [`BANNER_INDENT`].
+const BANNER_ROBOT: &[&str] = &[
+    "          .-------.",
+    "         / .-----. \\",
+    "        / /       \\ \\",
+    "        | |  o   o | |",
+    "        | |    ‿   | |",
+    "         \\ \\ \\___/ / /",
+    "     _    '-'-----'-'    _",
+    "    | |___________________| |",
+    "    |_______________________|",
+    "           |       |",
+    "          [|]     [|]",
+];
+
+/// The block-character "TRUSTY" wordmark drawn below the robot.
+///
+/// Why: a large title makes the banner read as a deliberate splash screen
+/// rather than a stray log line.
+/// What: six rows of unicode block-drawing glyphs plus a spaced-out subtitle.
+const BANNER_TITLE: &[&str] = &[
+    "████████╗██████╗ ██╗   ██╗███████╗████████╗██╗   ██╗",
+    "╚══██╔══╝██╔══██╗██║   ██║██╔════╝╚══██╔══╝╚██╗ ██╔╝",
+    "   ██║   ██████╔╝██║   ██║███████╗   ██║    ╚████╔╝ ",
+    "   ██║   ██╔══██╗██║   ██║╚════██║   ██║     ╚██╔╝  ",
+    "   ██║   ██║  ██║╚██████╔╝███████║   ██║      ██║   ",
+    "   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝      ╚═╝   ",
+    "             M U L T I - A G E N T   P M",
+];
+
+/// Query the terminal width in columns, falling back to 80 when unknown.
+///
+/// Why: the launch banner clears the screen and the caller may want the width
+/// for future centering; a robust width probe avoids panics on pipes/CI.
+/// What: issues a `TIOCGWINSZ` ioctl on stdout, then falls back to the
+/// `$COLUMNS` environment variable, then to a hard-coded 80.
+/// Test: `terminal_width_is_positive` asserts the result is always > 0.
+fn terminal_width() -> usize {
+    // SAFETY: `winsize` is a plain-old-data struct; `ioctl` only writes into it
+    // and we check the return code before reading the result.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &raw mut ws) == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
         }
-        let pad = WIDTH - text.chars().count();
-        println!("│{text}{}│", " ".repeat(pad));
-    };
+    }
+    if let Ok(cols) = std::env::var("COLUMNS")
+        && let Ok(n) = cols.parse::<usize>()
+        && n > 0
+    {
+        return n;
+    }
+    80
+}
+
+/// Render the full-screen `tm launch` banner into a single string.
+///
+/// Why: keeping the banner pure (string in, string out) makes it trivially
+/// testable and lets [`print_launch_banner`] stay a thin print wrapper.
+/// What: builds the cleared-screen escape sequence, the ASCII robot, the
+/// "TRUSTY" wordmark, and an indented session-info block. When
+/// `reconnect_session` is `Some`, a `Status:` row is added and the closing
+/// action line reads "Reconnecting..." instead of "Launching claude...".
+/// Test: `launch_banner_contains_session_fields`,
+/// `launch_banner_marks_reconnect`.
+fn render_launch_banner(
+    workdir: &str,
+    tmux_name: &str,
+    prompt_path: Option<&std::path::Path>,
+    reconnect_session: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    // Clear the screen and home the cursor so the banner owns the terminal.
+    out.push_str("\x1B[2J\x1B[1;1H");
+
+    out.push('\n');
+    for line in BANNER_ROBOT {
+        out.push_str(BANNER_INDENT);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    for line in BANNER_TITLE {
+        out.push_str(BANNER_INDENT);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+
+    let separator = "─".repeat(BANNER_SEPARATOR_WIDTH);
+    let field =
+        |label: &str, value: &str| -> String { format!("{BANNER_INDENT}{label:<9}:  {value}\n") };
 
     let memory = detect_memory();
     let search = detect_tool("trusty-search");
     let prompt = match prompt_path {
-        Some(p) => format!("{} (loaded)", p.display()),
+        Some(p) => p.display().to_string(),
         None => "(default)".to_string(),
     };
 
-    let version = env!("CARGO_PKG_VERSION");
-    let header = "  trusty-mpm";
-    // Right-align the version within the interior width.
-    let version_field = format!("v{version}");
-    let header_pad = WIDTH
-        .saturating_sub(header.chars().count())
-        .saturating_sub(version_field.chars().count())
-        .saturating_sub(2);
+    out.push_str(BANNER_INDENT);
+    out.push_str(&separator);
+    out.push('\n');
+    out.push_str(&field("Project", workdir));
+    out.push_str(&field("Session", tmux_name));
+    if let Some(session) = reconnect_session {
+        out.push_str(&field(
+            "Status",
+            &format!("↩  reconnecting to existing session ({session})"),
+        ));
+    } else {
+        out.push_str(&field("Memory", &format!("{memory}  ✓")));
+        out.push_str(&field("Search", &format!("{search}  ✓")));
+        out.push_str(&field("Prompt", &prompt));
+    }
+    out.push_str(BANNER_INDENT);
+    out.push_str(&separator);
+    out.push('\n');
+    out.push('\n');
 
-    println!("┌{}┐", "─".repeat(WIDTH));
-    println!("│{header}{}{version_field}  │", " ".repeat(header_pad));
-    row(format!("  Project:  {workdir}"));
-    row(format!("  Session:  {tmux_name}"));
-    row(format!("  Memory:   {memory}"));
-    row(format!("  Search:   {search}"));
-    row(format!("  Prompt:   {prompt}"));
-    println!("└{}┘", "─".repeat(WIDTH));
+    let action = if reconnect_session.is_some() {
+        "Reconnecting..."
+    } else {
+        "Launching claude..."
+    };
+    out.push_str(BANNER_INDENT);
+    out.push_str(action);
+    out.push('\n');
+    out
+}
+
+/// Print the full-screen `tm launch` banner, then pause briefly.
+///
+/// Why: `tm launch` should give the operator a readable splash screen before
+/// the terminal is taken over by `claude`/`tmux`.
+/// What: clears the screen, prints the ASCII robot, the "TRUSTY" wordmark, and
+/// the indented session-info block, queries the terminal width once (kept for
+/// future centering), then sleeps one second so the banner is legible.
+/// Test: `launch_banner_does_not_panic`.
+fn print_launch_banner(workdir: &str, tmux_name: &str, prompt_path: Option<&std::path::Path>) {
+    let _ = terminal_width();
+    print!(
+        "{}",
+        render_launch_banner(workdir, tmux_name, prompt_path, None)
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::thread::sleep(std::time::Duration::from_secs(1));
 }
 
 /// Find a live session whose `workdir` matches `workdir` via `GET /sessions`.
@@ -1296,40 +1406,22 @@ fn tmux_has_session(name: &str) -> bool {
     )
 }
 
-/// Print the `tm launch` banner with a "reconnecting" status line.
+/// Print the full-screen `tm launch` banner with a "reconnecting" status line.
 ///
 /// Why: when `tm launch` attaches to a pre-existing session the operator should
 /// see that no new session was created.
-/// What: prints the same fixed-width box as `print_launch_banner` but with a
-/// `Status:` row noting the reconnect instead of the memory/search/prompt rows.
+/// What: prints the same full-screen banner as [`print_launch_banner`] but with
+/// a `Status:` row noting the reconnect, then pauses one second so the banner
+/// is legible before `tmux` takes over.
 /// Test: `launch_reconnect_banner_does_not_panic`.
 fn print_launch_banner_reconnecting(workdir: &str, tmux_name: &str) {
-    /// Interior width of the banner box, in characters.
-    const WIDTH: usize = 53;
-
-    let row = |content: String| {
-        let mut text = content;
-        if text.chars().count() > WIDTH {
-            text = text.chars().take(WIDTH).collect();
-        }
-        let pad = WIDTH - text.chars().count();
-        println!("│{text}{}│", " ".repeat(pad));
-    };
-
-    let version = env!("CARGO_PKG_VERSION");
-    let header = "  trusty-mpm";
-    let version_field = format!("v{version}");
-    let header_pad = WIDTH
-        .saturating_sub(header.chars().count())
-        .saturating_sub(version_field.chars().count())
-        .saturating_sub(2);
-
-    println!("┌{}┐", "─".repeat(WIDTH));
-    println!("│{header}{}{version_field}  │", " ".repeat(header_pad));
-    row(format!("  Project:  {workdir}"));
-    row(format!("  Session:  {tmux_name}"));
-    row("  Status:   reconnecting to existing session".to_string());
-    println!("└{}┘", "─".repeat(WIDTH));
+    let _ = terminal_width();
+    print!(
+        "{}",
+        render_launch_banner(workdir, tmux_name, None, Some(tmux_name))
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::thread::sleep(std::time::Duration::from_secs(1));
 }
 
 /// Detect whether the `trusty-memory` MCP integration is available.
@@ -2218,9 +2310,53 @@ mod tests {
 
     #[test]
     fn launch_reconnect_banner_does_not_panic() {
-        // Why: the reconnect banner does the same width math as the launch
-        // banner; exercise it to catch arithmetic underflow regressions.
+        // Why: the reconnect banner shares the render path with the launch
+        // banner; exercise it to catch formatting regressions.
         print_launch_banner_reconnecting("/Users/test/project", "tmpm-quiet-falcon");
+    }
+
+    #[test]
+    fn terminal_width_is_positive() {
+        // Why: callers use the width for layout; a zero or absurd value would
+        // break formatting. The probe must always yield a usable column count.
+        assert!(terminal_width() > 0);
+    }
+
+    #[test]
+    fn launch_banner_contains_session_fields() {
+        // Why: the banner is the operator's only summary of what was wired up;
+        // the project, session, and prompt fields must all appear, the screen
+        // must be cleared, and the launch action line must be present.
+        let banner = render_launch_banner(
+            "/Users/test/project",
+            "tmpm-quiet-falcon",
+            Some(std::path::Path::new("/tmp/INSTRUCTIONS.md")),
+            None,
+        );
+        assert!(banner.starts_with("\x1B[2J\x1B[1;1H"), "screen not cleared");
+        assert!(banner.contains("/Users/test/project"));
+        assert!(banner.contains("tmpm-quiet-falcon"));
+        assert!(banner.contains("/tmp/INSTRUCTIONS.md"));
+        assert!(banner.contains("Launching claude..."));
+        assert!(banner.contains("TRUSTY") || banner.contains("M U L T I"));
+    }
+
+    #[test]
+    fn launch_banner_marks_reconnect() {
+        // Why: a reconnecting launch must not claim it started a new session;
+        // the banner must show a Status row and the "Reconnecting..." action.
+        let banner = render_launch_banner(
+            "/Users/test/project",
+            "tmpm-quiet-falcon",
+            None,
+            Some("tmpm-quiet-falcon"),
+        );
+        assert!(banner.contains("reconnecting to existing session"));
+        assert!(banner.contains("Reconnecting..."));
+        assert!(
+            !banner.contains("Launching claude..."),
+            "reconnect banner must not claim a fresh launch"
+        );
     }
 
     #[test]
