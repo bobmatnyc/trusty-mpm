@@ -40,6 +40,8 @@ enum Command {
     Status,
     /// Start the daemon if not running, or show status if already running.
     Start,
+    /// Stop the running daemon and start a fresh one.
+    Restart,
     /// Define and manage projects (registered working directories).
     Project {
         /// Project action to perform.
@@ -342,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Status => status(&client, &cli.url).await,
         Command::Start => start(&client, &cli.url).await,
+        Command::Restart => restart(&client, &cli.url).await,
         Command::Project { action } => project(&client, &cli.url, action).await,
         Command::Session { action } => session(&client, &cli.url, action).await,
         Command::Events => events(&client, &cli.url).await,
@@ -1321,6 +1324,32 @@ async fn daemon_healthy(client: &reqwest::Client, url: &str) -> bool {
 /// for up to 5 seconds, then prints "Starting daemon... done" and the status.
 /// Test: `cli_parses_start` covers parsing; the spawn/wait path is exercised by
 /// running `tm start` against a clean environment.
+async fn restart(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
+    if daemon_healthy(client, url).await {
+        print!("Stopping daemon... ");
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
+        // Kill any running tm/trusty-mpm daemon processes.
+        std::process::Command::new("pkill")
+            .args(["-f", "tm daemon"])
+            .status()
+            .ok();
+        std::process::Command::new("pkill")
+            .args(["-f", "trusty-mpm daemon"])
+            .status()
+            .ok();
+        // Wait until the port is free (up to 3 s).
+        for _ in 0..6 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if !daemon_healthy(client, url).await {
+                break;
+            }
+        }
+        println!("done");
+    }
+    start(client, url).await
+}
+
 async fn start(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     if daemon_healthy(client, url).await {
         println!("Daemon already running on :7880");
