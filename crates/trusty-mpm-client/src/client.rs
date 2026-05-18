@@ -870,13 +870,36 @@ impl DaemonClient {
             .json()
             .await?;
 
+        // Build the combined `--append-system-prompt` text (claude-mpm PM
+        // instructions + trusty tool-priority block). When present, write it to
+        // a temp file and pass it via `--system-prompt-file` so every launched
+        // `claude` is a properly configured PM instance. The temp file persists
+        // because `claude` reads it at startup; it lives in `/tmp` and is
+        // superseded by the next launch — no explicit cleanup is performed.
+        let claude_cmd = match trusty_mpm_core::session_launch::build_system_prompt() {
+            Some(prompt) => {
+                let path = std::env::temp_dir().join(format!(
+                    "trusty-mpm-system-prompt-{}.txt",
+                    uuid::Uuid::new_v4()
+                ));
+                match std::fs::write(&path, &prompt) {
+                    Ok(()) => format!("claude --system-prompt-file {}", path.display()),
+                    Err(err) => {
+                        tracing::warn!(%err, "failed to write system prompt file; launching bare claude");
+                        "claude".to_string()
+                    }
+                }
+            }
+            None => "claude".to_string(),
+        };
+
         let new_session = std::process::Command::new("tmux")
             .args(["new-session", "-d", "-s", &body.name, "-c", workdir])
             .status();
         match new_session {
             Ok(status) if status.success() => {
                 let send = std::process::Command::new("tmux")
-                    .args(["send-keys", "-t", &body.name, "claude", "Enter"])
+                    .args(["send-keys", "-t", &body.name, &claude_cmd, "Enter"])
                     .status();
                 if !matches!(send, Ok(s) if s.success()) {
                     return Err(anyhow::anyhow!(
