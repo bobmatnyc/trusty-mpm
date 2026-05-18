@@ -511,7 +511,7 @@ impl DashboardState {
 /// launch the sync `DashboardState` cannot perform; the dispatcher needs an
 /// explicit signal to either show a message or run the launch.
 /// What: `Resolved` carries a finished status line; `Launch` carries the
-/// expanded directory the caller should start a claude-mpm session in.
+/// expanded directory the caller should start a Claude Code session in.
 /// Test: `connect_action_*` tests in this module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectAction {
@@ -1057,7 +1057,7 @@ pub fn command_help_lines() -> Vec<String> {
         "  /tmux             list tmux sessions (managed + external)".to_string(),
         "  /status           show daemon status".to_string(),
         "  /adopt <name>     adopt a tmux session by name".to_string(),
-        "  /connect <id|dir>   focus session by id, or launch claude-mpm in dir".to_string(),
+        "  /connect <id|dir>   focus session by id, or launch claude in dir".to_string(),
         "  /chat <message>   ask the LLM chat assistant".to_string(),
         "  /send <s> <cmd>   send a prompt to a Claude Code session".to_string(),
         "  /discover         auto-discover tmux sessions running Claude Code".to_string(),

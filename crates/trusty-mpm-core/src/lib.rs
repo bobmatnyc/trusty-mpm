@@ -37,6 +37,7 @@ pub mod paths;
 pub mod project;
 pub mod project_discovery;
 pub mod session;
+pub mod session_launch;
 pub mod session_store;
 pub mod tmux;
 

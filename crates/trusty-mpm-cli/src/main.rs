@@ -706,38 +706,32 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
     match action {
         SessionAction::Start { dir } => {
             let path = resolve_dir(dir)?;
-            // Ensure `~/.claude/agents/` holds up-to-date composed agents
-            // before the session launches; CC reads them at startup.
+            // Prepare the custom instructions Claude Code reads at startup:
+            // deploy composed agents to `~/.claude/agents/` and merge the
+            // project CLAUDE.md. This shared prep is what makes a plain
+            // `claude` process behave as a trusty-mpm session.
             let fw = trusty_mpm_core::paths::FrameworkPaths::default();
-            match trusty_mpm_core::agent_deployer::deploy_agents(
-                &fw.agent_source_dir(),
-                &fw.claude_agents_dir(),
-            ) {
-                Ok(deploy) => println!(
-                    "Agents: {} deployed, {} skipped, {} unchanged",
-                    deploy.deployed.len(),
-                    deploy.skipped.len(),
-                    deploy.unchanged.len(),
-                ),
-                Err(err) => eprintln!("warning: agent deploy failed: {err}"),
-            }
-
-            // Compose the effective launch instructions (framework + dynamic
-            // delegation authority + project CLAUDE.md) and stash them where
-            // the operator can inspect them. Passing `--system-prompt` to the
-            // actual CC launch command is a future integration step.
-            match compose_session_instructions(&fw, &path) {
-                Ok((output, stash)) => {
-                    if output.claude_md_created {
+            match trusty_mpm_core::session_launch::prepare_session(&fw, &path) {
+                Ok(report) => {
+                    println!(
+                        "Agents: {} deployed, {} skipped, {} unchanged",
+                        report.deploy.deployed.len(),
+                        report.deploy.skipped.len(),
+                        report.deploy.unchanged.len(),
+                    );
+                    if report.instructions.claude_md_created {
                         println!("  Created CLAUDE.md stub in {}", path.display());
                     }
                     println!(
                         "Instructions: {} agents in delegation authority",
-                        output.agent_count
+                        report.instructions.agent_count
                     );
-                    println!("  Merged instructions written to {}", stash.display());
+                    println!(
+                        "  Merged instructions written to {}",
+                        report.stash.display()
+                    );
                 }
-                Err(err) => eprintln!("warning: instruction pipeline failed: {err}"),
+                Err(err) => eprintln!("warning: session preparation failed: {err}"),
             }
 
             #[derive(Deserialize)]

@@ -823,18 +823,34 @@ impl DaemonClient {
         Ok(body)
     }
 
-    /// Launch a fresh claude-mpm session in `workdir`.
+    /// Launch a fresh Claude Code session in `workdir`.
     ///
     /// Why: the TUI's `/connect <dir>` command is the single entry point for
     /// "connect to or launch a session for a project" — when no session exists
-    /// for a directory it must start one, mirroring `tm session start`.
-    /// What: POSTs `{workdir, project_path}` to `/sessions`, then creates a
-    /// detached tmux session via `tmux new-session` and starts `claude-mpm` in
-    /// it via `tmux send-keys`. Returns the daemon-assigned tmux session name.
-    /// The daemon only registers session state; the launch (tmux + process) is
-    /// owned by the client, exactly as the CLI does it.
+    /// for a directory it must start one, mirroring `tm session start`. A
+    /// trusty-mpm session is always the `claude` (Claude Code) CLI, never
+    /// `claude-mpm`; the trusty-mpm behaviour comes from the custom instructions
+    /// (deployed agents + project `CLAUDE.md`) prepared before launch.
+    /// What: runs [`trusty_mpm_core::session_launch::prepare_session`] (deploy
+    /// agents + merge `CLAUDE.md`), POSTs `{workdir, project_path}` to
+    /// `/sessions`, then creates a detached tmux session via `tmux new-session`
+    /// and starts `claude` in it via `tmux send-keys`. Returns the
+    /// daemon-assigned tmux session name. The daemon only registers session
+    /// state; the prep and launch (tmux + process) are owned by the client,
+    /// exactly as the CLI does it.
     /// Test: `launch_session_errors_when_daemon_unreachable`.
     pub async fn launch_session(&self, workdir: &str) -> anyhow::Result<String> {
+        // Prepare the custom instructions Claude Code reads at startup: deploy
+        // composed agents to `~/.claude/agents/` and merge the project
+        // `CLAUDE.md`. A prep failure is logged but not fatal — the session can
+        // still launch with whatever instructions already exist on disk.
+        let fw = trusty_mpm_core::paths::FrameworkPaths::default();
+        if let Err(err) =
+            trusty_mpm_core::session_launch::prepare_session(&fw, std::path::Path::new(workdir))
+        {
+            tracing::warn!(%err, "session pre-launch preparation failed");
+        }
+
         #[derive(Deserialize)]
         struct Body {
             #[serde(default)]
@@ -860,11 +876,11 @@ impl DaemonClient {
         match new_session {
             Ok(status) if status.success() => {
                 let send = std::process::Command::new("tmux")
-                    .args(["send-keys", "-t", &body.name, "claude-mpm", "Enter"])
+                    .args(["send-keys", "-t", &body.name, "claude", "Enter"])
                     .status();
                 if !matches!(send, Ok(s) if s.success()) {
                     return Err(anyhow::anyhow!(
-                        "tmux session {} created but failed to start claude-mpm",
+                        "tmux session {} created but failed to start claude",
                         body.name
                     ));
                 }
