@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 /// differently — only external sessions need an explicit "adopt" step before
 /// oversight applies.
 /// What: [`TrustyMpm`](SessionOrigin::TrustyMpm) for `tmpm-*` / `trusty-mpm-*`
-/// names, [`External`](SessionOrigin::External) for everything else.
+/// names (this covers both the random `tmpm-<adjective>-<noun>` form and the
+/// folder-derived `tmpm-<folder>` form), [`External`](SessionOrigin::External)
+/// for everything else.
 /// Test: `classifies_trusty_mpm_prefixes`, `classifies_external`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]

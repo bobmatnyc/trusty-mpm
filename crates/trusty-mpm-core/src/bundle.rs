@@ -53,6 +53,15 @@ pub const ENGINEER_AGENT: &str = include_str!("../assets/agents/engineer.md");
 /// Placeholder skill definition installed to `skills/example-skill.md`.
 pub const EXAMPLE_SKILL: &str = include_str!("../assets/skills/example-skill.md");
 
+/// Claude Code output style deployed to `~/.claude/output-styles/trusty-mpm.md`.
+///
+/// Why: launched sessions set `"outputStyle": "trusty-mpm"` in the project
+/// `.claude/settings.json`; Claude Code only honours that name if a matching
+/// style file exists. Bundling it lets the launch path deploy it directly,
+/// outside the framework-root [`ALL`] table (which installs under
+/// `~/.trusty-mpm/framework/`, not `~/.claude/`).
+pub const OUTPUT_STYLE: &str = include_str!("../assets/output-styles/trusty-mpm.md");
+
 /// One embedded framework artifact and its install location.
 ///
 /// Why: the installer iterates a single table rather than hard-coding each
@@ -169,6 +178,15 @@ mod tests {
         assert!(!BASE_OPS.trim().is_empty());
         assert!(!ENGINEER_AGENT.trim().is_empty());
         assert!(!EXAMPLE_SKILL.trim().is_empty());
+        assert!(!OUTPUT_STYLE.trim().is_empty());
+    }
+
+    #[test]
+    fn output_style_has_matching_frontmatter_name() {
+        // Claude Code matches the `outputStyle` settings key against the
+        // `name:` in the style file's frontmatter; a mismatch silently falls
+        // back to the operator's default style.
+        assert!(OUTPUT_STYLE.contains("name: trusty-mpm"));
     }
 
     #[test]

@@ -10,6 +10,8 @@
 //! Test: `cargo test -p trusty-mpm-core` asserts determinism, format, and that
 //! distinct UUIDs generally produce distinct names.
 
+use std::path::Path;
+
 use uuid::Uuid;
 
 /// Adjective half of the wordlist (50 short, neutral words).
@@ -52,6 +54,83 @@ pub fn name_from_uuid(uuid: &Uuid) -> String {
     // from overlapping low bits (which would correlate the two words).
     let noun = NOUNS[((value / ADJECTIVES.len() as u128) % NOUNS.len() as u128) as usize];
     format!("{PREFIX}{adj}-{noun}")
+}
+
+/// Maximum length of the sanitized folder portion of a directory-derived name.
+///
+/// Why: tmux session names have practical length limits and long names clutter
+/// the dashboard; truncating the folder keeps `tmpm-<folder>` glanceable.
+const MAX_FOLDER_LEN: usize = 20;
+
+/// Fallback session name used when a directory yields an empty folder slug.
+///
+/// Why: a path like `/` or `///` sanitizes to nothing; a session still needs a
+/// stable, valid tmux name.
+const DIR_FALLBACK: &str = "tmpm-session";
+
+/// Derive a session name from a project directory's basename.
+///
+/// Why: random adjective+noun names are stable but not meaningful — an operator
+/// cannot tell which project a session belongs to from its name. Deriving the
+/// name from the project folder (`tmpm-trusty-mpm`) makes sessions instantly
+/// identifiable while staying a valid, short tmux session name.
+/// What: takes the final path component, lowercases it, replaces every run of
+/// non-alphanumeric characters with a single `-`, strips leading/trailing
+/// dashes, truncates the slug to [`MAX_FOLDER_LEN`] chars, and returns
+/// `tmpm-<slug>`. Falls back to [`DIR_FALLBACK`] when the slug is empty.
+/// Test: `name_from_dir_basic`, `name_from_dir_sanitizes`,
+/// `name_from_dir_collapses_and_trims`, `name_from_dir_truncates`,
+/// `name_from_dir_empty_fallback`.
+pub fn name_from_dir(path: &Path) -> String {
+    let basename = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Replace every non-alphanumeric char with `-`, lowercasing as we go.
+    let mut slug = String::with_capacity(basename.len());
+    for ch in basename.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.extend(ch.to_lowercase());
+        } else {
+            // Non-alphanumeric (spaces, underscores, dots, existing dashes,
+            // unicode) all collapse to a dash placeholder.
+            slug.push('-');
+        }
+    }
+
+    // Collapse consecutive dashes and strip leading/trailing dashes.
+    let mut collapsed = String::with_capacity(slug.len());
+    let mut prev_dash = true; // start true so a leading dash is dropped
+    for ch in slug.chars() {
+        if ch == '-' {
+            if !prev_dash {
+                collapsed.push('-');
+            }
+            prev_dash = true;
+        } else {
+            collapsed.push(ch);
+            prev_dash = false;
+        }
+    }
+    while collapsed.ends_with('-') {
+        collapsed.pop();
+    }
+
+    // Truncate to the folder budget, then re-strip any trailing dash exposed
+    // by the cut.
+    if collapsed.len() > MAX_FOLDER_LEN {
+        collapsed.truncate(MAX_FOLDER_LEN);
+        while collapsed.ends_with('-') {
+            collapsed.pop();
+        }
+    }
+
+    if collapsed.is_empty() {
+        DIR_FALLBACK.to_string()
+    } else {
+        format!("{PREFIX}{collapsed}")
+    }
 }
 
 #[cfg(test)]
@@ -99,5 +178,52 @@ mod tests {
     fn known_uuid_is_stable() {
         // Nil UUID maps to index 0 of both lists — pins the algorithm.
         assert_eq!(name_from_uuid(&Uuid::nil()), "tmpm-quiet-falcon");
+    }
+
+    #[test]
+    fn name_from_dir_basic() {
+        assert_eq!(
+            name_from_dir(Path::new("/Users/masa/Projects/trusty-mpm")),
+            "tmpm-trusty-mpm"
+        );
+    }
+
+    #[test]
+    fn name_from_dir_sanitizes() {
+        // Spaces become dashes; underscores become dashes; result lowercased.
+        assert_eq!(
+            name_from_dir(Path::new("/home/foo/my project")),
+            "tmpm-my-project"
+        );
+        assert_eq!(name_from_dir(Path::new("/srv/my_api_v2")), "tmpm-my-api-v2");
+        assert_eq!(name_from_dir(Path::new("/x/MixedCase")), "tmpm-mixedcase");
+    }
+
+    #[test]
+    fn name_from_dir_collapses_and_trims() {
+        // Multiple separators collapse to one dash; leading/trailing stripped.
+        assert_eq!(
+            name_from_dir(Path::new("/x/--weird__  name--")),
+            "tmpm-weird-name"
+        );
+        assert_eq!(name_from_dir(Path::new("/x/...dots...")), "tmpm-dots");
+    }
+
+    #[test]
+    fn name_from_dir_truncates() {
+        // The folder slug is capped at 20 chars; no trailing dash remains.
+        let name = name_from_dir(Path::new("/x/this-is-a-very-long-folder-name"));
+        let slug = name.strip_prefix("tmpm-").expect("tmpm- prefix");
+        assert!(slug.len() <= 20, "slug under 20 chars: {slug}");
+        assert!(!slug.ends_with('-'), "no trailing dash: {slug}");
+        assert_eq!(name, "tmpm-this-is-a-very-long");
+    }
+
+    #[test]
+    fn name_from_dir_empty_fallback() {
+        // Paths that sanitize to nothing fall back to a stable default.
+        assert_eq!(name_from_dir(Path::new("/")), "tmpm-session");
+        assert_eq!(name_from_dir(Path::new("/x/----")), "tmpm-session");
+        assert_eq!(name_from_dir(Path::new("")), "tmpm-session");
     }
 }

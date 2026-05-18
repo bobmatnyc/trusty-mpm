@@ -137,7 +137,7 @@ pub fn discover_claude_sessions(state: &DaemonState) -> DiscoveryResult {
         // Register a tmux-hosted session under the discovered tmux name. The
         // workdir is unknown from the pane listing, so it is left empty — a
         // later snapshot or hook event can enrich it.
-        let mut session = Session::new(SessionId::new(), String::new(), ControlModel::Tmux);
+        let mut session = Session::new(SessionId::new(), String::new(), ControlModel::Tmux, None);
         session.tmux_name = session_name.clone();
         session.status = SessionStatus::Active;
         session.origin = SessionHost::Tmux;
@@ -369,7 +369,7 @@ pub fn discover_native_processes(state: &DaemonState) -> DiscoveryResult {
         }
         // Native processes are not tmux-hosted; tag the control model `Pty`
         // (an OS-owned terminal) and the origin `Native`.
-        let mut session = Session::new(SessionId::new(), cwd.clone(), ControlModel::Pty);
+        let mut session = Session::new(SessionId::new(), cwd.clone(), ControlModel::Pty, None);
         session.tmux_name = name.clone();
         session.status = SessionStatus::Active;
         session.origin = SessionHost::Native;

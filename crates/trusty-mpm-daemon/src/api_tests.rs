@@ -5,7 +5,7 @@ use trusty_mpm_core::session::{ControlModel, Session, SessionStatus};
 fn state_with_session() -> (Arc<DaemonState>, SessionId) {
     let state = DaemonState::shared();
     let id = SessionId::new();
-    let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux);
+    let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
     session.status = SessionStatus::Active;
     state.register_session(session);
     (state, id)
@@ -71,6 +71,7 @@ async fn register_session_associates_project() {
         Json(RegisterSession {
             workdir: "/work/demo".into(),
             project_path: Some("/work/demo".into()),
+            name: None,
         }),
     )
     .await;
@@ -92,6 +93,7 @@ async fn list_sessions_filters_by_project() {
         Json(RegisterSession {
             workdir: "/work/demo".into(),
             project_path: Some("/work/demo".into()),
+            name: None,
         }),
     )
     .await;
@@ -100,6 +102,7 @@ async fn list_sessions_filters_by_project() {
         Json(RegisterSession {
             workdir: "/work/other".into(),
             project_path: Some("/work/other".into()),
+            name: None,
         }),
     )
     .await;
@@ -138,6 +141,7 @@ async fn register_and_remove_session() {
         Json(RegisterSession {
             workdir: "/tmp/new".into(),
             project_path: None,
+            name: None,
         }),
     )
     .await;
@@ -163,6 +167,7 @@ async fn registered_session_has_friendly_tmux_name() {
         Json(RegisterSession {
             workdir: "/tmp/friendly".into(),
             project_path: None,
+            name: None,
         }),
     )
     .await;
@@ -205,6 +210,7 @@ async fn register_session_returns_id_even_without_tmux() {
         Json(RegisterSession {
             workdir: "/tmp/no-tmux".into(),
             project_path: None,
+            name: None,
         }),
     )
     .await;
@@ -411,7 +417,7 @@ async fn resume_unpaused_session_is_409() {
 async fn command_to_stopped_session_is_409() {
     let state = DaemonState::shared();
     let id = SessionId::new();
-    let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux);
+    let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
     session.status = SessionStatus::Stopped;
     state.register_session(session);
 

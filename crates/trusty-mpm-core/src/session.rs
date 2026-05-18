@@ -6,7 +6,7 @@
 //! exchanged over IPC.
 //! Test: `cargo test -p trusty-mpm-core` round-trips a `Session` through JSON.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -148,20 +148,32 @@ impl Session {
     /// Build a freshly-registered session with derived metadata.
     ///
     /// Why: every call site that creates a `Session` needs the same defaults —
-    /// a friendly tmux name derived from the id and `created_at`/`last_seen`
-    /// stamped to now; centralizing it prevents drift.
-    /// What: derives `tmux_name` via [`crate::names::name_from_uuid`] and stamps
-    /// both timestamps to the current time.
-    /// Test: `new_derives_tmux_name`.
-    pub fn new(id: SessionId, workdir: impl Into<String>, control: ControlModel) -> Self {
+    /// a friendly tmux name and `created_at`/`last_seen` stamped to now;
+    /// centralizing it prevents drift. A session belongs to a project, so the
+    /// tmux name should identify that project rather than be random.
+    /// What: when `project_dir` is `Some`, derives `tmux_name` from the folder
+    /// basename via [`crate::names::name_from_dir`] (`tmpm-<folder>`); when
+    /// `None`, falls back to the UUID-derived [`crate::names::name_from_uuid`].
+    /// Both timestamps are stamped to the current time.
+    /// Test: `new_derives_tmux_name`, `new_derives_tmux_name_from_dir`.
+    pub fn new(
+        id: SessionId,
+        workdir: impl Into<String>,
+        control: ControlModel,
+        project_dir: Option<&Path>,
+    ) -> Self {
         let now = SystemTime::now();
+        let tmux_name = match project_dir {
+            Some(dir) => crate::names::name_from_dir(dir),
+            None => crate::names::name_from_uuid(&id.0),
+        };
         Self {
             id,
             workdir: workdir.into(),
             status: SessionStatus::Starting,
             control,
             active_delegations: 0,
-            tmux_name: crate::names::name_from_uuid(&id.0),
+            tmux_name,
             created_at: now,
             last_seen: now,
             project_path: None,
@@ -189,7 +201,7 @@ mod tests {
 
     #[test]
     fn session_json_roundtrip() {
-        let mut session = Session::new(SessionId::new(), "/tmp/project", ControlModel::Tmux);
+        let mut session = Session::new(SessionId::new(), "/tmp/project", ControlModel::Tmux, None);
         session.status = SessionStatus::Active;
         session.active_delegations = 2;
         let json = serde_json::to_string(&session).unwrap();
@@ -202,21 +214,34 @@ mod tests {
     #[test]
     fn new_derives_tmux_name() {
         let id = SessionId::new();
-        let session = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        let session = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
         assert_eq!(session.tmux_name, crate::names::name_from_uuid(&id.0));
         assert!(session.tmux_name.starts_with("tmpm-"));
         assert_eq!(session.status, SessionStatus::Starting);
     }
 
     #[test]
+    fn new_derives_tmux_name_from_dir() {
+        // With a project dir the tmux name is the sanitized folder, not random.
+        let dir = std::path::Path::new("/Users/x/trusty-mpm");
+        let session = Session::new(
+            SessionId::new(),
+            "/Users/x/trusty-mpm",
+            ControlModel::Tmux,
+            Some(dir),
+        );
+        assert_eq!(session.tmux_name, "tmpm-trusty-mpm");
+    }
+
+    #[test]
     fn new_has_no_project_by_default() {
-        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         assert_eq!(session.project_path, None);
     }
 
     #[test]
     fn project_path_survives_json_roundtrip() {
-        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         session.project_path = Some(std::path::PathBuf::from("/work/proj"));
         let json = serde_json::to_string(&session).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
@@ -228,14 +253,14 @@ mod tests {
 
     #[test]
     fn new_has_no_pause_state_by_default() {
-        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         assert_eq!(session.paused_at, None);
         assert_eq!(session.pause_summary, None);
     }
 
     #[test]
     fn pause_state_survives_json_roundtrip() {
-        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         session.status = SessionStatus::Paused;
         session.paused_at = Some(SystemTime::now());
         session.pause_summary = Some("mid-task".to_string());
@@ -248,14 +273,14 @@ mod tests {
 
     #[test]
     fn new_defaults_to_tmux_host_without_pid() {
-        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         assert_eq!(session.origin, SessionHost::Tmux);
         assert_eq!(session.pid, None);
     }
 
     #[test]
     fn native_host_state_survives_json_roundtrip() {
-        let mut session = Session::new(SessionId::new(), "/work/proj", ControlModel::Pty);
+        let mut session = Session::new(SessionId::new(), "/work/proj", ControlModel::Pty, None);
         session.origin = SessionHost::Native;
         session.pid = Some(4242);
         let json = serde_json::to_string(&session).unwrap();
@@ -295,7 +320,7 @@ mod tests {
 
     #[test]
     fn touch_advances_last_seen() {
-        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         let before = session.last_seen;
         std::thread::sleep(std::time::Duration::from_millis(2));
         session.touch();

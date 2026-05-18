@@ -812,7 +812,7 @@ mod tests {
     use trusty_mpm_core::session::{ControlModel, SessionStatus};
 
     fn sample_session() -> Session {
-        let mut s = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let mut s = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         s.status = SessionStatus::Active;
         s
     }

@@ -500,7 +500,7 @@ mod tests {
         // With one registered session, `/sessions` returns exactly that summary.
         use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
         let (state, url) = spawn_test_daemon().await;
-        let mut session = Session::new(SessionId::new(), "/tmp/proj", ControlModel::Tmux);
+        let mut session = Session::new(SessionId::new(), "/tmp/proj", ControlModel::Tmux, None);
         session.status = SessionStatus::Active;
         state.register_session(session);
 
@@ -520,7 +520,7 @@ mod tests {
         use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
         let (state, url) = spawn_test_daemon().await;
         let id = SessionId::new();
-        let mut session = Session::new(id, "/tmp/proj", ControlModel::Tmux);
+        let mut session = Session::new(id, "/tmp/proj", ControlModel::Tmux, None);
         session.status = SessionStatus::Active;
         state.register_session(session);
 
@@ -571,7 +571,7 @@ mod tests {
         use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
         let (state, url) = spawn_test_daemon().await;
         let id = SessionId::new();
-        let mut session = Session::new(id, "/tmp/proj", ControlModel::Tmux);
+        let mut session = Session::new(id, "/tmp/proj", ControlModel::Tmux, None);
         session.status = SessionStatus::Active;
         state.register_session(session);
 
@@ -662,7 +662,7 @@ mod tests {
         use trusty_mpm_core::session::{ControlModel, Session, SessionId, SessionStatus};
         let (state, url) = spawn_test_daemon().await;
         let id = SessionId::new();
-        let mut session = Session::new(id, "/tmp/proj", ControlModel::Tmux);
+        let mut session = Session::new(id, "/tmp/proj", ControlModel::Tmux, None);
         session.status = SessionStatus::Active;
         state.register_session(session);
 

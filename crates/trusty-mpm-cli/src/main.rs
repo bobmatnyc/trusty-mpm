@@ -1068,19 +1068,22 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
         eprintln!("warning: session preparation failed: {err}");
     }
 
-    // 3. Register the session with the daemon to obtain a tmux name. When the
-    //    daemon is unreachable we can still launch — fall back to a generated
-    //    `tmpm-<adjective>-<noun>` name derived from a fresh UUID.
+    // 3. Register the session with the daemon. The tmux name is derived from
+    //    the project folder (`tmpm-<folder>`); we send it so the daemon's
+    //    registry stays consistent with the tmux session we create below. When
+    //    the daemon is unreachable we still launch under the same folder name.
     #[derive(Deserialize)]
     struct Body {
         #[serde(default)]
         name: String,
     }
+    let folder_name = fallback_session_name(&path);
     let tmux_name = match client
         .post(format!("{url}/sessions"))
         .json(&serde_json::json!({
             "workdir": path,
             "project_path": path,
+            "name": folder_name,
         }))
         .send()
         .await
@@ -1088,16 +1091,16 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
         Ok(resp) => match resp.error_for_status() {
             Ok(resp) => match resp.json::<Body>().await {
                 Ok(body) if !body.name.is_empty() => body.name,
-                _ => fallback_session_name(),
+                _ => folder_name.clone(),
             },
             Err(err) => {
                 eprintln!("warning: daemon rejected session registration: {err}");
-                fallback_session_name()
+                folder_name.clone()
             }
         },
         Err(err) => {
             eprintln!("warning: daemon unreachable ({err}); launching without registration");
-            fallback_session_name()
+            folder_name.clone()
         }
     };
 
@@ -1171,15 +1174,16 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
     Ok(())
 }
 
-/// Generate a fallback `tmpm-<adjective>-<noun>` session name from a fresh UUID.
+/// Compute the fallback `tmpm-<folder>` session name for a project directory.
 ///
 /// Why: when the daemon is unreachable `tm launch` still needs a tmux session
-/// name; reusing the daemon's `name_from_uuid` scheme keeps generated names
-/// indistinguishable from daemon-assigned ones.
-/// What: returns `name_from_uuid` of a newly generated v4 UUID.
-/// Test: `fallback_session_name_has_tmpm_prefix`.
-fn fallback_session_name() -> String {
-    trusty_mpm_core::names::name_from_uuid(&trusty_mpm_core::session::SessionId::new().0)
+/// name; deriving it from the project folder keeps the offline name identical
+/// to the one the daemon would assign for the same directory.
+/// What: returns `name_from_dir(path)` (`tmpm-<sanitized-folder>`).
+/// Test: `fallback_session_name_has_tmpm_prefix`,
+/// `fallback_session_name_uses_folder`.
+fn fallback_session_name(path: &std::path::Path) -> String {
+    trusty_mpm_core::names::name_from_dir(path)
 }
 
 /// Left indent applied to every line of the full-screen launch banner.
@@ -2308,8 +2312,15 @@ mod tests {
 
     #[test]
     fn fallback_session_name_has_tmpm_prefix() {
-        let name = fallback_session_name();
+        let name = fallback_session_name(std::path::Path::new("/work/p"));
         assert!(name.starts_with("tmpm-"), "got {name}");
+    }
+
+    #[test]
+    fn fallback_session_name_uses_folder() {
+        // The offline fallback name reflects the project folder, not a UUID.
+        let name = fallback_session_name(std::path::Path::new("/Users/x/trusty-mpm"));
+        assert_eq!(name, "tmpm-trusty-mpm");
     }
 
     #[test]

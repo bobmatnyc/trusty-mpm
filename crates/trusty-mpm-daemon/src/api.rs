@@ -161,7 +161,8 @@ pub async fn recent_events(State(state): State<Arc<DaemonState>>) -> Json<Events
 ///
 /// Why: a session created by an external launcher (or the CLI) must announce
 /// itself so the dashboard and MCP tools can see it.
-/// What: the working directory the session runs in.
+/// What: the working directory the session runs in, plus an optional project
+/// and an optional caller-supplied tmux session name.
 /// Test: `register_and_remove_session`.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct RegisterSession {
@@ -173,6 +174,15 @@ pub struct RegisterSession {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub project_path: Option<PathBuf>,
+    /// Optional caller-supplied tmux session name.
+    ///
+    /// Why: the CLI computes a `tmpm-<folder>` name from the project directory
+    /// and creates the tmux session under that name; passing it here keeps the
+    /// daemon registry's `tmux_name` consistent with the live tmux session.
+    /// What: when present and non-empty it is used as the session's
+    /// `tmux_name`; when absent the daemon derives one itself.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// `POST /sessions` — register a new managed session, returning its id.
@@ -196,8 +206,20 @@ pub async fn register_session(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RegisterSession>,
 ) -> Json<RegisterSessionResponse> {
-    let mut session = Session::new(SessionId::new(), body.workdir.clone(), ControlModel::Tmux);
+    // Derive the tmux name from the project directory (`tmpm-<folder>`) so the
+    // registry name matches the folder-based session the CLI creates. A
+    // caller-supplied `name` always wins; otherwise fall back to the UUID name.
+    let project_dir = body.project_path.as_deref();
+    let mut session = Session::new(
+        SessionId::new(),
+        body.workdir.clone(),
+        ControlModel::Tmux,
+        project_dir,
+    );
     session.project_path = body.project_path.clone();
+    if let Some(name) = body.name.as_deref().filter(|n| !n.is_empty()) {
+        session.tmux_name = name.to_string();
+    }
     let id = session.id;
     let tmux_name = session.tmux_name.clone();
     state.register_session(session);
@@ -643,7 +665,7 @@ pub async fn ingest_hook(
     // only ways a session enters state. The workdir is left empty here and
     // enriched later by a snapshot or subsequent events.
     if post.event == HookEvent::SessionStart && state.session(session).is_none() {
-        let mut new_session = Session::new(session, String::new(), ControlModel::Tmux);
+        let mut new_session = Session::new(session, String::new(), ControlModel::Tmux, None);
         new_session.status = SessionStatus::Active;
         state.register_session(new_session);
         tracing::info!("auto-registered session on SessionStart: {session:?}");

@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn save_then_load_round_trips() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let mut session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         session.status = SessionStatus::Paused;
         session.paused_at = Some(std::time::SystemTime::now());
         session.pause_summary = Some("stopped to grab coffee".to_string());
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn save_with_no_summary_writes_null() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         save_pause_in(tmp.path(), &session).expect("save pause");
         let loaded = load_pause_in(tmp.path(), &session.id).expect("pause file exists");
         assert!(loaded["summary"].is_null());
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn clear_removes_file() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         save_pause_in(tmp.path(), &session).expect("save pause");
         assert!(load_pause_in(tmp.path(), &session.id).is_some());
         clear_pause_in(tmp.path(), &session.id).expect("clear pause");

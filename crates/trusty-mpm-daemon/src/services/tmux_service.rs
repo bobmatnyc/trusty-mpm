@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn capture_without_tmux_is_empty() {
         // tmux is generally absent in CI; capture must degrade to "" not panic.
-        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux);
+        let session = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
         let _ = TmuxService::capture(&session, 10);
     }
 

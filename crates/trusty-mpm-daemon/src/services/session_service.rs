@@ -217,7 +217,7 @@ mod tests {
 
     fn active_session(state: &DaemonState) -> SessionId {
         let id = SessionId::new();
-        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
         s.status = SessionStatus::Active;
         state.register_session(s);
         id
@@ -272,7 +272,7 @@ mod tests {
     fn command_target_rejects_stopped() {
         let state = DaemonState::new();
         let id = SessionId::new();
-        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
         s.status = SessionStatus::Stopped;
         state.register_session(s);
         let svc = SessionService::new(&state);

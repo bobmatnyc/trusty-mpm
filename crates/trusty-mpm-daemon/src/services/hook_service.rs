@@ -341,7 +341,7 @@ mod tests {
         // recorded and the verdict is Allow.
         let state = DaemonState::new();
         let id = SessionId::new();
-        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
         s.status = SessionStatus::Active;
         state.register_session(s);
 
@@ -433,7 +433,7 @@ mod tests {
         // must not appear in the ring buffer.
         let state = DaemonState::new();
         let id = SessionId::new();
-        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
         s.status = SessionStatus::Active;
         state.register_session(s);
 
@@ -456,7 +456,7 @@ mod tests {
         // buffer unchanged.
         let state = DaemonState::new();
         let id = SessionId::new();
-        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
         s.status = SessionStatus::Active;
         state.register_session(s);
 
@@ -478,7 +478,7 @@ mod tests {
         // payload content — the filter is FileChanged-only.
         let state = DaemonState::new();
         let id = SessionId::new();
-        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
         s.status = SessionStatus::Active;
         state.register_session(s);
 

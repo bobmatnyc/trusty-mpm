@@ -35,6 +35,12 @@ pub struct PrepReport {
     pub instructions: PipelineOutput,
     /// Path the merged instructions were stashed to for inspection.
     pub stash: PathBuf,
+    /// Path the `trusty-mpm` output style was deployed to, if it succeeded.
+    ///
+    /// `None` when deployment was skipped (no home directory) or failed; the
+    /// session still launches in that case, just with the operator's default
+    /// style.
+    pub output_style: Option<PathBuf>,
 }
 
 /// A failure raised while preparing a session for launch.
@@ -100,11 +106,108 @@ pub fn prepare_session(fw: &FrameworkPaths, project_dir: &Path) -> Result<PrepRe
         source,
     })?;
 
+    // Set the Claude Code output style so the launched session's status bar
+    // reads `style:trusty-mpm`. A failure here is non-fatal: the session still
+    // launches, it just shows the operator's default style.
+    if let Err(err) = write_output_style(project_dir) {
+        tracing::warn!("failed to set trusty-mpm output style: {err}");
+    }
+
+    // Deploy the bundled output-style definition so Claude Code can resolve the
+    // `trusty-mpm` name written into `.claude/settings.json` above. Non-fatal:
+    // a missing style file just falls back to the operator's default.
+    let output_style = match dirs::home_dir() {
+        Some(home) => match deploy_output_style(&home) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                tracing::warn!("failed to deploy trusty-mpm output style file: {err}");
+                None
+            }
+        },
+        None => {
+            tracing::warn!("skipping output style deploy: home directory unresolved");
+            None
+        }
+    };
+
     Ok(PrepReport {
         deploy,
         instructions,
         stash,
+        output_style,
     })
+}
+
+/// Deploy the bundled `trusty-mpm` output style under `<home>/.claude/output-styles/`.
+///
+/// Why: [`write_output_style`] only sets `"outputStyle": "trusty-mpm"` in the
+/// project settings; Claude Code honours that name only when a matching style
+/// file exists in `~/.claude/output-styles/`. This places that file. `home` is
+/// passed in (rather than resolved here) so tests can target a temp directory
+/// instead of the operator's real home.
+/// What: creates `<home>/.claude/output-styles/` if absent, then writes the
+/// bundled [`crate::bundle::OUTPUT_STYLE`] asset, always overwriting so
+/// framework upgrades to the style propagate on the next launch. Returns the
+/// path written.
+/// Test: `deploy_output_style_writes_file`, `deploy_output_style_overwrites`.
+fn deploy_output_style(home: &Path) -> Result<PathBuf, PrepError> {
+    let style_dir = home.join(".claude").join("output-styles");
+    std::fs::create_dir_all(&style_dir).map_err(|source| PrepError::Io {
+        path: style_dir.clone(),
+        source,
+    })?;
+    let style_path = style_dir.join("trusty-mpm.md");
+    std::fs::write(&style_path, crate::bundle::OUTPUT_STYLE).map_err(|source| PrepError::Io {
+        path: style_path.clone(),
+        source,
+    })?;
+    Ok(style_path)
+}
+
+/// Claude Code output style applied to launched sessions.
+///
+/// Why: the Claude Code status bar renders `style:<outputStyle>`; launched
+/// trusty-mpm sessions should advertise themselves as `trusty-mpm`.
+const OUTPUT_STYLE: &str = "trusty-mpm";
+
+/// Merge `"outputStyle": "trusty-mpm"` into the project's `.claude/settings.json`.
+///
+/// Why: Claude Code reads the output style from `.claude/settings.json` under
+/// the `outputStyle` key (there is no `--style` CLI flag); writing it in the
+/// project directory makes every `claude` launched there show
+/// `style:trusty-mpm` without disturbing the operator's global settings.
+/// What: reads an existing `<project>/.claude/settings.json` (preserving all
+/// other keys), sets `outputStyle` to [`OUTPUT_STYLE`], and writes it back
+/// pretty-printed. Creates the file and `.claude/` directory when absent.
+/// Test: `prepare_session_sets_output_style`,
+/// `write_output_style_preserves_existing_keys`.
+fn write_output_style(project_dir: &Path) -> Result<(), PrepError> {
+    let claude_dir = project_dir.join(".claude");
+    std::fs::create_dir_all(&claude_dir).map_err(|source| PrepError::Io {
+        path: claude_dir.clone(),
+        source,
+    })?;
+    let settings_path = claude_dir.join("settings.json");
+
+    // Load existing settings to preserve unrelated keys; tolerate a missing or
+    // malformed file by starting from an empty object.
+    let mut settings = match std::fs::read_to_string(&settings_path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+        Err(_) => serde_json::Value::Object(serde_json::Map::new()),
+    };
+
+    settings["outputStyle"] = serde_json::Value::String(OUTPUT_STYLE.to_string());
+
+    let serialized = serde_json::to_string_pretty(&settings)
+        .map_err(|err| PrepError::Deploy(err.to_string()))?;
+    std::fs::write(&settings_path, serialized).map_err(|source| PrepError::Io {
+        path: settings_path.clone(),
+        source,
+    })?;
+    Ok(())
 }
 
 /// Build the `--append-system-prompt` text for a launched session.
@@ -188,6 +291,97 @@ mod tests {
             report.stash,
             project.join(".trusty-mpm").join("last-instructions.md")
         );
+    }
+
+    #[test]
+    fn prepare_session_sets_output_style() {
+        // Why: a launched session must show `style:trusty-mpm`, which Claude
+        // Code reads from `<project>/.claude/settings.json`.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        let fw = FrameworkPaths::default();
+
+        prepare_session(&fw, project).expect("prep succeeds");
+
+        let settings_path = project.join(".claude").join("settings.json");
+        assert!(settings_path.exists(), ".claude/settings.json must exist");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(value["outputStyle"], serde_json::json!("trusty-mpm"));
+    }
+
+    #[test]
+    fn write_output_style_preserves_existing_keys() {
+        // Why: merging the style must not clobber an operator's other settings.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        let claude_dir = project.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"theme":"dark","outputStyle":"old"}"#,
+        )
+        .unwrap();
+
+        write_output_style(project).expect("write succeeds");
+
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["outputStyle"], serde_json::json!("trusty-mpm"));
+        assert_eq!(value["theme"], serde_json::json!("dark"));
+    }
+
+    #[test]
+    fn deploy_output_style_writes_file() {
+        // Why: Claude Code resolves the `trusty-mpm` output style only when a
+        // matching file exists in `~/.claude/output-styles/`; deployment must
+        // create that file (and its parent dir) with the bundled content.
+        let home = tempdir().unwrap();
+        let path = deploy_output_style(home.path()).expect("deploy succeeds");
+
+        assert_eq!(
+            path,
+            home.path()
+                .join(".claude")
+                .join("output-styles")
+                .join("trusty-mpm.md")
+        );
+        let written = std::fs::read_to_string(&path).expect("style file readable");
+        assert_eq!(written, crate::bundle::OUTPUT_STYLE);
+        assert!(written.contains("name: trusty-mpm"));
+    }
+
+    #[test]
+    fn deploy_output_style_overwrites() {
+        // Why: framework upgrades to the style must propagate on the next
+        // launch, so deployment always overwrites any existing file.
+        let home = tempdir().unwrap();
+        let first = deploy_output_style(home.path()).expect("first deploy succeeds");
+        std::fs::write(&first, "stale operator content").unwrap();
+
+        let second = deploy_output_style(home.path()).expect("second deploy succeeds");
+        assert_eq!(first, second);
+        let written = std::fs::read_to_string(&second).unwrap();
+        assert_eq!(written, crate::bundle::OUTPUT_STYLE);
+    }
+
+    #[test]
+    fn prepare_session_reports_output_style() {
+        // Why: callers report the deployed style path; `prepare_session` must
+        // populate `PrepReport.output_style` with the file it deployed.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        let fw = FrameworkPaths::default();
+
+        let report = prepare_session(&fw, project).expect("prep succeeds");
+
+        let style = report
+            .output_style
+            .expect("output style deployed when home is resolvable");
+        assert!(style.ends_with("trusty-mpm.md"));
+        assert!(style.exists());
     }
 
     #[test]

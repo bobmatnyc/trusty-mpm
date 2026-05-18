@@ -206,7 +206,7 @@ mod tests {
     fn state_with_session() -> (Arc<DaemonState>, SessionId) {
         let state = DaemonState::shared();
         let id = SessionId::new();
-        let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
         session.status = SessionStatus::Active;
         state.register_session(session);
         (state, id)
