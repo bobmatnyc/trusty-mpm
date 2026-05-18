@@ -1320,7 +1320,7 @@ fn short_id(value: &serde_json::Value) -> String {
         .get("0")
         .and_then(|v| v.as_str())
         .map(|s| s.chars().take(8).collect::<String>())
-        .unwrap_or_else(|| "????????".to_string())
+        .unwrap_or_else(|| "--------".to_string())
 }
 
 /// `status` subcommand — probe daemon health and list sessions.
@@ -1739,14 +1739,14 @@ mod tests {
     #[test]
     fn short_id_falls_back_when_field_missing() {
         // Missing `0` key or a scalar value → the placeholder.
-        assert_eq!(short_id(&serde_json::json!({})), "????????");
-        assert_eq!(short_id(&serde_json::json!("scalar")), "????????");
+        assert_eq!(short_id(&serde_json::json!({})), "--------");
+        assert_eq!(short_id(&serde_json::json!("scalar")), "--------");
     }
 
     #[test]
     fn short_id_falls_back_when_value_not_str() {
         // `0` present but not a string → the placeholder.
-        assert_eq!(short_id(&serde_json::json!({"0": 42})), "????????");
+        assert_eq!(short_id(&serde_json::json!({"0": 42})), "--------");
     }
 
     #[test]
