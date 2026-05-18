@@ -38,6 +38,8 @@ struct Cli {
 enum Command {
     /// Show daemon and session status.
     Status,
+    /// Start the daemon if not running, or show status if already running.
+    Start,
     /// Define and manage projects (registered working directories).
     Project {
         /// Project action to perform.
@@ -315,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     match cli.command {
         Command::Status => status(&client, &cli.url).await,
+        Command::Start => start(&client, &cli.url).await,
         Command::Project { action } => project(&client, &cli.url, action).await,
         Command::Session { action } => session(&client, &cli.url, action).await,
         Command::Events => events(&client, &cli.url).await,
@@ -1196,14 +1199,103 @@ fn short_id(value: &serde_json::Value) -> String {
 /// What: `GET /health` then `GET /sessions`, printing one line per session.
 /// Test: run against a live daemon; "daemon: unreachable" when it is down.
 async fn status(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
-    let healthy = match client.get(format!("{url}/health")).send().await {
-        Ok(r) => r.status().is_success(),
-        Err(_) => false,
-    };
-    if !healthy {
+    if !daemon_healthy(client, url).await {
         println!("daemon: unreachable");
         return Ok(());
     }
+    print_status(client, url).await
+}
+
+/// Probe the daemon's `/health` endpoint for liveness.
+///
+/// Why: both `start` (to decide whether to spawn) and the post-spawn wait loop
+/// need a single yes/no liveness check; factoring it out keeps the two call
+/// sites identical and the intent obvious.
+/// What: issues `GET {url}/health`, returning `true` only on a 2xx response and
+/// `false` on any transport error or non-success status.
+/// Test: covered indirectly by running `tm start` against a live/dead daemon;
+/// the logic mirrors the probe already used by `status`.
+async fn daemon_healthy(client: &reqwest::Client, url: &str) -> bool {
+    match client.get(format!("{url}/health")).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// `start` subcommand — ensure the daemon is running, then show status.
+///
+/// Why: operators want one command that is safe to run repeatedly — it brings
+/// the daemon up if it is down and is a no-op (just status) if it is already
+/// up, so `tm start` can sit in shell profiles and setup scripts.
+/// What: probes `/health`; if healthy, prints "Daemon already running" plus the
+/// same listing as `tm status`. If not, opens `~/.trusty-mpm/daemon.log`, spawns
+/// `tm daemon` detached with stdout/stderr appended to that log, polls `/health`
+/// for up to 5 seconds, then prints "Starting daemon... done" and the status.
+/// Test: `cli_parses_start` covers parsing; the spawn/wait path is exercised by
+/// running `tm start` against a clean environment.
+async fn start(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
+    if daemon_healthy(client, url).await {
+        println!("Daemon already running on :7880");
+        return print_status(client, url).await;
+    }
+
+    // Resolve the log file under `~/.trusty-mpm/`, creating the dir if absent.
+    let root = trusty_mpm_core::paths::FrameworkPaths::default().root;
+    std::fs::create_dir_all(&root)?;
+    let log_path = root.join("daemon.log");
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let stderr = stdout.try_clone()?;
+
+    // Spawn `tm daemon` detached, pointed at our own binary so the spawned
+    // daemon is always the same build as this CLI.
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(&exe)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()?;
+
+    // Poll `/health` for up to 5 seconds (10 × 500ms) so a slow boot still
+    // resolves before we give up.
+    print!("Starting daemon... ");
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+    let mut healthy = false;
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if daemon_healthy(client, url).await {
+            healthy = true;
+            break;
+        }
+    }
+    if healthy {
+        println!("done");
+    } else {
+        println!("failed");
+        println!(
+            "daemon did not become healthy within 5s; see {}",
+            log_path.display()
+        );
+        return Ok(());
+    }
+
+    print_status(client, url).await
+}
+
+/// Print the daemon health line, session listing, and Telegram-bot note.
+///
+/// Why: `status` and `start` must show identical state; sharing one printer
+/// keeps the two outputs from drifting and adds the Telegram note in one place.
+/// What: prints `daemon: ok`, one line per session from `GET /sessions`, and
+/// `Telegram bot active` when a bot token is resolvable from the environment or
+/// a local `.env.local` / `.env` file.
+/// Test: covered indirectly by running `tm status` / `tm start` against a live
+/// daemon; Telegram token resolution is tested in `trusty-mpm-telegram`.
+async fn print_status(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     println!("daemon: ok");
 
     #[derive(Deserialize)]
@@ -1226,6 +1318,10 @@ async fn status(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
             s.workdir,
             s.active_delegations
         );
+    }
+
+    if trusty_mpm_telegram::resolve_token("TELEGRAM_BOT_TOKEN").is_some() {
+        println!("Telegram bot active");
     }
     Ok(())
 }
@@ -1431,6 +1527,12 @@ mod tests {
     fn cli_parses_status() {
         let cli = Cli::try_parse_from(["trusty-mpm", "status"]).unwrap();
         assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn cli_parses_start() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "start"]).unwrap();
+        assert!(matches!(cli.command, Command::Start));
     }
 
     #[test]
