@@ -272,6 +272,19 @@ impl DaemonClient {
         &self.base
     }
 
+    /// Re-point this client at a new daemon base URL.
+    ///
+    /// Why: the daemon may bind a fresh ephemeral port across a restart, so a
+    /// long-lived UI (the TUI) must be able to follow it to the address recorded
+    /// in the lock file instead of being stuck on a stale URL and reporting
+    /// "daemon unreachable" forever. The pooled `reqwest::Client` is kept; only
+    /// the target address changes.
+    /// What: overwrites [`Self::base`] with `base`.
+    /// Test: `set_base_url_repoints_client`.
+    pub fn set_base_url(&mut self, base: impl Into<String>) {
+        self.base = base.into();
+    }
+
     /// Fetch the current session list from the daemon.
     ///
     /// Why: every UI's session view refreshes from this.
@@ -842,6 +855,15 @@ mod tests {
     fn base_url_is_stored() {
         let client = DaemonClient::new("http://127.0.0.1:7880");
         assert_eq!(client.base_url(), "http://127.0.0.1:7880");
+    }
+
+    #[test]
+    fn set_base_url_repoints_client() {
+        // Why: a long-lived UI must follow the daemon to a new ephemeral port
+        // after a restart; `set_base_url` is what makes that re-pointing possible.
+        let mut client = DaemonClient::new("http://127.0.0.1:7880");
+        client.set_base_url("http://127.0.0.1:54321");
+        assert_eq!(client.base_url(), "http://127.0.0.1:54321");
     }
 
     #[test]

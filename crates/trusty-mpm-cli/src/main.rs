@@ -1929,7 +1929,12 @@ mod tests {
 
     #[test]
     fn cli_parses_tui_defaults() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "tui"]).unwrap();
+        // The `--url` flag is passed explicitly: the `tui` subcommand's `url`
+        // arg carries `env = "TRUSTY_MPM_URL"`, so an ambient `TRUSTY_MPM_URL`
+        // in the test runner's environment would otherwise override the clap
+        // `default_value` and make this assertion environment-dependent.
+        // `interval_ms` has no env binding, so its default is asserted bare.
+        let cli = Cli::try_parse_from(["trusty-mpm", "tui", "--url", DEFAULT_URL]).unwrap();
         match cli.command {
             Command::Tui { url, interval_ms } => {
                 assert_eq!(url, DEFAULT_URL);

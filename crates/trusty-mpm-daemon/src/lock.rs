@@ -2,6 +2,9 @@
 //!
 //! Why: Clients use the lock file to discover the daemon's actual address
 //! (which may differ from the configured port if auto-selection kicked in).
+//! The file lives at `~/.trusty-mpm/daemon.lock` — the same framework root
+//! every other artifact uses — so the daemon and its clients always agree on
+//! its location.
 //! What: `write_lock` creates the TOML file; `remove_lock` deletes it.
 //! Both are best-effort — errors are logged but not fatal.
 //! Test: `write_lock` / `remove_lock` round-trip covered below.

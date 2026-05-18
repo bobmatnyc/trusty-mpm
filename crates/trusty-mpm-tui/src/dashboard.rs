@@ -478,13 +478,15 @@ pub fn normalize_command(input: &str) -> String {
 ///
 /// Why: a colour-coded status cell makes the operator's eye jump to trouble —
 /// centralising the mapping keeps `session_rows` readable and unit-testable.
-/// What: `"active"` → green, `"paused"` → yellow, anything else → gray.
+/// What: `"active"` → green, `"paused"` → yellow, anything else → white. The
+/// fallback is white (not `Gray`) because `Gray` is a dim mid-tone that is
+/// nearly invisible against the dashboard background on many terminal themes.
 /// Test: `session_status_colours`.
 fn session_status_color(status: &str) -> Color {
     match status {
         "active" => Color::Green,
         "paused" => Color::Yellow,
-        _ => Color::Gray,
+        _ => Color::White,
     }
 }
 
@@ -511,14 +513,15 @@ fn status_label(status: trusty_mpm_core::session::SessionStatus) -> &'static str
 /// Why: an at-a-glance colour for breaker state surfaces open breakers
 /// immediately; centralising the mapping keeps `breaker_rows` testable.
 /// What: `"closed"` → green, `"half_open"` → yellow, `"open"` → red, anything
-/// else → gray.
+/// else → white. The fallback is white (not `Gray`) so an unrecognised state
+/// stays readable instead of fading into a dim mid-tone.
 /// Test: `breaker_state_colours`.
 fn breaker_state_color(state: &str) -> Color {
     match state {
         "closed" => Color::Green,
         "half_open" => Color::Yellow,
         "open" => Color::Red,
-        _ => Color::Gray,
+        _ => Color::White,
     }
 }
 
@@ -554,13 +557,20 @@ pub fn read_log_tail(n: usize) -> Vec<String> {
 /// Pick the row style for a session table row.
 ///
 /// Why: ratatui's `Row` exposes no public style getter, so the highlight logic
-/// is factored here where a test can assert it directly.
-/// What: `DarkGray` background + white foreground for the selected row, the
-/// default (reset) style otherwise.
+/// is factored here where a test can assert it directly. The selected row must
+/// stand out unambiguously; a `DarkGray` background (the previous choice) is a
+/// dim mid-tone that barely separated the highlighted row from the body on
+/// many terminal themes.
+/// What: a solid `Blue` background with bold `White` foreground for the
+/// selected row — a high-contrast pairing legible on both dark and light
+/// terminals — and the default (reset) style otherwise.
 /// Test: `selected_row_is_highlighted`.
 pub fn session_row_style(selected: bool) -> Style {
     if selected {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
+        Style::default()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     }
@@ -765,6 +775,43 @@ pub fn session_output_panel_lines(state: &DashboardState) -> Vec<String> {
     }
 }
 
+/// Pick the header-title colour from the daemon's reachability.
+///
+/// Why: the title doubles as a health indicator — the operator should see a
+/// problem from the colour alone. Factoring the choice out of `render` lets a
+/// test assert the error colour without a terminal frame.
+/// What: `Cyan` when the daemon is reachable, `Red` when it is not.
+/// Test: `title_color_signals_daemon_health`.
+fn title_color(daemon_reachable: bool) -> Color {
+    if daemon_reachable {
+        Color::Cyan
+    } else {
+        Color::Red
+    }
+}
+
+/// Build the header-title style from the daemon's reachability.
+///
+/// Why: a bare red foreground is easy to miss on a busy or light-themed
+/// terminal — the "daemon unreachable" banner is the single most important
+/// signal on the dashboard, so when the daemon is down the title is rendered as
+/// loud reverse-video (a solid red bar with the terminal's background colour as
+/// the text) which is unmissable on every theme. While healthy it stays a calm
+/// bold cyan. Factoring this out of `render` lets a test assert it without a
+/// terminal frame.
+/// What: bold cyan when reachable; bold + reversed red when unreachable.
+/// Test: `title_style_signals_daemon_health`.
+fn title_style(daemon_reachable: bool) -> Style {
+    let base = Style::default()
+        .fg(title_color(daemon_reachable))
+        .add_modifier(Modifier::BOLD);
+    if daemon_reachable {
+        base
+    } else {
+        base.add_modifier(Modifier::REVERSED)
+    }
+}
+
 /// Build the status-bar line (header line 2).
 ///
 /// Why: gives the operator feedback on the last action, or the key hint when
@@ -783,6 +830,23 @@ pub fn status_line(state: &DashboardState) -> String {
     } else {
         body
     }
+}
+
+/// Build the styled controls-hint [`Line`] for the header area.
+///
+/// Why: the hint text rendered in the plain terminal default foreground was
+/// invisible in iTerm2 (and many other terminals) because the header area
+/// inherits a background that can be close to the default foreground color.
+/// Bold + reversed video swaps the terminal's own fg/bg pair so the line is
+/// guaranteed to be readable on every dark or light theme.
+/// What: wraps `status_line(state)` with `Modifier::BOLD | Modifier::REVERSED`.
+/// Test: `status_bar_line_is_high_contrast`.
+pub fn status_bar_line(state: &DashboardState) -> Line<'static> {
+    Line::from(status_line(state)).style(
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::REVERSED),
+    )
 }
 
 /// Shared style for table header rows (Sessions, Circuit Breakers).
@@ -850,7 +914,7 @@ fn render_help_overlay(frame: &mut Frame) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Help — press ? or Esc to close"),
+                    .title(panel_title("Help — press ? or Esc to close")),
             ),
         area,
     );
@@ -1042,21 +1106,18 @@ pub fn render_with_table_state(
         ])
         .split(chunks[1]);
 
+    // The title doubles as a daemon-health indicator: a calm cyan when the
+    // daemon is reachable, a loud red when it is not, so the operator sees the
+    // error state at a glance instead of reading the text.
     let title = if state.daemon_reachable {
         format!("trusty-mpm dashboard — {} session(s)", state.sessions.len())
     } else {
         "trusty-mpm dashboard — daemon unreachable".to_string()
     };
     let header = Paragraph::new(vec![
-        Line::from(title).style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        // Status / controls bar: use the terminal's default foreground (no dim
-        // `Gray`, which is near-invisible on many light and dark themes) so the
-        // key hints stay legible regardless of the terminal palette.
-        Line::from(status_line(state)),
+        Line::from(title).style(title_style(state.daemon_reachable)),
+        // Status / controls bar: see `status_bar_line` for the contrast rationale.
+        status_bar_line(state),
     ]);
     frame.render_widget(header, chunks[0]);
 
@@ -1215,8 +1276,8 @@ mod tests {
     #[test]
     fn selected_row_is_highlighted() {
         // `session_rows` with `selected = 0` builds two rows; the highlight
-        // logic in `session_row_style` puts a `DarkGray` background on the
-        // selected row only.
+        // logic in `session_row_style` puts a high-contrast blue background
+        // on the selected row only.
         let state = DashboardState {
             sessions: vec![
                 session("a", "/p/a", "active", "tmpm-a"),
@@ -1226,12 +1287,36 @@ mod tests {
         };
         let rows = session_rows(&state, 0);
         assert_eq!(rows.len(), 2);
-        // Row 0 is selected → DarkGray bg + white fg.
+        // Row 0 is selected → solid blue bg + bold white fg for clear contrast.
         let selected = session_row_style(true);
-        assert_eq!(selected.bg, Some(Color::DarkGray));
+        assert_eq!(selected.bg, Some(Color::Blue));
         assert_eq!(selected.fg, Some(Color::White));
-        // Row 1 is not selected → no DarkGray background.
-        assert_ne!(session_row_style(false).bg, Some(Color::DarkGray));
+        assert!(selected.add_modifier.contains(Modifier::BOLD));
+        // Row 1 is not selected → no background highlight.
+        assert_eq!(session_row_style(false).bg, None);
+    }
+
+    #[test]
+    fn title_color_signals_daemon_health() {
+        // The header title is a health indicator: cyan when the daemon is
+        // reachable, a loud red when it is not so the operator cannot miss it.
+        assert_eq!(title_color(true), Color::Cyan);
+        assert_eq!(title_color(false), Color::Red);
+    }
+
+    #[test]
+    fn title_style_signals_daemon_health() {
+        // Healthy: calm bold cyan, no reverse video.
+        let healthy = title_style(true);
+        assert_eq!(healthy.fg, Some(Color::Cyan));
+        assert!(healthy.add_modifier.contains(Modifier::BOLD));
+        assert!(!healthy.add_modifier.contains(Modifier::REVERSED));
+        // Unreachable: loud bold + reverse-video red banner — unmissable on any
+        // terminal theme, light or dark.
+        let down = title_style(false);
+        assert_eq!(down.fg, Some(Color::Red));
+        assert!(down.add_modifier.contains(Modifier::BOLD));
+        assert!(down.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -1621,8 +1706,10 @@ mod tests {
     fn session_status_colours() {
         assert_eq!(session_status_color("active"), Color::Green);
         assert_eq!(session_status_color("paused"), Color::Yellow);
-        assert_eq!(session_status_color("unknown"), Color::Gray);
-        assert_eq!(session_status_color("anything-else"), Color::Gray);
+        // Unknown statuses fall back to white, not a dim gray, so they stay
+        // readable on every terminal theme.
+        assert_eq!(session_status_color("unknown"), Color::White);
+        assert_eq!(session_status_color("anything-else"), Color::White);
     }
 
     #[test]
@@ -1630,7 +1717,8 @@ mod tests {
         assert_eq!(breaker_state_color("closed"), Color::Green);
         assert_eq!(breaker_state_color("half_open"), Color::Yellow);
         assert_eq!(breaker_state_color("open"), Color::Red);
-        assert_eq!(breaker_state_color("weird"), Color::Gray);
+        // Unknown breaker states fall back to readable white, not dim gray.
+        assert_eq!(breaker_state_color("weird"), Color::White);
     }
 
     #[test]
@@ -1650,6 +1738,27 @@ mod tests {
         assert_eq!(span.content, "Sessions");
         assert_eq!(span.style.fg, Some(Color::Cyan));
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn status_bar_line_is_high_contrast() {
+        // The controls hint must be bold + reversed so it is legible on every
+        // terminal theme (dark or light) without hard-coding a color.
+        let state = DashboardState::default();
+        let line = status_bar_line(&state);
+        assert!(
+            line.style.add_modifier.contains(Modifier::BOLD),
+            "status bar line must be bold"
+        );
+        assert!(
+            line.style.add_modifier.contains(Modifier::REVERSED),
+            "status bar line must use reversed video for contrast"
+        );
+        // The text content must still carry the key hint.
+        assert!(
+            line.to_string().contains("navigate"),
+            "status bar must include key hints"
+        );
     }
 
     #[test]

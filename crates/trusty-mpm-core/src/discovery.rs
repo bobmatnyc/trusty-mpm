@@ -3,20 +3,34 @@
 //! Why: The daemon may bind to an ephemeral port when 7880 is busy.
 //! The lock file records the actual address so clients always find it.
 //! What: `resolve_daemon_url` checks an explicit override first, then
-//! reads `~/.config/trusty-mpm/daemon.lock`, then falls back to the
-//! hard-coded default.
+//! reads `~/.trusty-mpm/daemon.lock`, then falls back to the hard-coded
+//! default.
 //! Test: The unit tests below cover all three resolution paths.
 
 use std::path::PathBuf;
+
+use crate::paths::FRAMEWORK_DIR_NAME;
 
 /// Default daemon URL when no override and no lock file is found.
 pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:7880";
 
 /// Path to the daemon lock file.
+///
+/// Why: the lock file MUST live in the same `~/.trusty-mpm` root as every
+/// other framework artifact (logs, sessions, framework dir). It previously
+/// resolved under `dirs::config_dir()` (`~/.config/trusty-mpm`), so the daemon
+/// wrote the lock to one directory while the rest of the app — and any user
+/// inspecting the install — looked in another. That mismatch meant clients
+/// that resolved the URL from a differently-configured environment (or simply
+/// expected the documented `~/.trusty-mpm` location) never found the lock and
+/// fell back to the default port, reporting "daemon unreachable".
+/// What: `~/.trusty-mpm/daemon.lock`, derived from the same `home_dir` +
+/// [`FRAMEWORK_DIR_NAME`] as `FrameworkPaths`.
+/// Test: `lock_file_path_is_under_framework_root`.
 pub fn lock_file_path() -> PathBuf {
-    dirs::config_dir()
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("trusty-mpm")
+        .join(FRAMEWORK_DIR_NAME)
         .join("daemon.lock")
 }
 
@@ -24,7 +38,7 @@ pub fn lock_file_path() -> PathBuf {
 /// 1. `explicit` — from `--url` flag or `TRUSTY_MPM_URL` env var (if Some,
 ///    non-empty, AND not just the default). A caller passing the clap default
 ///    value is treated the same as passing None so the lock file can win.
-/// 2. Lock file `~/.config/trusty-mpm/daemon.lock` (if present and PID alive)
+/// 2. Lock file `~/.trusty-mpm/daemon.lock` (if present and PID alive)
 /// 3. `DEFAULT_DAEMON_URL`
 pub fn resolve_daemon_url(explicit: Option<&str>) -> String {
     // 1. Explicit override wins — but only if it's a real override, not the
@@ -105,5 +119,23 @@ mod tests {
         // We can't guarantee no lock file exists, so just check it's a valid URL.
         let result = resolve_daemon_url(None);
         assert!(result.starts_with("http"));
+    }
+
+    #[test]
+    fn lock_file_path_is_under_framework_root() {
+        // Why: the lock file must share the `~/.trusty-mpm` root with every
+        // other framework artifact. A path under `~/.config` (the previous
+        // behaviour) meant the daemon and its clients could disagree on the
+        // location and the TUI would report "daemon unreachable".
+        let path = lock_file_path();
+        assert!(
+            path.ends_with(format!("{FRAMEWORK_DIR_NAME}/daemon.lock")),
+            "lock file path {path:?} is not under the {FRAMEWORK_DIR_NAME} root"
+        );
+        // The parent directory is the framework root itself.
+        assert_eq!(
+            path.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new(FRAMEWORK_DIR_NAME))
+        );
     }
 }

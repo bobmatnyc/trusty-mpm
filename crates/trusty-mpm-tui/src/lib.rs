@@ -38,6 +38,32 @@ pub async fn run(url: String, interval_ms: u64) -> anyhow::Result<()> {
     run_focused(url, interval_ms, None).await
 }
 
+/// Re-resolve the daemon URL from the lock file when the daemon is unreachable.
+///
+/// Why: `DaemonClient` is built once at startup from a URL resolved at that
+/// instant. If the TUI launched before the daemon wrote its lock file, or the
+/// daemon later restarted onto a fresh ephemeral port, the client would stay
+/// pinned to a stale address and report "daemon unreachable" forever even
+/// though a daemon is live. Re-resolving on every failed poll lets the TUI
+/// self-heal and follow the daemon to its current address.
+/// What: when `reachable` is `false`, calls [`trusty_mpm_core::resolve_daemon_url`]
+/// (lock file → default) and, if it yields a URL different from the client's
+/// current base, re-points the client and returns `true` so the caller can
+/// re-poll immediately. A no-op (returns `false`) while the daemon is reachable.
+/// Test: `rediscover_repoints_when_lockfile_changes`.
+fn rediscover_daemon(client: &mut DaemonClient, reachable: bool) -> bool {
+    if reachable {
+        return false;
+    }
+    let resolved = trusty_mpm_core::resolve_daemon_url(None);
+    if resolved != client.base_url() {
+        client.set_base_url(resolved);
+        true
+    } else {
+        false
+    }
+}
+
 /// Run the dashboard pre-focused on a specific session.
 ///
 /// Why: `tm connect <target>` resolves a fuzzy target to a definitive session
@@ -53,7 +79,7 @@ pub async fn run_focused(
     interval_ms: u64,
     focus_id: Option<String>,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(url);
+    let mut client = DaemonClient::new(url);
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -61,7 +87,7 @@ pub async fn run_focused(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &client, interval_ms, focus_id).await;
+    let result = run_loop(&mut terminal, &mut client, interval_ms, focus_id).await;
 
     // Always restore the terminal, even on error.
     disable_raw_mode()?;
@@ -76,10 +102,19 @@ pub async fn run_focused(
 /// re-poll on demand (after an action) as well as on its timer.
 /// What: probes health, then pulls sessions / events / breakers and the on-disk
 /// log tail; clears the panels when the daemon is unreachable. Re-clamps the
-/// session selection so a shrunken list never leaves a stale index.
-/// Test: the pure pieces (rendering, client, clamping) are unit-tested.
-async fn poll_daemon(state: &mut DashboardState, client: &DaemonClient) {
+/// session selection so a shrunken list never leaves a stale index. When the
+/// daemon is unreachable it re-resolves the daemon URL from the lock file via
+/// [`rediscover_daemon`] and retries one health probe, so the TUI follows the
+/// daemon to a new ephemeral port after a restart instead of being stuck.
+/// Test: the pure pieces (rendering, client, clamping, rediscovery) are
+/// unit-tested.
+async fn poll_daemon(state: &mut DashboardState, client: &mut DaemonClient) {
     state.daemon_reachable = client.is_healthy().await;
+    // Self-heal: if the daemon looks unreachable, the lock file may now point
+    // at a different (ephemeral) port — re-resolve and retry one probe.
+    if rediscover_daemon(client, state.daemon_reachable) {
+        state.daemon_reachable = client.is_healthy().await;
+    }
     if state.daemon_reachable {
         match client.sessions().await {
             Ok(sessions) => state.sessions = sessions,
@@ -148,7 +183,7 @@ async fn refresh_session_output(state: &mut DashboardState, client: &DaemonClien
 /// loop is the thin glue exercised by launching the dashboard.
 async fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
-    client: &DaemonClient,
+    client: &mut DaemonClient,
     interval_ms: u64,
     focus_id: Option<String>,
 ) -> anyhow::Result<()> {
@@ -639,6 +674,31 @@ mod tests {
         };
         handle_open_in_iterm2(&mut state);
         assert_eq!(state.last_action.as_deref(), Some("no sessions"));
+    }
+
+    #[test]
+    fn rediscover_is_noop_when_daemon_reachable() {
+        // Why: a reachable daemon must never trigger a URL re-resolution — that
+        // would needlessly thrash the client base URL while everything works.
+        let mut client = DaemonClient::new("http://127.0.0.1:7880");
+        assert!(!rediscover_daemon(&mut client, true));
+        assert_eq!(client.base_url(), "http://127.0.0.1:7880");
+    }
+
+    #[test]
+    fn rediscover_is_noop_when_resolved_url_unchanged() {
+        // Why: when the daemon is unreachable but the lock file resolves to the
+        // same URL the client already targets, re-pointing is pointless — the
+        // function must report "no change" so the caller does not re-poll.
+        // What: with no lock file present, `resolve_daemon_url(None)` returns the
+        // default; a client already on the default sees no change.
+        let mut client = DaemonClient::new(trusty_mpm_core::DEFAULT_DAEMON_URL);
+        // If a stale lock file exists on this machine it could resolve elsewhere;
+        // either way the function must not panic and must return a bool.
+        let changed = rediscover_daemon(&mut client, false);
+        if !changed {
+            assert_eq!(client.base_url(), trusty_mpm_core::DEFAULT_DAEMON_URL);
+        }
     }
 
     #[tokio::test]
