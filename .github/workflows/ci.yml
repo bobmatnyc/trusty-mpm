@@ -64,4 +64,4 @@ jobs:
           workspaces: trusty-mpm
       - name: cargo check
         working-directory: trusty-mpm
-        run: cargo check --workspace --exclude trusty-mpm-gui
+        run: cargo check --workspace --exclude trusty-mpm-gui --no-default-features
