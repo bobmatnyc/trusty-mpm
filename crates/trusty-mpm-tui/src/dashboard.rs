@@ -21,26 +21,220 @@ use ratatui::{
 use crate::client::{BreakerRow, EventRow, SessionRow};
 
 /// One-line key hint shown in the status bar before any action is taken.
-pub const KEY_HINT: &str = "keys: ↑↓ navigate | p pause | r resume | x stop | o iTerm2 tab | c connect | / command | ? help | q quit";
+pub const KEY_HINT: &str = "keys: ↑↓ navigate | p pause | r resume | x stop | o iTerm2 tab | : / command | ? help | q quit";
 
-/// A pairing overlay's display contents.
+/// Maximum number of executed commands kept in the command-bar history.
+pub const COMMAND_HISTORY_LIMIT: usize = 20;
+
+/// Every slash command the command bar knows, in autocomplete order.
 ///
-/// Why: when the operator runs `/pair`, the dashboard must show the returned
-/// code (or an error) in a prominent, dismissible overlay; holding the rendered
-/// strings here keeps overlay state out of the render path.
-/// What: either a successful code with its TTL, or a failure message.
-/// Test: `pair_overlay_lines_show_code`, `pair_overlay_lines_show_error`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PairDisplay {
-    /// A pairing code was issued; carries the code and its lifetime in seconds.
-    Code {
-        /// One-time pairing code from `POST /pair/request`.
-        code: String,
-        /// Seconds until the code expires.
-        expires_in_seconds: u64,
-    },
-    /// The pairing request failed; carries the human-readable reason.
-    Error(String),
+/// Why: the command bar's Tab autocomplete and `/help` both enumerate the known
+/// commands; keeping the canonical list here means a new command is registered
+/// in exactly one place.
+/// What: the bare command verbs, each as it would appear after the leading `/`.
+/// Test: `known_commands_contains_core_verbs`.
+pub const KNOWN_COMMANDS: &[&str] = &[
+    "pair", "projects", "sessions", "tmux", "status", "adopt", "help", "connect",
+];
+
+/// The persistent slash-command bar pinned to the bottom of the dashboard.
+///
+/// Why: the operator needs a vim-style command line that is always visible — an
+/// output panel showing the last command's result above a single input line —
+/// rather than transient modal overlays. Holding all of its mutable state in one
+/// struct keeps the event loop and the renderer in sync.
+/// What: `active` gates whether keystrokes are captured for editing; `input` is
+/// the current edit buffer; `output` holds the last result's wrapped lines;
+/// `history` is a ring of the last [`COMMAND_HISTORY_LIMIT`] executed commands;
+/// `history_cursor` tracks ↑/↓ recall; `autocomplete_cycle` tracks Tab cycling.
+/// Test: `command_bar_*` unit tests cover activation, editing, history, and
+/// autocomplete.
+#[derive(Debug, Clone, Default)]
+pub struct CommandBar {
+    /// Whether the bar is capturing keystrokes (cursor shown, input editable).
+    pub active: bool,
+    /// The current edit buffer (without the leading `/`).
+    pub input: String,
+    /// Wrapped output lines from the last executed command.
+    pub output: Vec<String>,
+    /// Recently executed commands, newest last, capped at the history limit.
+    pub history: Vec<String>,
+    /// Index into [`Self::history`] while recalling with ↑/↓; `None` = live input.
+    history_cursor: Option<usize>,
+    /// Tab autocomplete state: `(matches, index)` for the current cycle.
+    autocomplete_cycle: Option<(Vec<String>, usize)>,
+}
+
+impl CommandBar {
+    /// Activate the command bar so it begins capturing keystrokes.
+    ///
+    /// Why: the `:` and `/` keys turn the always-visible bar into an editable
+    /// command line; the activating key itself is consumed, not buffered, so the
+    /// operator types the bare command verb.
+    /// What: sets [`Self::active`] and resets the history cursor and the
+    /// autocomplete cycle so a fresh edit session starts clean.
+    /// Test: `command_bar_activate_deactivate`.
+    pub fn activate(&mut self) {
+        self.active = true;
+        self.history_cursor = None;
+        self.autocomplete_cycle = None;
+    }
+
+    /// Deactivate the command bar and clear the edit buffer (the Esc key).
+    ///
+    /// Why: Esc must abandon a half-typed command and return single-key
+    /// shortcuts to normal operation; the output panel is left intact so the
+    /// operator can still read the last result.
+    /// What: clears [`Self::active`] and [`Self::input`], resets recall state.
+    /// Test: `command_bar_activate_deactivate`.
+    pub fn deactivate(&mut self) {
+        self.active = false;
+        self.input.clear();
+        self.history_cursor = None;
+        self.autocomplete_cycle = None;
+    }
+
+    /// Append a character to the input buffer while the bar is active.
+    ///
+    /// Why: printable keystrokes build up the command string.
+    /// What: pushes `c`; resets the autocomplete cycle and history cursor so the
+    /// next Tab / ↑ starts fresh. A no-op when the bar is inactive.
+    /// Test: `command_bar_edits_buffer`.
+    pub fn push(&mut self, c: char) {
+        if !self.active {
+            return;
+        }
+        self.input.push(c);
+        self.autocomplete_cycle = None;
+        self.history_cursor = None;
+    }
+
+    /// Delete the last character of the input buffer (the Backspace key).
+    ///
+    /// Why: Backspace must edit a mistyped command.
+    /// What: pops the trailing character; resets autocomplete / recall state.
+    /// A no-op when the bar is inactive or the buffer is empty.
+    /// Test: `command_bar_edits_buffer`.
+    pub fn backspace(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.input.pop();
+        self.autocomplete_cycle = None;
+        self.history_cursor = None;
+    }
+
+    /// Cycle Tab autocomplete through the commands matching the current prefix.
+    ///
+    /// Why: pressing Tab on `/p` should cycle `/pair`, `/projects` so the
+    /// operator never has to type a full command name.
+    /// What: on the first Tab for a prefix, collects every [`KNOWN_COMMANDS`]
+    /// entry that starts with the typed verb and replaces the buffer with the
+    /// first match; each further Tab advances to the next match, wrapping. A
+    /// no-op when the bar is inactive or nothing matches.
+    /// Test: `command_bar_tab_cycles_matches`.
+    pub fn autocomplete(&mut self) {
+        if !self.active {
+            return;
+        }
+        // Continue an in-progress cycle when the buffer still matches it.
+        if let Some((matches, idx)) = self.autocomplete_cycle.as_mut()
+            && self.input == matches[*idx]
+        {
+            *idx = (*idx + 1) % matches.len();
+            self.input = matches[*idx].clone();
+            return;
+        }
+        let prefix = normalize_command(&self.input);
+        let matches: Vec<String> = KNOWN_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.starts_with(&prefix))
+            .map(|cmd| (*cmd).to_string())
+            .collect();
+        if matches.is_empty() {
+            self.autocomplete_cycle = None;
+            return;
+        }
+        self.input = matches[0].clone();
+        self.autocomplete_cycle = Some((matches, 0));
+    }
+
+    /// Recall the previous command from history (the ↑ key).
+    ///
+    /// Why: re-running or editing a recent command should not require retyping.
+    /// What: moves the history cursor one step toward the oldest entry and loads
+    /// it into the buffer; a no-op when the bar is inactive or history is empty.
+    /// Test: `command_bar_history_recall`.
+    pub fn history_prev(&mut self) {
+        if !self.active || self.history.is_empty() {
+            return;
+        }
+        let next = match self.history_cursor {
+            None => self.history.len() - 1,
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_cursor = Some(next);
+        self.input = self.history[next].clone();
+        self.autocomplete_cycle = None;
+    }
+
+    /// Recall the next (newer) command from history (the ↓ key).
+    ///
+    /// Why: lets the operator step back down after recalling too far with ↑.
+    /// What: advances the history cursor toward the newest entry; stepping past
+    /// the newest clears the cursor and empties the buffer (back to live input).
+    /// A no-op when the bar is inactive or no recall is in progress.
+    /// Test: `command_bar_history_recall`.
+    pub fn history_next(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Some(i) = self.history_cursor else {
+            return;
+        };
+        if i + 1 >= self.history.len() {
+            self.history_cursor = None;
+            self.input.clear();
+        } else {
+            self.history_cursor = Some(i + 1);
+            self.input = self.history[i + 1].clone();
+        }
+        self.autocomplete_cycle = None;
+    }
+
+    /// Take the typed command for execution, recording it in history.
+    ///
+    /// Why: pressing Enter dispatches the command; the loop needs the buffer's
+    /// text and the bar needs the command pushed onto its bounded history.
+    /// What: returns the trimmed buffer, clears the input, appends a non-empty
+    /// command to [`Self::history`] (dropping the oldest beyond the limit), and
+    /// resets the recall / autocomplete state. The bar stays active.
+    /// Test: `command_bar_submit_records_history`.
+    pub fn take_for_execution(&mut self) -> String {
+        let typed = std::mem::take(&mut self.input);
+        self.history_cursor = None;
+        self.autocomplete_cycle = None;
+        let trimmed = typed.trim().to_string();
+        if !trimmed.is_empty() {
+            self.history.push(trimmed.clone());
+            if self.history.len() > COMMAND_HISTORY_LIMIT {
+                let overflow = self.history.len() - COMMAND_HISTORY_LIMIT;
+                self.history.drain(0..overflow);
+            }
+        }
+        trimmed
+    }
+
+    /// Replace the output panel with the result of the last command.
+    ///
+    /// Why: command results are shown inline in the panel above the input line
+    /// rather than in a modal popup.
+    /// What: stores `lines` as the new output, discarding the previous result.
+    /// Test: `command_bar_set_output`.
+    pub fn set_output(&mut self, lines: Vec<String>) {
+        self.output = lines;
+    }
 }
 
 /// Snapshot of everything the dashboard renders this frame.
@@ -85,30 +279,16 @@ pub struct DashboardState {
     /// initialises; drives the `[iTerm2]` status-bar indicator.
     /// Test: `status_line_shows_iterm2_indicator`.
     pub iterm2_mode: bool,
-    /// Current contents of the inline `connect>` prompt, if it is open.
+    /// The persistent vim-style slash-command bar pinned to the bottom.
     ///
-    /// Why: the `c` key opens an inline prompt where the operator types a fuzzy
-    /// session target; while it is `Some` the event loop routes every keystroke
-    /// to the prompt instead of navigation/action keys.
-    /// What: `None` when the prompt is closed, `Some(buffer)` while editing.
-    /// Test: `connect_prompt_open_close`, `connect_prompt_edits_buffer`.
-    pub connect_prompt: Option<String>,
-    /// Current contents of the inline `command>` prompt, if it is open.
-    ///
-    /// Why: the `/` key opens a slash-command bar where the operator types a
-    /// command name (e.g. `pair`); while it is `Some` the event loop routes
-    /// every keystroke to the prompt instead of navigation/action keys.
-    /// What: `None` when the prompt is closed, `Some(buffer)` while editing.
-    /// Test: `command_prompt_open_close`, `command_prompt_edits_buffer`.
-    pub command_prompt: Option<String>,
-    /// The pairing overlay's contents, when it is visible.
-    ///
-    /// Why: `/pair` requests a Telegram pairing code from the daemon; the result
-    /// must stay on screen long enough for the operator to read and type it into
-    /// their bot, then be dismissible with Esc/Enter.
-    /// What: `None` when no overlay is shown, `Some(PairDisplay)` otherwise.
-    /// Test: `pair_overlay_open_close`, `pair_overlay_lines_show_code`.
-    pub pair_overlay: Option<PairDisplay>,
+    /// Why: the operator drives every slash command (`/pair`, `/projects`, …)
+    /// from one always-visible bar with an inline output panel, Tab
+    /// autocomplete, and ↑/↓ history — replacing the old transient prompts and
+    /// the pairing modal popup.
+    /// What: see [`CommandBar`]; `command_bar.active` gates whether keystrokes
+    /// are captured for editing or fall through to single-key shortcuts.
+    /// Test: `command_bar_*` unit tests.
+    pub command_bar: CommandBar,
 }
 
 impl DashboardState {
@@ -191,64 +371,19 @@ impl DashboardState {
             .collect()
     }
 
-    /// Open the inline `connect>` prompt with an empty buffer.
+    /// Resolve a fuzzy target and focus the matching session for `/connect`.
     ///
-    /// Why: the `c` key starts a fuzzy session-connect flow without leaving the
-    /// dashboard.
-    /// What: sets [`Self::connect_prompt`] to `Some(String::new())`.
-    /// Test: `connect_prompt_open_close`.
-    pub fn open_connect_prompt(&mut self) {
-        self.connect_prompt = Some(String::new());
-    }
-
-    /// Close the `connect>` prompt without taking any action (the Esc key).
-    ///
-    /// Why: the operator must be able to abandon a half-typed target.
-    /// What: clears [`Self::connect_prompt`] back to `None`.
-    /// Test: `connect_prompt_open_close`.
-    pub fn close_connect_prompt(&mut self) {
-        self.connect_prompt = None;
-    }
-
-    /// Append a character to the open `connect>` prompt buffer.
-    ///
-    /// Why: printable keystrokes build up the target string while the prompt is
-    /// open.
-    /// What: pushes `c` onto the buffer; a no-op when the prompt is closed.
-    /// Test: `connect_prompt_edits_buffer`.
-    pub fn connect_prompt_push(&mut self, c: char) {
-        if let Some(buf) = self.connect_prompt.as_mut() {
-            buf.push(c);
-        }
-    }
-
-    /// Delete the last character of the open `connect>` prompt buffer.
-    ///
-    /// Why: Backspace must edit a mistyped target.
-    /// What: pops the trailing character; a no-op when closed or empty.
-    /// Test: `connect_prompt_edits_buffer`.
-    pub fn connect_prompt_backspace(&mut self) {
-        if let Some(buf) = self.connect_prompt.as_mut() {
-            buf.pop();
-        }
-    }
-
-    /// Resolve the typed target and focus the matching session (the Enter key).
-    ///
-    /// Why: completes the in-TUI `/connect` flow — the operator types a fuzzy
-    /// target and expects the dashboard to jump to that session.
-    /// What: resolves the prompt buffer against the current sessions via
+    /// Why: the `/connect <id>` command jumps the dashboard selection to a
+    /// session resolved from a fuzzy target — id prefix, name, or workdir.
+    /// What: resolves `target` against the current sessions via
     /// [`trusty_mpm_core::resolve_target`]; on `Found` it focuses the row and
-    /// records `"Connected to <id>"`, on `Ambiguous`/`NotFound` it records the
-    /// matching status line; always closes the prompt afterward.
-    /// Test: `submit_connect_found`, `submit_connect_not_found`,
-    /// `submit_connect_ambiguous`.
-    pub fn submit_connect(&mut self) {
-        let Some(target) = self.connect_prompt.take() else {
-            return;
-        };
+    /// returns `"Connected to <id>"`, on `Ambiguous`/`NotFound` it returns the
+    /// matching status line. Does not touch any input buffer.
+    /// Test: `resolve_connect_found`, `resolve_connect_not_found`,
+    /// `resolve_connect_ambiguous`.
+    pub fn resolve_connect(&mut self, target: &str) -> String {
         let summaries = self.session_summaries();
-        self.last_action = Some(match trusty_mpm_core::resolve_target(&target, &summaries) {
+        match trusty_mpm_core::resolve_target(target, &summaries) {
             trusty_mpm_core::ResolveResult::Found(id) => {
                 self.focus_on(&id);
                 format!("Connected to {id}")
@@ -257,80 +392,7 @@ impl DashboardState {
                 format!("Ambiguous: {}", ids.join(", "))
             }
             trusty_mpm_core::ResolveResult::NotFound => "No session matched".to_string(),
-        });
-    }
-
-    /// Open the inline `command>` slash-command prompt with an empty buffer.
-    ///
-    /// Why: the `/` key starts a slash-command flow (e.g. `/pair`) without
-    /// leaving the dashboard.
-    /// What: sets [`Self::command_prompt`] to `Some(String::new())`.
-    /// Test: `command_prompt_open_close`.
-    pub fn open_command_prompt(&mut self) {
-        self.command_prompt = Some(String::new());
-    }
-
-    /// Close the `command>` prompt without dispatching anything (the Esc key).
-    ///
-    /// Why: the operator must be able to abandon a half-typed command.
-    /// What: clears [`Self::command_prompt`] back to `None`.
-    /// Test: `command_prompt_open_close`.
-    pub fn close_command_prompt(&mut self) {
-        self.command_prompt = None;
-    }
-
-    /// Append a character to the open `command>` prompt buffer.
-    ///
-    /// Why: printable keystrokes build up the command string while open.
-    /// What: pushes `c` onto the buffer; a no-op when the prompt is closed.
-    /// Test: `command_prompt_edits_buffer`.
-    pub fn command_prompt_push(&mut self, c: char) {
-        if let Some(buf) = self.command_prompt.as_mut() {
-            buf.push(c);
         }
-    }
-
-    /// Delete the last character of the open `command>` prompt buffer.
-    ///
-    /// Why: Backspace must edit a mistyped command.
-    /// What: pops the trailing character; a no-op when closed or empty.
-    /// Test: `command_prompt_edits_buffer`.
-    pub fn command_prompt_backspace(&mut self) {
-        if let Some(buf) = self.command_prompt.as_mut() {
-            buf.pop();
-        }
-    }
-
-    /// Show the pairing overlay with a freshly-issued code.
-    ///
-    /// Why: a successful `/pair` request must display the code prominently so
-    /// the operator can read it and type it into their Telegram bot.
-    /// What: sets [`Self::pair_overlay`] to a [`PairDisplay::Code`].
-    /// Test: `pair_overlay_lines_show_code`.
-    pub fn show_pair_code(&mut self, code: String, expires_in_seconds: u64) {
-        self.pair_overlay = Some(PairDisplay::Code {
-            code,
-            expires_in_seconds,
-        });
-    }
-
-    /// Show the pairing overlay with an error message.
-    ///
-    /// Why: a failed `/pair` request must still surface the reason to the
-    /// operator rather than silently doing nothing.
-    /// What: sets [`Self::pair_overlay`] to a [`PairDisplay::Error`].
-    /// Test: `pair_overlay_lines_show_error`.
-    pub fn show_pair_error(&mut self, message: String) {
-        self.pair_overlay = Some(PairDisplay::Error(message));
-    }
-
-    /// Dismiss the pairing overlay (the Esc / Enter keys).
-    ///
-    /// Why: the overlay must clear once the operator has read or copied it.
-    /// What: clears [`Self::pair_overlay`] back to `None`.
-    /// Test: `pair_overlay_open_close`.
-    pub fn close_pair_overlay(&mut self) {
-        self.pair_overlay = None;
     }
 }
 
@@ -586,73 +648,101 @@ pub fn help_text() -> String {
         "  r         resume selected session",
         "  x         stop selected session",
         "  o         open session in iTerm2 tab",
-        "  c         connect to session",
-        "  /         slash command (e.g. /pair)",
+        "  : or /    activate the command bar",
         "  ?         toggle this help",
         "  q / Esc   quit",
     ]
     .join("\n")
 }
 
-/// Build the body lines for the pairing overlay.
+/// Build the multi-line `/help` output shown in the command-bar output panel.
 ///
-/// Why: separating overlay text from the ratatui widget lets a test assert the
-/// content (the code, the TTL, the bot instruction) without a terminal backend.
-/// What: for a [`PairDisplay::Code`], a two-line block showing the code with its
-/// expiry and the `/pair <code>` bot instruction; for [`PairDisplay::Error`], a
-/// single error line.
-/// Test: `pair_overlay_lines_show_code`, `pair_overlay_lines_show_error`.
-pub fn pair_overlay_lines(display: &PairDisplay) -> Vec<String> {
-    match display {
-        PairDisplay::Code {
-            code,
-            expires_in_seconds,
-        } => {
-            let minutes = expires_in_seconds / 60;
-            vec![
-                format!("Telegram pairing code: {code}  (expires in {minutes} min)"),
-                format!("Send /pair {code} to your Telegram bot"),
-            ]
-        }
-        PairDisplay::Error(message) => vec![format!("Pairing failed: {message}")],
+/// Why: the `/help` command must document every slash command inline; keeping
+/// the text in one function lets a test assert each command is listed.
+/// What: a header line plus one `  /<cmd>  — <description>` line per command.
+/// Test: `command_help_lines_list_all_commands`.
+pub fn command_help_lines() -> Vec<String> {
+    vec![
+        "Available commands:".to_string(),
+        "  /pair             request a Telegram pairing code".to_string(),
+        "  /projects         list discovered Claude Code projects".to_string(),
+        "  /sessions         list daemon sessions".to_string(),
+        "  /tmux             list tmux sessions (managed + external)".to_string(),
+        "  /status           show daemon status".to_string(),
+        "  /adopt <name>     adopt a tmux session by name".to_string(),
+        "  /connect <id>     focus a session by fuzzy target".to_string(),
+        "  /help             show this help".to_string(),
+        "Tab: autocomplete   ↑/↓: history   Esc: close".to_string(),
+    ]
+}
+
+/// Build the input line shown in the command bar.
+///
+/// Why: kept separate so a test can assert the rendered prefix and the cursor
+/// glyph without a terminal frame.
+/// What: returns `CMD> <input>` plus a trailing `_` cursor when `active`.
+/// Test: `command_input_line_shows_cursor_when_active`.
+pub fn command_input_line(bar: &CommandBar) -> String {
+    if bar.active {
+        format!("CMD> {}_", bar.input)
+    } else {
+        format!("CMD> {}", bar.input)
     }
 }
 
-/// Render the dismissible pairing overlay.
+/// Render the persistent command zone (output panel + input line).
 ///
-/// Why: `/pair` must show the issued code (or an error) prominently and stay
-/// until the operator dismisses it with Esc/Enter.
-/// What: clears a centred box and draws a bordered `Paragraph` of
-/// [`pair_overlay_lines`]; a code is drawn in green, an error in red.
-/// Test: the line content is covered by `pair_overlay_lines_*`; layout is
-/// exercised by the rendering smoke test.
-fn render_pair_overlay(frame: &mut Frame, display: &PairDisplay) {
-    let area = centered_rect(64, 6, frame.area());
-    let lines = pair_overlay_lines(display);
-    let color = match display {
-        PairDisplay::Code { .. } => Color::Green,
-        PairDisplay::Error(_) => Color::Red,
+/// Why: the command bar is always visible at the bottom of the dashboard — an
+/// output panel showing the last result above a single editable input line.
+/// What: draws a bordered `List` of the bar's output lines into `output_area`
+/// and a bordered `Paragraph` of [`command_input_line`] into `input_area`; the
+/// input line is highlighted yellow while the bar is active.
+/// Test: line content is covered by `command_input_line` and
+/// `command_help_lines`; layout is exercised by the rendering smoke test.
+fn render_command_zone(frame: &mut Frame, bar: &CommandBar, output_area: Rect, input_area: Rect) {
+    let output_items: Vec<ListItem> = if bar.output.is_empty() {
+        vec![ListItem::new(
+            "(no command output yet — press : or / to begin)",
+        )]
+    } else {
+        bar.output
+            .iter()
+            .map(|l| ListItem::new(l.as_str()))
+            .collect()
     };
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines.join("\n"))
-            .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Telegram Pairing — press Esc or Enter to dismiss"),
-            ),
-        area,
+    let output = List::new(output_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Command Output"),
     );
+    frame.render_widget(output, output_area);
+
+    let input_style = if bar.active {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let hint = if bar.active {
+        " [Tab: autocomplete  ↑↓: history]"
+    } else {
+        " [: or / to activate]"
+    };
+    let input = Paragraph::new(format!("{}{hint}", command_input_line(bar)))
+        .style(input_style)
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(input, input_area);
 }
 
 /// Draw the dashboard frame.
 ///
 /// Why: the single entry point the event loop calls each tick.
-/// What: a four-panel layout — a two-line header (title + status bar); a middle
-/// row split 60/40 between the sessions table and the circuit-breaker table; a
-/// bottom row split 50/50 between the recent-events list and the daemon log
-/// tail. When `show_help` is set, a centred help overlay floats over the layout.
+/// What: a panel layout — a two-line header (title + status bar); a middle row
+/// split 60/40 between the sessions table and the circuit-breaker table; an
+/// events/log row; then the persistent command zone (output panel + input
+/// line) pinned to the bottom. When `show_help` is set, a centred help overlay
+/// floats over the layout.
 /// Test: rendering is exercised by the integration smoke test; row/line content
 /// is unit-tested via `session_rows`, `breaker_rows`, and `event_lines`.
 pub fn render(frame: &mut Frame, state: &DashboardState) {
@@ -681,6 +771,8 @@ pub fn render_with_table_state(
             Constraint::Length(2),  // header (title + status bar)
             Constraint::Min(6),     // sessions + breakers
             Constraint::Length(10), // events + log tail
+            Constraint::Length(4),  // command output panel
+            Constraint::Length(3),  // command input line
         ])
         .split(frame.area());
 
@@ -754,71 +846,12 @@ pub fn render_with_table_state(
         List::new(log_items).block(Block::default().borders(Borders::ALL).title("Daemon Log"));
     frame.render_widget(log_panel, bottom[1]);
 
+    // The persistent command zone is always visible at the bottom.
+    render_command_zone(frame, &state.command_bar, chunks[3], chunks[4]);
+
     if state.show_help {
         render_help_overlay(frame);
     }
-
-    if let Some(buffer) = state.connect_prompt.as_deref() {
-        render_input_prompt(
-            frame,
-            "connect",
-            buffer,
-            "Connect — Enter to resolve, Esc to cancel",
-        );
-    }
-
-    if let Some(buffer) = state.command_prompt.as_deref() {
-        render_input_prompt(
-            frame,
-            "command",
-            buffer,
-            "Command — Enter to run, Esc to cancel",
-        );
-    }
-
-    // The pairing overlay is drawn last so it floats above every other panel.
-    if let Some(display) = state.pair_overlay.as_ref() {
-        render_pair_overlay(frame, display);
-    }
-}
-
-/// Render an inline single-line input prompt at the bottom of the frame.
-///
-/// Why: both the `c` (connect) and `/` (slash-command) flows need a visible
-/// single-line input showing what the operator has typed so far; sharing one
-/// renderer keeps the two prompts visually consistent.
-/// What: clears a three-row-tall bordered box on the bottom line and draws
-/// `<prefix>> <buffer>` inside a box titled `title`.
-/// Test: the prompt text is covered by `prompt_line`; the layout math is
-/// exercised by the rendering smoke test.
-fn render_input_prompt(frame: &mut Frame, prefix: &str, buffer: &str, title: &str) {
-    let area = frame.area();
-    let row = Rect {
-        x: area.x,
-        y: area.y + area.height.saturating_sub(3),
-        width: area.width,
-        height: 3,
-    };
-    frame.render_widget(Clear, row);
-    frame.render_widget(
-        Paragraph::new(prompt_line(prefix, buffer))
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title.to_string()),
-            ),
-        row,
-    );
-}
-
-/// Build the text shown inside an inline input prompt.
-///
-/// Why: kept separate so a test can assert the prompt prefix without a frame.
-/// What: returns `<prefix>> <buffer>`.
-/// Test: `prompt_line_has_prefix`.
-pub fn prompt_line(prefix: &str, buffer: &str) -> String {
-    format!("{prefix}> {buffer}")
 }
 
 #[cfg(test)]
@@ -1168,30 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_prompt_open_close() {
-        // `c` opens an empty prompt; Esc closes it.
-        let mut state = DashboardState::default();
-        assert!(state.connect_prompt.is_none());
-        state.open_connect_prompt();
-        assert_eq!(state.connect_prompt.as_deref(), Some(""));
-        state.close_connect_prompt();
-        assert!(state.connect_prompt.is_none());
-    }
-
-    #[test]
-    fn connect_prompt_edits_buffer() {
-        // Printable keys append, Backspace removes the trailing character.
-        let mut state = DashboardState::default();
-        state.open_connect_prompt();
-        state.connect_prompt_push('f');
-        state.connect_prompt_push('e');
-        assert_eq!(state.connect_prompt.as_deref(), Some("fe"));
-        state.connect_prompt_backspace();
-        assert_eq!(state.connect_prompt.as_deref(), Some("f"));
-    }
-
-    #[test]
-    fn submit_connect_found() {
+    fn resolve_connect_found() {
         // A unique name-prefix match focuses the row and reports "Connected to".
         let mut state = DashboardState {
             sessions: vec![
@@ -1200,36 +1210,23 @@ mod tests {
             ],
             ..DashboardState::default()
         };
-        state.open_connect_prompt();
-        for c in "front".chars() {
-            state.connect_prompt_push(c);
-        }
-        state.submit_connect();
-        assert!(state.connect_prompt.is_none());
+        let msg = state.resolve_connect("front");
         assert_eq!(state.selected_session, 0);
-        assert_eq!(
-            state.last_action.as_deref(),
-            Some(format!("Connected to {}", sid("aaa").0).as_str())
-        );
+        assert_eq!(msg, format!("Connected to {}", sid("aaa").0));
     }
 
     #[test]
-    fn submit_connect_not_found() {
+    fn resolve_connect_not_found() {
         // A target matching nothing reports "No session matched".
         let mut state = DashboardState {
             sessions: vec![session("aaa", "/p/a", "active", "frontend")],
             ..DashboardState::default()
         };
-        state.open_connect_prompt();
-        for c in "zzz".chars() {
-            state.connect_prompt_push(c);
-        }
-        state.submit_connect();
-        assert_eq!(state.last_action.as_deref(), Some("No session matched"));
+        assert_eq!(state.resolve_connect("zzz"), "No session matched");
     }
 
     #[test]
-    fn submit_connect_ambiguous() {
+    fn resolve_connect_ambiguous() {
         // Two sessions sharing a name prefix yield an "Ambiguous:" status line.
         let mut state = DashboardState {
             sessions: vec![
@@ -1238,57 +1235,12 @@ mod tests {
             ],
             ..DashboardState::default()
         };
-        state.open_connect_prompt();
-        for c in "feature".chars() {
-            state.connect_prompt_push(c);
-        }
-        state.submit_connect();
-        assert!(
-            state
-                .last_action
-                .as_deref()
-                .unwrap()
-                .starts_with("Ambiguous:")
-        );
+        assert!(state.resolve_connect("feature").starts_with("Ambiguous:"));
     }
 
     #[test]
-    fn prompt_line_has_prefix() {
-        assert_eq!(prompt_line("connect", "front"), "connect> front");
-        assert_eq!(prompt_line("command", "pair"), "command> pair");
-    }
-
-    #[test]
-    fn help_text_lists_connect_binding() {
-        assert!(help_text().contains("connect to session"));
-    }
-
-    #[test]
-    fn help_text_lists_slash_command_binding() {
-        assert!(help_text().contains("/pair"));
-    }
-
-    #[test]
-    fn command_prompt_open_close() {
-        // `/` opens an empty command prompt; Esc closes it.
-        let mut state = DashboardState::default();
-        assert!(state.command_prompt.is_none());
-        state.open_command_prompt();
-        assert_eq!(state.command_prompt.as_deref(), Some(""));
-        state.close_command_prompt();
-        assert!(state.command_prompt.is_none());
-    }
-
-    #[test]
-    fn command_prompt_edits_buffer() {
-        // Printable keys append, Backspace removes the trailing character.
-        let mut state = DashboardState::default();
-        state.open_command_prompt();
-        state.command_prompt_push('p');
-        state.command_prompt_push('a');
-        assert_eq!(state.command_prompt.as_deref(), Some("pa"));
-        state.command_prompt_backspace();
-        assert_eq!(state.command_prompt.as_deref(), Some("p"));
+    fn help_text_lists_command_bar_binding() {
+        assert!(help_text().contains("activate the command bar"));
     }
 
     #[test]
@@ -1300,40 +1252,168 @@ mod tests {
     }
 
     #[test]
-    fn pair_overlay_open_close() {
-        // A code (or error) opens the overlay; closing clears it.
-        let mut state = DashboardState::default();
-        assert!(state.pair_overlay.is_none());
-        state.show_pair_code("ABC123".into(), 300);
-        assert!(state.pair_overlay.is_some());
-        state.close_pair_overlay();
-        assert!(state.pair_overlay.is_none());
-        state.show_pair_error("daemon unreachable".into());
-        assert!(matches!(state.pair_overlay, Some(PairDisplay::Error(_))));
+    fn known_commands_contains_core_verbs() {
+        for verb in [
+            "pair", "projects", "sessions", "tmux", "status", "adopt", "help",
+        ] {
+            assert!(
+                KNOWN_COMMANDS.contains(&verb),
+                "KNOWN_COMMANDS missing `{verb}`"
+            );
+        }
     }
 
     #[test]
-    fn pair_overlay_lines_show_code() {
-        // The code overlay shows the code, a minute-rounded TTL, and the bot
-        // instruction line.
-        let display = PairDisplay::Code {
-            code: "ABC123".into(),
-            expires_in_seconds: 300,
-        };
-        let lines = pair_overlay_lines(&display);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("ABC123"));
-        assert!(lines[0].contains("expires in 5 min"));
-        assert!(lines[1].contains("/pair ABC123"));
+    fn command_help_lines_list_all_commands() {
+        let text = command_help_lines().join("\n");
+        for verb in [
+            "/pair",
+            "/projects",
+            "/sessions",
+            "/tmux",
+            "/status",
+            "/adopt",
+            "/connect",
+        ] {
+            assert!(text.contains(verb), "/help missing `{verb}`");
+        }
     }
 
     #[test]
-    fn pair_overlay_lines_show_error() {
-        let display = PairDisplay::Error("connection refused".into());
-        let lines = pair_overlay_lines(&display);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("Pairing failed"));
-        assert!(lines[0].contains("connection refused"));
+    fn command_bar_activate_deactivate() {
+        // `:` / `/` activate the bar; Esc deactivates and clears the buffer.
+        let mut bar = CommandBar::default();
+        assert!(!bar.active);
+        bar.activate();
+        assert!(bar.active);
+        bar.push('p');
+        bar.deactivate();
+        assert!(!bar.active);
+        assert!(bar.input.is_empty());
+    }
+
+    #[test]
+    fn command_bar_edits_buffer() {
+        // Printable keys append, Backspace removes the trailing character;
+        // both are no-ops while the bar is inactive.
+        let mut bar = CommandBar::default();
+        bar.push('x'); // inactive — ignored
+        assert!(bar.input.is_empty());
+        bar.activate();
+        bar.push('p');
+        bar.push('a');
+        assert_eq!(bar.input, "pa");
+        bar.backspace();
+        assert_eq!(bar.input, "p");
+    }
+
+    #[test]
+    fn command_bar_tab_cycles_matches() {
+        // Tab on `/p` cycles `pair` then `projects`, wrapping back to `pair`.
+        let mut bar = CommandBar::default();
+        bar.activate();
+        bar.push('p');
+        bar.autocomplete();
+        assert_eq!(bar.input, "pair");
+        bar.autocomplete();
+        assert_eq!(bar.input, "projects");
+        bar.autocomplete();
+        assert_eq!(bar.input, "pair");
+    }
+
+    #[test]
+    fn command_bar_tab_no_match_is_noop() {
+        // Tab with a prefix matching nothing leaves the buffer untouched.
+        let mut bar = CommandBar::default();
+        bar.activate();
+        bar.push('z');
+        bar.autocomplete();
+        assert_eq!(bar.input, "z");
+    }
+
+    #[test]
+    fn command_bar_submit_records_history() {
+        // Enter takes the buffer and pushes a non-empty command into history.
+        let mut bar = CommandBar::default();
+        bar.activate();
+        for c in "pair".chars() {
+            bar.push(c);
+        }
+        let typed = bar.take_for_execution();
+        assert_eq!(typed, "pair");
+        assert!(bar.input.is_empty());
+        assert_eq!(bar.history, vec!["pair".to_string()]);
+        // An empty command is not recorded.
+        let empty = bar.take_for_execution();
+        assert_eq!(empty, "");
+        assert_eq!(bar.history.len(), 1);
+    }
+
+    #[test]
+    fn command_bar_history_capped_at_limit() {
+        // History keeps only the last COMMAND_HISTORY_LIMIT commands.
+        let mut bar = CommandBar::default();
+        bar.activate();
+        for n in 0..(COMMAND_HISTORY_LIMIT + 5) {
+            for c in format!("cmd{n}").chars() {
+                bar.push(c);
+            }
+            bar.take_for_execution();
+        }
+        assert_eq!(bar.history.len(), COMMAND_HISTORY_LIMIT);
+        // The oldest entries were dropped; the newest is retained.
+        assert_eq!(
+            bar.history.last().map(String::as_str),
+            Some(format!("cmd{}", COMMAND_HISTORY_LIMIT + 4).as_str())
+        );
+    }
+
+    #[test]
+    fn command_bar_history_recall() {
+        // ↑ steps back through history; ↓ steps forward and clears past newest.
+        let mut bar = CommandBar::default();
+        bar.activate();
+        for cmd in ["status", "tmux", "pair"] {
+            for c in cmd.chars() {
+                bar.push(c);
+            }
+            bar.take_for_execution();
+        }
+        bar.history_prev();
+        assert_eq!(bar.input, "pair");
+        bar.history_prev();
+        assert_eq!(bar.input, "tmux");
+        bar.history_prev();
+        assert_eq!(bar.input, "status");
+        bar.history_prev(); // saturates at the oldest
+        assert_eq!(bar.input, "status");
+        bar.history_next();
+        assert_eq!(bar.input, "tmux");
+        bar.history_next();
+        assert_eq!(bar.input, "pair");
+        bar.history_next(); // past newest → back to empty live input
+        assert!(bar.input.is_empty());
+    }
+
+    #[test]
+    fn command_bar_set_output() {
+        // Output replaces the previous result.
+        let mut bar = CommandBar::default();
+        bar.set_output(vec!["first".into()]);
+        assert_eq!(bar.output, vec!["first".to_string()]);
+        bar.set_output(vec!["second".into(), "line".into()]);
+        assert_eq!(bar.output, vec!["second".to_string(), "line".to_string()]);
+    }
+
+    #[test]
+    fn command_input_line_shows_cursor_when_active() {
+        let mut bar = CommandBar::default();
+        for c in "pair".chars() {
+            bar.input.push(c);
+        }
+        assert_eq!(command_input_line(&bar), "CMD> pair");
+        bar.active = true;
+        assert_eq!(command_input_line(&bar), "CMD> pair_");
     }
 
     #[test]
