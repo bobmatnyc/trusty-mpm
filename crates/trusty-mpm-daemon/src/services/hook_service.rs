@@ -8,9 +8,11 @@
 //! What: [`HookDecision`] is the daemon-facing verdict; [`HookService`] builds
 //! the [`OverseerContext`] from a raw payload, consults the configured
 //! overseer, audits the verdict, applies output optimization, and records the
-//! event in the ring buffer.
+//! event in the ring buffer. [`FileChanged`](HookEvent::FileChanged) events are
+//! pre-filtered by [`is_coding_file`] so OS / browser noise never enters the
+//! ring buffer.
 //! Test: `cargo test -p trusty-mpm-daemon services::hook` covers the
-//! disabled-overseer fast path and the decision conversion.
+//! disabled-overseer fast path, the decision conversion, and the file filter.
 
 use serde_json::Value;
 use trusty_mpm_core::hook::{HookEvent, HookEventRecord};
@@ -19,6 +21,94 @@ use trusty_mpm_core::session::SessionId;
 
 use crate::audit::AuditEntry;
 use crate::state::DaemonState;
+
+// ---- FileChanged noise filter -------------------------------------------
+
+/// Path substrings that indicate OS / browser noise rather than source files.
+///
+/// Why: Claude Code's `FileChanged` hook fires for every `inotify`/FSEvents
+/// notification on the system, including Chrome temp files, macOS preferences,
+/// and browser caches. Storing those in the ring buffer fills the TUI "Recent
+/// Events" panel with irrelevant noise.
+/// What: a substring deny-list checked case-insensitively against the full
+/// path.  Any match causes the event to be silently dropped before ring-buffer
+/// insertion.
+/// Test: `is_coding_file_rejects_noise`, `is_coding_file_accepts_source`.
+const NOISE_PATTERNS: &[&str] = &[
+    // Browser temp/state files
+    ".com.google.chrome",
+    ".com.apple.",
+    "com.apple.",
+    "preferences",
+    "cookies",
+    "history",
+    "cache",
+    "gpucache",
+    "indexeddb",
+    "localstorage",
+    "sessionstorage",
+    // OS noise
+    ".ds_store",
+    ".spotlight-",
+    ".temporaryitems",
+    ".trashes",
+    ".fseventsd",
+    // Log / tmp / lock
+    ".log",
+    ".tmp",
+    ".lock",
+    // Build / dependency artifacts
+    "node_modules/",
+    "/target/",
+    "/.git/",
+];
+
+/// File extensions that identify coding-relevant files.
+///
+/// Why: an allow-list guards against path names that don't match any noise
+/// pattern but are still irrelevant (e.g. `~/.zsh_history`). Files with one of
+/// these extensions are always kept.
+/// Test: `is_coding_file_accepts_source`.
+const CODE_EXTENSIONS: &[&str] = &[
+    ".rs", ".toml", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".kt", ".swift", ".c",
+    ".cpp", ".h", ".hpp", ".md", ".yaml", ".yml", ".json", ".sh", ".env", ".sql", ".html", ".css",
+    ".scss", ".vue", ".svelte",
+];
+
+/// Source-directory path components that flag a file as project-related.
+///
+/// Why: some project files (e.g. `Makefile`, `.env`) may lack a recognised
+/// extension but are clearly code when they live under a source tree.
+/// Test: `is_coding_file_accepts_source_dir`.
+const SOURCE_DIRS: &[&str] = &["/src/", "/lib/", "/crates/", "/packages/"];
+
+/// Return `true` when a `FileChanged` path represents a coding-relevant file.
+///
+/// Why: OS file watchers emit events for every byte written anywhere on the
+/// system; the ring buffer must only retain events that a developer would
+/// recognise as meaningful (source, config, docs). Centralising the logic here
+/// makes it easy to extend without touching the event dispatch loop.
+/// What: rejects any path whose lowercased form contains a [`NOISE_PATTERNS`]
+/// substring; keeps any path with a [`CODE_EXTENSIONS`] suffix or a
+/// [`SOURCE_DIRS`] component; silently drops everything else.
+/// Test: `is_coding_file_rejects_noise`, `is_coding_file_accepts_source`,
+/// `is_coding_file_accepts_source_dir`.
+fn is_coding_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+
+    // Deny: matches any noise pattern.
+    if NOISE_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
+
+    // Allow: has a recognised code extension.
+    if CODE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
+        return true;
+    }
+
+    // Allow: lives inside a source directory tree.
+    SOURCE_DIRS.iter().any(|dir| path.contains(dir))
+}
 
 /// The daemon-facing result of processing one hook event.
 ///
@@ -147,6 +237,17 @@ impl<'s> HookService<'s> {
             crate::optimizer::optimize_tool_output(&cfg, &tool_name, &mut payload);
         }
 
+        // 2b. FileChanged: drop OS / browser noise before it enters the ring
+        //     buffer. Only coding-relevant paths (source files, config, docs)
+        //     are kept. Non-FileChanged events are unaffected.
+        if event == HookEvent::FileChanged {
+            let path = payload.get("path").and_then(Value::as_str).unwrap_or("");
+            if !is_coding_file(path) {
+                tracing::trace!("dropped FileChanged noise: {path}");
+                return HookDecision::Allow;
+            }
+        }
+
         // 3. Record the event in the bounded history.
         self.state
             .push_hook_event(HookEventRecord::now(session, event, payload));
@@ -250,6 +351,139 @@ mod tests {
             HookEvent::PreToolUse,
             serde_json::json!({ "tool": "Bash" }),
         );
+        assert_eq!(decision, HookDecision::Allow);
+        assert_eq!(state.recent_hook_events().len(), 1);
+    }
+
+    // ---- is_coding_file unit tests ---------------------------------------
+
+    #[test]
+    fn is_coding_file_rejects_noise() {
+        // Browser temp files.
+        assert!(!is_coding_file(
+            "/var/folders/abc/.com.google.Chrome.xyz/Preferences"
+        ));
+        // macOS preference directories.
+        assert!(!is_coding_file(
+            "/Users/masa/Library/Preferences/com.apple.finder.plist"
+        ));
+        // DS_Store and spotlight noise.
+        assert!(!is_coding_file("/Users/masa/Projects/.DS_Store"));
+        assert!(!is_coding_file("/private/var/.Spotlight-V100/something"));
+        // Log, tmp, lock files.
+        assert!(!is_coding_file("/tmp/daemon.log"));
+        assert!(!is_coding_file("/tmp/work.tmp"));
+        assert!(!is_coding_file("/var/run/sshd.lock"));
+        // Build / dependency artifacts.
+        assert!(!is_coding_file(
+            "/Users/masa/Projects/app/node_modules/lodash/index.js"
+        ));
+        assert!(!is_coding_file(
+            "/Users/masa/Projects/trusty/target/debug/main"
+        ));
+        assert!(!is_coding_file(
+            "/Users/masa/Projects/app/.git/objects/pack/pack-abc.idx"
+        ));
+    }
+
+    #[test]
+    fn is_coding_file_accepts_source() {
+        // Rust, TOML, TypeScript, Python.
+        assert!(is_coding_file(
+            "/Users/masa/Projects/trusty/crates/core/src/lib.rs"
+        ));
+        assert!(is_coding_file("/Users/masa/Projects/trusty/Cargo.toml"));
+        assert!(is_coding_file(
+            "/Users/masa/Projects/app/src/components/Button.tsx"
+        ));
+        assert!(is_coding_file("/Users/masa/Projects/app/scripts/build.py"));
+        // Config and docs.
+        assert!(is_coding_file("/Users/masa/Projects/app/README.md"));
+        assert!(is_coding_file(
+            "/Users/masa/Projects/app/.github/workflows/ci.yaml"
+        ));
+        assert!(is_coding_file("/Users/masa/Projects/app/schema.sql"));
+        assert!(is_coding_file("/Users/masa/Projects/app/.env"));
+    }
+
+    #[test]
+    fn is_coding_file_accepts_source_dir() {
+        // Files without a recognised extension but inside a source tree.
+        assert!(is_coding_file("/Users/masa/Projects/app/src/Makefile"));
+        assert!(is_coding_file(
+            "/Users/masa/Projects/trusty/crates/daemon/src/BUILD"
+        ));
+        assert!(is_coding_file(
+            "/Users/masa/Projects/app/packages/ui/Dockerfile"
+        ));
+        assert!(is_coding_file("/Users/masa/Projects/lib/core/something"));
+    }
+
+    #[test]
+    fn is_coding_file_drops_unknown_extension_outside_source_dirs() {
+        // A file with no recognised extension and not in a source dir.
+        assert!(!is_coding_file("/Users/masa/Downloads/somefile.xyz"));
+        // Shell history and similar home-dir clutter.
+        assert!(!is_coding_file("/Users/masa/.zsh_history"));
+    }
+
+    #[test]
+    fn file_changed_noise_is_not_recorded() {
+        // A Chrome temp-file `FileChanged` event must be silently dropped and
+        // must not appear in the ring buffer.
+        let state = DaemonState::new();
+        let id = SessionId::new();
+        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        s.status = SessionStatus::Active;
+        state.register_session(s);
+
+        let svc = HookService::new(&state);
+        let decision = svc.process(
+            id,
+            HookEvent::FileChanged,
+            serde_json::json!({
+                "path": "/var/folders/abc/.com.google.Chrome.xyz/Preferences"
+            }),
+        );
+        // The event is silently allowed (no error) but not recorded.
+        assert_eq!(decision, HookDecision::Allow);
+        assert_eq!(state.recent_hook_events().len(), 0);
+    }
+
+    #[test]
+    fn file_changed_source_file_is_recorded() {
+        // A Rust source file must pass through the filter and enter the ring
+        // buffer unchanged.
+        let state = DaemonState::new();
+        let id = SessionId::new();
+        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        s.status = SessionStatus::Active;
+        state.register_session(s);
+
+        let svc = HookService::new(&state);
+        let decision = svc.process(
+            id,
+            HookEvent::FileChanged,
+            serde_json::json!({
+                "path": "/Users/masa/Projects/trusty/crates/core/src/lib.rs"
+            }),
+        );
+        assert_eq!(decision, HookDecision::Allow);
+        assert_eq!(state.recent_hook_events().len(), 1);
+    }
+
+    #[test]
+    fn non_file_changed_events_bypass_filter() {
+        // Non-FileChanged events must always be recorded regardless of any
+        // payload content — the filter is FileChanged-only.
+        let state = DaemonState::new();
+        let id = SessionId::new();
+        let mut s = Session::new(id, "/tmp/p", ControlModel::Tmux);
+        s.status = SessionStatus::Active;
+        state.register_session(s);
+
+        let svc = HookService::new(&state);
+        let decision = svc.process(id, HookEvent::SessionStart, serde_json::json!({}));
         assert_eq!(decision, HookDecision::Allow);
         assert_eq!(state.recent_hook_events().len(), 1);
     }
