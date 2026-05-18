@@ -60,6 +60,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/health", get(health))
         .route("/sessions", get(list_sessions).post(register_session))
         .route("/sessions/dead", axum::routing::delete(reap_sessions))
+        .route("/sessions/discover", post(discover_sessions))
         .route("/sessions/{id}", axum::routing::delete(remove_session))
         .route("/sessions/{id}/events", get(session_events))
         .route("/sessions/{id}/pause", post(pause_session))
@@ -95,6 +96,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/pair/request", post(pair_request))
         .route("/pair/confirm", post(pair_confirm))
         .route("/pair/status", get(pair_status))
+        .route("/pair/reset", post(pair_reset))
         .merge(
             SwaggerUi::new("/api-docs")
                 .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
@@ -268,6 +270,30 @@ pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<ReapRe
     let result = SessionService::new(&state).reap();
     Json(ReapResponse {
         removed: result.reaped,
+    })
+}
+
+/// `POST /sessions/discover` — auto-discover tmux sessions running Claude Code.
+///
+/// Why: `GET /sessions` only reports daemon-managed sessions; operators run
+/// `claude` / `claude-code` / `claude-mpm` / `tm` in tmux panes the daemon never
+/// created. This endpoint scans every pane and registers the ones running
+/// Claude Code so they appear in the dashboard and the Telegram bot.
+/// What: runs [`crate::discovery::discover_claude_sessions`] and returns
+/// `{ "discovered": <count>, "sessions": [name, ...] }`. tmux being unavailable
+/// yields a zero count rather than an error.
+/// Test: `discover_sessions_returns_count` in `api_tests.rs`.
+#[utoipa::path(
+    post,
+    path = "/sessions/discover",
+    tag = "sessions",
+    responses((status = 200, description = "tmux sessions running Claude Code, newly registered"))
+)]
+pub async fn discover_sessions(State(state): State<Arc<DaemonState>>) -> Json<DiscoverResponse> {
+    let result = crate::discovery::discover_claude_sessions(&state);
+    Json(DiscoverResponse {
+        discovered: result.adopted,
+        sessions: result.sessions,
     })
 }
 
@@ -1017,6 +1043,23 @@ pub async fn pair_status(
     State(state): State<Arc<DaemonState>>,
 ) -> Json<crate::services::PairStatus> {
     Json(PairingService::new(&state).status())
+}
+
+/// `POST /pair/reset` — clear the Telegram pairing.
+///
+/// Why: an operator unpairing the bot must drop the binding both in memory and
+/// on disk so a daemon restart does not restore it from `pairing.json`.
+/// What: delegates to [`PairingService::reset`] and returns `{ "reset": true }`.
+/// Test: `pair_reset_clears_pairing` in `api_tests.rs`.
+#[utoipa::path(
+    post,
+    path = "/pair/reset",
+    tag = "config",
+    responses((status = 200, description = "Pairing cleared"))
+)]
+pub async fn pair_reset(State(state): State<Arc<DaemonState>>) -> Json<PairResetResponse> {
+    PairingService::new(&state).reset();
+    Json(PairResetResponse { reset: true })
 }
 
 /// Parse a UUID string into a `SessionId`, mapping failure to a `400`-mapped

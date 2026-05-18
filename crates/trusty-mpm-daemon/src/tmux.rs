@@ -211,6 +211,36 @@ impl TmuxDriver {
         })
     }
 
+    /// List every pane on the host as `session_name pane_current_command`.
+    ///
+    /// Why: session auto-discovery scans all panes to find ones running Claude
+    /// Code; `list-panes -a` reports every pane across every session in one
+    /// call, so the daemon need not iterate sessions itself.
+    /// What: runs `tmux list-panes -a -F "#{session_name} #{pane_current_command}"`
+    /// directly (this cross-session form has no `core::tmux::TmuxCommand`
+    /// variant) and returns its raw stdout. An empty tmux server (`no server
+    /// running`) yields an empty string rather than an error.
+    /// Test: parsing of the output is covered by `discovery::parse_pane_line`;
+    /// this listing path is exercised by the `discovery` tmux-absent test.
+    pub fn list_claude_panes(&self) -> Result<String> {
+        let output = Command::new(&self.tmux_path)
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name} #{pane_current_command}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("no server running") || stderr.contains("no sessions") {
+                return Ok(String::new());
+            }
+            return Err(Error::Protocol(format!("tmux list-panes -a: {stderr}")));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     /// List every tmux session, tagged with its [`SessionOrigin`].
     ///
     /// Why: the universal-session dashboard manages *all* tmux sessions, not

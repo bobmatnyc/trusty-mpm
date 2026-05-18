@@ -34,7 +34,8 @@ pub const COMMAND_HISTORY_LIMIT: usize = 20;
 /// What: the bare command verbs, each as it would appear after the leading `/`.
 /// Test: `known_commands_contains_core_verbs`.
 pub const KNOWN_COMMANDS: &[&str] = &[
-    "pair", "projects", "sessions", "tmux", "status", "adopt", "connect", "chat", "send", "help",
+    "pair", "projects", "sessions", "tmux", "status", "adopt", "connect", "chat", "send",
+    "discover", "help", "exit", "quit",
 ];
 
 /// The persistent slash-command bar pinned to the bottom of the dashboard.
@@ -297,6 +298,24 @@ pub struct DashboardState {
     /// What: the message history, updated after every successful `/chat` turn.
     /// Test: `dispatch_chat_writes_error_when_daemon_down`.
     pub chat_history: Vec<trusty_mpm_client::ChatMessage>,
+    /// The session the command bar's summarized-chat mode targets.
+    ///
+    /// Why: plain (non-`/`) text typed in the CMD> bar is sent to a "focused"
+    /// session and its output summarized; the bar must remember which session
+    /// that is. Pressing Enter on a highlighted session row sets it.
+    /// What: the focused session's friendly tmux name (or UUID string when it
+    /// has no name); `None` when no session is focused.
+    /// Test: `set_active_session_uses_selected_target`,
+    /// `command_input_line_shows_focused_session`.
+    pub active_session: Option<String>,
+    /// Whether the event loop should exit (set by `/exit` or `/quit`).
+    ///
+    /// Why: `/exit` and `/quit` must leave the dashboard exactly like the `q`
+    /// key; the command dispatcher cannot return from the loop itself, so it
+    /// raises this flag and the loop checks it after dispatch.
+    /// What: `false` until an `/exit` / `/quit` command runs.
+    /// Test: `dispatch_exit_sets_should_exit`.
+    pub should_exit: bool,
 }
 
 impl DashboardState {
@@ -355,6 +374,19 @@ impl DashboardState {
         } else {
             false
         }
+    }
+
+    /// Mark the currently-highlighted session as the command-bar's target.
+    ///
+    /// Why: pressing Enter on a session row "focuses" it so plain text typed in
+    /// the CMD> bar is routed to that session's summarized-chat mode.
+    /// What: copies [`Self::selected_target`] into [`Self::active_session`];
+    /// returns the focused name, or `None` when the session list is empty.
+    /// Test: `set_active_session_uses_selected_target`.
+    pub fn set_active_session(&mut self) -> Option<String> {
+        let target = self.selected_target().filter(|t| !t.is_empty());
+        self.active_session = target.clone();
+        target
     }
 
     /// Build the [`SessionSummary`] slice the resolver searches.
@@ -681,22 +713,43 @@ pub fn command_help_lines() -> Vec<String> {
         "  /connect <id>     focus a session by fuzzy target".to_string(),
         "  /chat <message>   ask the LLM chat assistant".to_string(),
         "  /send <s> <cmd>   send a prompt to a Claude Code session".to_string(),
+        "  /discover         auto-discover tmux sessions running Claude Code".to_string(),
         "  /help             show this help".to_string(),
+        "  /exit, /quit      leave the dashboard".to_string(),
+        "  <plain text>      send to the focused session + summarize".to_string(),
         "Tab: autocomplete   ↑/↓: history   Esc: close".to_string(),
     ]
+}
+
+/// Build the command-bar prompt prefix, reflecting the focused session.
+///
+/// Why: the summarized-chat mode routes plain text to a focused session; the
+/// prompt must show which session is focused so the operator knows where plain
+/// text will go.
+/// What: `CMD [session: <name>]> ` when `active_session` is `Some`, otherwise
+/// the bare `CMD> `.
+/// Test: `command_prompt_reflects_focused_session`.
+pub fn command_prompt(active_session: Option<&str>) -> String {
+    match active_session {
+        Some(name) => format!("CMD [session: {name}]> "),
+        None => "CMD> ".to_string(),
+    }
 }
 
 /// Build the input line shown in the command bar.
 ///
 /// Why: kept separate so a test can assert the rendered prefix and the cursor
 /// glyph without a terminal frame.
-/// What: returns `CMD> <input>` plus a trailing `_` cursor when `active`.
-/// Test: `command_input_line_shows_cursor_when_active`.
-pub fn command_input_line(bar: &CommandBar) -> String {
+/// What: returns `<prompt><input>` plus a trailing `_` cursor when `active`,
+/// where the prompt is [`command_prompt`] for `active_session`.
+/// Test: `command_input_line_shows_cursor_when_active`,
+/// `command_input_line_shows_focused_session`.
+pub fn command_input_line(bar: &CommandBar, active_session: Option<&str>) -> String {
+    let prompt = command_prompt(active_session);
     if bar.active {
-        format!("CMD> {}_", bar.input)
+        format!("{prompt}{}_", bar.input)
     } else {
-        format!("CMD> {}", bar.input)
+        format!("{prompt}{}", bar.input)
     }
 }
 
@@ -709,7 +762,13 @@ pub fn command_input_line(bar: &CommandBar) -> String {
 /// input line is highlighted yellow while the bar is active.
 /// Test: line content is covered by `command_input_line` and
 /// `command_help_lines`; layout is exercised by the rendering smoke test.
-fn render_command_zone(frame: &mut Frame, bar: &CommandBar, output_area: Rect, input_area: Rect) {
+fn render_command_zone(
+    frame: &mut Frame,
+    bar: &CommandBar,
+    active_session: Option<&str>,
+    output_area: Rect,
+    input_area: Rect,
+) {
     let output_items: Vec<ListItem> = if bar.output.is_empty() {
         vec![ListItem::new(
             "(no command output yet — press : or / to begin)",
@@ -739,7 +798,7 @@ fn render_command_zone(frame: &mut Frame, bar: &CommandBar, output_area: Rect, i
     } else {
         " [: or / to activate]"
     };
-    let input = Paragraph::new(format!("{}{hint}", command_input_line(bar)))
+    let input = Paragraph::new(format!("{}{hint}", command_input_line(bar, active_session)))
         .style(input_style)
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(input, input_area);
@@ -870,7 +929,13 @@ pub fn render_with_table_state(
 
     // The persistent command zone spans the full terminal width at the bottom:
     // a 3-line output strip above a 3-line CMD> input strip.
-    render_command_zone(frame, &state.command_bar, chunks[2], chunks[3]);
+    render_command_zone(
+        frame,
+        &state.command_bar,
+        state.active_session.as_deref(),
+        chunks[2],
+        chunks[3],
+    );
 
     if state.show_help {
         render_help_overlay(frame);
@@ -1434,9 +1499,49 @@ mod tests {
         for c in "pair".chars() {
             bar.input.push(c);
         }
-        assert_eq!(command_input_line(&bar), "CMD> pair");
+        assert_eq!(command_input_line(&bar, None), "CMD> pair");
         bar.active = true;
-        assert_eq!(command_input_line(&bar), "CMD> pair_");
+        assert_eq!(command_input_line(&bar, None), "CMD> pair_");
+    }
+
+    #[test]
+    fn command_prompt_reflects_focused_session() {
+        // No focused session → bare prompt; a focused session is named inline.
+        assert_eq!(command_prompt(None), "CMD> ");
+        assert_eq!(
+            command_prompt(Some("my-project")),
+            "CMD [session: my-project]> "
+        );
+    }
+
+    #[test]
+    fn command_input_line_shows_focused_session() {
+        // The input line carries the focused-session prefix.
+        let bar = CommandBar::default();
+        assert_eq!(
+            command_input_line(&bar, Some("frontend")),
+            "CMD [session: frontend]> "
+        );
+    }
+
+    #[test]
+    fn set_active_session_uses_selected_target() {
+        // Focusing the highlighted row copies its tmux name into active_session.
+        let mut state = DashboardState {
+            sessions: vec![
+                session("aaa", "/p/a", "active", "frontend"),
+                session("bbb", "/p/b", "active", "backend"),
+            ],
+            selected_session: 1,
+            ..DashboardState::default()
+        };
+        assert_eq!(state.set_active_session(), Some("backend".to_string()));
+        assert_eq!(state.active_session.as_deref(), Some("backend"));
+
+        // With no sessions, focusing yields None.
+        let mut empty = DashboardState::default();
+        assert_eq!(empty.set_active_session(), None);
+        assert!(empty.active_session.is_none());
     }
 
     #[test]

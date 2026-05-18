@@ -13,6 +13,7 @@ pub mod api;
 pub mod audit;
 pub mod claude_config;
 pub mod discover;
+pub mod discovery;
 pub mod error;
 pub mod llm_overseer;
 pub mod lock;
@@ -20,6 +21,7 @@ pub mod mcp_backend;
 pub mod openapi;
 pub mod optimizer;
 pub mod overseer_compose;
+pub mod pairing_store;
 pub mod services;
 pub mod state;
 pub mod tmux;
@@ -75,6 +77,16 @@ pub async fn serve_http(
         addrs.memory, addrs.search
     );
     state.set_trusty_addrs(addrs);
+
+    // Auto-discover existing tmux sessions running Claude Code so they appear
+    // in the dashboard and the Telegram bot without a manual `/adopt`.
+    let discovered = discovery::discover_claude_sessions(&state);
+    if discovered.adopted > 0 {
+        info!(
+            "auto-discovered {} Claude Code tmux session(s)",
+            discovered.adopted
+        );
+    }
 
     // Spawn the multi-session file watcher as a background task.
     let fw = watcher::FileWatcher::new(Arc::clone(&state));

@@ -115,6 +115,14 @@ pub struct DaemonState {
     /// What: `None` when no code is outstanding, else `(code, issued_at)`.
     /// Test: `pairing_round_trip`, `expired_pair_code_is_rejected`.
     pair_code: Mutex<Option<(String, std::time::Instant)>>,
+    /// The `~/.trusty-mpm` directory the daemon persists state under.
+    ///
+    /// Why: the pairing record (`pairing.json`) must survive restarts; it is
+    /// written under this root. Holding the resolved path means tests can point
+    /// it at a temp directory while production uses the home-relative root.
+    /// What: the framework root, the directory `pairing.json` lives in.
+    /// Test: `pairing_persists_to_disk`.
+    framework_root: PathBuf,
 }
 
 impl Default for DaemonState {
@@ -256,6 +264,12 @@ impl DaemonState {
     pub fn new() -> Self {
         let optimizer = load_optimizer_config();
         let build = load_overseer();
+        let framework_root = FrameworkPaths::default().root;
+        // Restore a persisted Telegram pairing so push alerts survive restarts.
+        let paired = crate::pairing_store::load(&framework_root).map(|r| r.chat_id);
+        if let Some(chat_id) = paired {
+            tracing::info!("restored persisted Telegram pairing (chat {chat_id})");
+        }
         Self {
             sessions: DashMap::new(),
             delegations: DashMap::new(),
@@ -271,14 +285,32 @@ impl DaemonState {
             overseer_handler: build.handler,
             llm: build.llm,
             audit: Arc::new(AuditLogger::new(&logs_dir())),
-            paired_chat_id: Mutex::new(None),
+            paired_chat_id: Mutex::new(paired),
             pair_code: Mutex::new(None),
+            framework_root,
         }
     }
 
     /// Wrap the state in an `Arc` for sharing across tasks.
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::new())
+    }
+
+    /// Construct default state whose persisted pairing lives under `root`.
+    ///
+    /// Why: pairing now writes `pairing.json` to disk; tests that exercise
+    /// confirm / clear must redirect that write to a temp directory so they
+    /// never touch (or depend on) the operator's real `~/.trusty-mpm`.
+    /// What: builds [`DaemonState::new`]'s defaults but overrides the framework
+    /// root with `root`, re-reading any pairing record already under it.
+    /// Test: `pairing_persists_to_disk`, `pairing_reset_clears_disk`.
+    #[doc(hidden)]
+    pub fn with_root(root: PathBuf) -> Self {
+        let mut state = Self::new();
+        let paired = crate::pairing_store::load(&root).map(|r| r.chat_id);
+        *state.paired_chat_id.lock() = paired;
+        state.framework_root = root;
+        state
     }
 
     /// Construct state whose framework-managed config is read from `paths`.
@@ -303,6 +335,8 @@ impl DaemonState {
         };
         let overseer_cfg = OverseerConfig::load_from(&paths.overseer_config());
         let build = build_overseer(overseer_cfg);
+        let framework_root = paths.root.clone();
+        let paired = crate::pairing_store::load(&framework_root).map(|r| r.chat_id);
         Self {
             sessions: DashMap::new(),
             delegations: DashMap::new(),
@@ -318,8 +352,9 @@ impl DaemonState {
             overseer_handler: build.handler,
             llm: build.llm,
             audit: Arc::new(AuditLogger::new(&paths.root.join("logs"))),
-            paired_chat_id: Mutex::new(None),
+            paired_chat_id: Mutex::new(paired),
             pair_code: Mutex::new(None),
+            framework_root,
         }
     }
 
@@ -349,11 +384,14 @@ impl DaemonState {
     /// Confirm a pairing code and register `chat_id` on success.
     ///
     /// Why: the bot's `/pair <code>` flow validates the operator's code and, on
-    /// success, binds the chat so push alerts have a destination.
-    /// What: returns `true` and stores `chat_id` when `code` matches the
-    /// outstanding code and it is within [`PAIR_CODE_TTL`]; clears the code
-    /// either way (a used or expired code never validates twice).
-    /// Test: `pairing_round_trip`, `expired_pair_code_is_rejected`.
+    /// success, binds the chat so push alerts have a destination — and the
+    /// binding must survive a daemon restart.
+    /// What: returns `true` and stores `chat_id` (in memory *and* persisted to
+    /// `~/.trusty-mpm/pairing.json`) when `code` matches the outstanding code
+    /// and it is within [`PAIR_CODE_TTL`]; clears the code either way (a used or
+    /// expired code never validates twice). A failed disk write is logged, not
+    /// fatal — the in-memory pairing still takes effect.
+    /// Test: `pairing_round_trip`, `pairing_persists_to_disk`.
     pub fn confirm_pair_code(&self, code: &str, chat_id: i64) -> bool {
         let mut guard = self.pair_code.lock();
         let valid = matches!(
@@ -364,8 +402,26 @@ impl DaemonState {
         *guard = None;
         if valid {
             *self.paired_chat_id.lock() = Some(chat_id);
+            let record = crate::pairing_store::PairingRecord::new(chat_id);
+            if let Err(e) = crate::pairing_store::save(&self.framework_root, &record) {
+                tracing::warn!("failed to persist Telegram pairing: {e}");
+            }
         }
         valid
+    }
+
+    /// Clear the Telegram pairing, in memory and on disk.
+    ///
+    /// Why: `POST /pair/reset` (or any explicit unpair) must drop the binding so
+    /// a restart does not resurrect it from `pairing.json`.
+    /// What: sets `paired_chat_id` to `None` and deletes the persisted record;
+    /// a failed delete is logged, not fatal.
+    /// Test: `pairing_reset_clears_disk`.
+    pub fn clear_pairing(&self) {
+        *self.paired_chat_id.lock() = None;
+        if let Err(e) = crate::pairing_store::clear(&self.framework_root) {
+            tracing::warn!("failed to delete persisted Telegram pairing: {e}");
+        }
     }
 
     /// The chat id currently paired with this daemon, if any.
@@ -1058,8 +1114,10 @@ mod tests {
     #[test]
     fn pairing_round_trip() {
         // A freshly-generated code confirms once, binds the chat id, and is
-        // then consumed so the same code cannot validate twice.
-        let state = DaemonState::new();
+        // then consumed so the same code cannot validate twice. The state is
+        // rooted at a temp dir so the persisted record never touches HOME.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = DaemonState::with_root(dir.path().to_path_buf());
         assert_eq!(state.paired_chat_id(), None);
         let code = state.generate_pair_code();
         assert_eq!(code.len(), 6);
@@ -1072,9 +1130,42 @@ mod tests {
 
     #[test]
     fn wrong_pair_code_is_rejected() {
-        let state = DaemonState::new();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = DaemonState::with_root(dir.path().to_path_buf());
         let _code = state.generate_pair_code();
         assert!(!state.confirm_pair_code("ZZZZZZ", 12345678));
         assert_eq!(state.paired_chat_id(), None);
+    }
+
+    #[test]
+    fn pairing_persists_to_disk() {
+        // Confirming a code writes pairing.json; a fresh state rooted at the
+        // same directory restores the binding without a new handshake.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let state = DaemonState::with_root(root.clone());
+        let code = state.generate_pair_code();
+        assert!(state.confirm_pair_code(&code, 555));
+        // The on-disk record exists.
+        assert_eq!(
+            crate::pairing_store::load(&root).map(|r| r.chat_id),
+            Some(555)
+        );
+        // A new state restores the pairing from disk.
+        let restored = DaemonState::with_root(root);
+        assert_eq!(restored.paired_chat_id(), Some(555));
+    }
+
+    #[test]
+    fn pairing_reset_clears_disk() {
+        // clear_pairing drops the binding in memory and removes pairing.json.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let state = DaemonState::with_root(root.clone());
+        let code = state.generate_pair_code();
+        assert!(state.confirm_pair_code(&code, 777));
+        state.clear_pairing();
+        assert_eq!(state.paired_chat_id(), None);
+        assert!(crate::pairing_store::load(&root).is_none());
     }
 }

@@ -59,6 +59,31 @@ pub struct ReapResponse {
     pub removed: usize,
 }
 
+/// Response of `POST /sessions/discover`.
+///
+/// Why: the auto-discovery endpoint reports how many tmux sessions running
+/// Claude Code it newly registered, so a UI can tell the operator what changed.
+/// What: the count plus the friendly names of the discovered sessions.
+/// Test: `discover_sessions_returns_count` in `api_tests.rs`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiscoverResponse {
+    /// Number of tmux sessions newly registered by the scan.
+    pub discovered: usize,
+    /// Friendly tmux names of the newly-registered sessions.
+    pub sessions: Vec<String>,
+}
+
+/// Response of `POST /pair/reset`.
+///
+/// Why: clearing the pairing should give the caller an explicit acknowledgement.
+/// What: a `reset` flag, always `true` on a successful call.
+/// Test: `pair_reset_clears_pairing` in `api_tests.rs`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairResetResponse {
+    /// Always `true` — the pairing was cleared.
+    pub reset: bool,
+}
+
 /// Response of `POST /sessions/{id}/pause`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PauseResponse {

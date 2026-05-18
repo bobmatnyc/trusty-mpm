@@ -33,6 +33,7 @@ use utoipa::OpenApi;
         crate::api::register_session,
         crate::api::remove_session,
         crate::api::reap_sessions,
+        crate::api::discover_sessions,
         crate::api::session_events,
         crate::api::pause_session,
         crate::api::resume_session,
@@ -63,6 +64,7 @@ use utoipa::OpenApi;
         crate::api::pair_request,
         crate::api::pair_confirm,
         crate::api::pair_status,
+        crate::api::pair_reset,
     ),
     components(schemas(
         trusty_mpm_core::session::Session,

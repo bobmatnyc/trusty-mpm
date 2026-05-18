@@ -168,6 +168,11 @@ async fn run_loop<B: ratatui::backend::Backend>(
                     KeyCode::Enter => {
                         let typed = state.command_bar.take_for_execution();
                         dispatch_command(&mut state, client, &typed).await;
+                        // `/exit` and `/quit` raise `should_exit` — honour it
+                        // here, exactly like pressing `q`.
+                        if state.should_exit {
+                            return Ok(());
+                        }
                         poll_daemon(&mut state, client).await;
                         last_poll = Instant::now();
                     }
@@ -188,6 +193,16 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 KeyCode::Char(':') | KeyCode::Char('/') => state.command_bar.activate(),
                 KeyCode::Up | KeyCode::Char('k') => state.select_up(),
                 KeyCode::Down | KeyCode::Char('j') => state.select_down(),
+                KeyCode::Enter => {
+                    // Enter on a highlighted session row focuses it for the
+                    // command bar's summarized-chat mode.
+                    match state.set_active_session() {
+                        Some(name) => {
+                            state.last_action = Some(format!("Focused session: {name}"));
+                        }
+                        None => state.last_action = Some("no sessions to focus".to_string()),
+                    }
+                }
                 KeyCode::Char('p') => {
                     handle_action(&mut state, client, Action::Pause).await;
                     poll_daemon(&mut state, client).await;
@@ -309,6 +324,13 @@ async fn dispatch_command(state: &mut DashboardState, client: &DaemonClient, typ
     if trimmed.is_empty() {
         return;
     }
+    // Plain text (no leading `/`) is not a command — it routes to the focused
+    // session's summarized-chat mode rather than the slash-command dispatch.
+    if !trimmed.starts_with('/') {
+        let lines = session_chat(state, client, trimmed).await;
+        state.command_bar.set_output(lines);
+        return;
+    }
     // Split into verb + argument tail; normalize only the verb.
     let no_slash = trimmed.trim_start_matches('/').trim_start();
     let (verb, arg) = match no_slash.split_once(char::is_whitespace) {
@@ -319,6 +341,20 @@ async fn dispatch_command(state: &mut DashboardState, client: &DaemonClient, typ
     let lines: Vec<String> = match verb.as_str() {
         "" => return,
         "help" => dashboard::command_help_lines(),
+        "exit" | "quit" => {
+            // `/exit` and `/quit` leave the dashboard, exactly like the `q`
+            // key; the dispatcher can't return from the loop, so it raises a
+            // flag the event loop checks after dispatch.
+            state.should_exit = true;
+            vec!["Exiting…".to_string()]
+        }
+        "discover" => match client.discover_sessions().await {
+            Ok(0) => vec!["discover: no new Claude Code sessions found".to_string()],
+            Ok(n) => vec![format!(
+                "discover: adopted {n} tmux session(s) running Claude Code"
+            )],
+            Err(e) => vec![format!("discover: daemon error: {e}")],
+        },
         "pair" => match client.pair_request().await {
             Ok(req) => {
                 let minutes = req.expires_in_seconds / 60;
@@ -460,6 +496,59 @@ async fn dispatch_command(state: &mut DashboardState, client: &DaemonClient, typ
         other => vec![format!("unknown command: /{other}  (try /help)")],
     };
     state.command_bar.set_output(lines);
+}
+
+/// The prompt prefix used to summarize Claude Code session output.
+///
+/// Why: the summarized-chat mode asks the LLM for a tight 2-3 sentence digest
+/// of the pane output; keeping the instruction in one constant means the chat
+/// and the test assert against the same text.
+const SUMMARY_PROMPT: &str = "Summarize this Claude Code session output in 2-3 sentences, focusing on what \
+     was accomplished or any errors:\n\n";
+
+/// Route plain CMD-bar text to the focused session, then summarize the output.
+///
+/// Why: the summarized-chat mode lets the operator drive the focused Claude
+/// Code session with plain text — the message is sent to the session and the
+/// raw pane output is condensed by the LLM so the operator reads a digest, not
+/// a wall of text.
+/// What: requires a focused session (else a hint to `/connect`); sends `message`
+/// via `POST /sessions/{id}/command`; if an LLM is configured, asks
+/// `POST /llm/chat` to summarize the captured output with [`SUMMARY_PROMPT`] and
+/// shows the summary, otherwise shows the raw output. Every daemon failure
+/// becomes a renderable line, never a panic.
+/// Test: `session_chat_without_focus_hints_connect`,
+/// `session_chat_without_daemon_reports_error`.
+async fn session_chat(
+    state: &mut DashboardState,
+    client: &DaemonClient,
+    message: &str,
+) -> Vec<String> {
+    let Some(session) = state.active_session.clone() else {
+        return vec!["No session selected — use /connect <id> or select a session".to_string()];
+    };
+    let output = match client.send_session_command(&session, message).await {
+        Ok(Some(output)) => output,
+        Ok(None) => return vec![format!("session {session} not found")],
+        Err(e) => return vec![format!("session chat: daemon error: {e}")],
+    };
+
+    // Summarize the pane output via the LLM overseer when one is configured;
+    // otherwise fall back to showing the raw captured output.
+    let prompt = format!("{SUMMARY_PROMPT}{output}");
+    match client.llm_chat(&prompt, &[]).await {
+        Ok(Some(outcome)) => std::iter::once(format!("[session: {session}] summary:"))
+            .chain(outcome.reply.lines().map(str::to_string))
+            .collect(),
+        Ok(None) => std::iter::once(format!(
+            "[session: {session}] (LLM not configured — raw output):"
+        ))
+        .chain(output.lines().map(str::to_string))
+        .collect(),
+        Err(e) => std::iter::once(format!("session chat: summary failed: {e}"))
+            .chain(output.lines().map(str::to_string))
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +699,67 @@ mod tests {
         let mut state = DashboardState::default();
         dispatch_command(&mut state, &client, "/send frontend").await;
         assert!(state.command_bar.output[0].contains("usage"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_exit_sets_should_exit() {
+        // `/exit` and `/quit` must raise the loop's exit flag.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "/exit").await;
+        assert!(state.should_exit);
+
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "/quit").await;
+        assert!(state.should_exit);
+    }
+
+    #[tokio::test]
+    async fn dispatch_discover_writes_error_when_daemon_down() {
+        // `/discover` against an unreachable daemon surfaces the failure.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "/discover").await;
+        assert!(
+            state
+                .command_bar
+                .output
+                .iter()
+                .any(|l| l.contains("discover: daemon error"))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_chat_without_focus_hints_connect() {
+        // Plain text with no focused session must hint at /connect.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "hello there").await;
+        assert!(
+            state.command_bar.output[0].contains("No session selected"),
+            "expected a connect hint, got {:?}",
+            state.command_bar.output
+        );
+    }
+
+    #[tokio::test]
+    async fn session_chat_without_daemon_reports_error() {
+        // Plain text with a focused session but a dead daemon reports an error.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState {
+            active_session: Some("frontend".to_string()),
+            ..DashboardState::default()
+        };
+        dispatch_command(&mut state, &client, "run the tests").await;
+        assert!(
+            state
+                .command_bar
+                .output
+                .iter()
+                .any(|l| l.contains("daemon error")),
+            "expected a daemon error, got {:?}",
+            state.command_bar.output
+        );
     }
 
     #[tokio::test]

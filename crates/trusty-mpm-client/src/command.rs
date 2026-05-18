@@ -43,6 +43,8 @@ pub enum TrustyCommand {
     Tmux,
     /// Discover projects from the Claude Code configuration.
     Projects,
+    /// Auto-discover tmux sessions running Claude Code and adopt them.
+    Discover,
     /// Adopt an external tmux session for oversight.
     Adopt {
         /// tmux session name to adopt.
@@ -105,6 +107,7 @@ pub fn help_text() -> &'static str {
      /overseer — show overseer status\n\
      /tmux — list all tmux sessions\n\
      /projects — discover projects from Claude Code config\n\
+     /discover — auto-discover tmux sessions running Claude Code\n\
      /adopt <session> — adopt an external tmux session\n\
      /config <path> — analyze Claude Code config for a project\n\
      /snapshot <session> — capture a tmux pane\n\
@@ -131,6 +134,7 @@ mod tests {
             "/overseer",
             "/tmux",
             "/projects",
+            "/discover",
             "/adopt",
             "/config",
             "/snapshot",

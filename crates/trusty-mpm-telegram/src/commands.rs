@@ -45,6 +45,9 @@ pub enum TelegramCommand {
     /// Discover projects from Claude Code config.
     #[command(description = "Discover projects from Claude Code config")]
     Projects,
+    /// Auto-discover tmux sessions running Claude Code.
+    #[command(description = "Auto-discover tmux sessions running Claude Code")]
+    Discover,
     /// Adopt an external tmux session — `/adopt <session>`.
     #[command(description = "Adopt an external tmux session")]
     Adopt(String),
@@ -95,6 +98,7 @@ impl From<TelegramCommand> for TrustyCommand {
             TelegramCommand::Overseer => TrustyCommand::Overseer,
             TelegramCommand::Tmux => TrustyCommand::Tmux,
             TelegramCommand::Projects => TrustyCommand::Projects,
+            TelegramCommand::Discover => TrustyCommand::Discover,
             TelegramCommand::Adopt(session) => TrustyCommand::Adopt { session },
             TelegramCommand::Config(project) => TrustyCommand::Config { project },
             TelegramCommand::Snapshot(session) => TrustyCommand::Snapshot { session },
@@ -187,15 +191,16 @@ mod tests {
 
     #[test]
     fn bot_commands_lists_every_command() {
-        // teloxide's generated descriptor must enumerate all sixteen commands.
+        // teloxide's generated descriptor must enumerate all seventeen commands.
         let descriptions = TelegramCommand::bot_commands();
-        assert_eq!(descriptions.len(), 16);
+        assert_eq!(descriptions.len(), 17);
         assert!(descriptions.iter().any(|c| c.command == "/sessions"));
         assert!(descriptions.iter().any(|c| c.command == "/pair"));
         assert!(descriptions.iter().any(|c| c.command == "/start"));
         assert!(descriptions.iter().any(|c| c.command == "/projects"));
         assert!(descriptions.iter().any(|c| c.command == "/adopt"));
         assert!(descriptions.iter().any(|c| c.command == "/send"));
+        assert!(descriptions.iter().any(|c| c.command == "/discover"));
     }
 
     #[test]

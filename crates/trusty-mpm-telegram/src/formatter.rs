@@ -101,6 +101,13 @@ impl TelegramFormatter {
             CommandResult::Adopted { session } => {
                 format!("✅ Adopted tmux session <code>{session}</code> for oversight")
             }
+            CommandResult::Discovered { count } => {
+                if *count == 0 {
+                    "🔍 No new Claude Code tmux sessions found".to_string()
+                } else {
+                    format!("🔍 Discovered and adopted {count} Claude Code tmux session(s)")
+                }
+            }
             CommandResult::ProjectRegistered { path } => {
                 format!("✅ Registered project <code>{path}</code>")
             }

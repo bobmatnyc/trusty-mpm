@@ -80,6 +80,7 @@ impl CommandExecutor {
             TrustyCommand::Overseer => self.overseer().await,
             TrustyCommand::Tmux => self.tmux().await,
             TrustyCommand::Projects => self.projects().await,
+            TrustyCommand::Discover => self.discover().await,
             TrustyCommand::Adopt { session } => self.adopt(&session).await,
             TrustyCommand::Config { project } => self.config(&project).await,
             TrustyCommand::Snapshot { session } => self.snapshot(&session).await,
@@ -255,6 +256,21 @@ impl CommandExecutor {
                     })
                     .collect(),
             ),
+            Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
+        }
+    }
+
+    /// `/discover` — auto-discover tmux sessions running Claude Code.
+    ///
+    /// Why: operators run Claude Code in tmux panes the daemon never created;
+    /// `/discover` scans every pane and adopts the ones running it so they show
+    /// up without a manual `/adopt`.
+    /// What: calls `POST /sessions/discover`; returns [`CommandResult::Discovered`]
+    /// with the count, or an `Error` when the daemon is unreachable.
+    /// Test: `execute_discover_against_test_daemon`.
+    async fn discover(&self) -> CommandResult {
+        match self.client.discover_sessions().await {
+            Ok(count) => CommandResult::Discovered { count },
             Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
         }
     }
@@ -457,7 +473,11 @@ mod tests {
         String,
     ) {
         use trusty_mpm_daemon::{api, state::DaemonState};
-        let state = DaemonState::shared();
+        // Root the daemon's persisted state at a throwaway temp directory so
+        // pairing tests never read (or write) the operator's real pairing
+        // record. `keep` leaks the directory so it outlives the server task.
+        let root = tempfile::tempdir().unwrap().keep();
+        let state = std::sync::Arc::new(DaemonState::with_root(root));
         let router = api::router(std::sync::Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -579,6 +599,21 @@ mod tests {
                 }
             }
             other => panic!("expected DiscoveredProjects, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_discover_against_test_daemon() {
+        // `/discover` returns a well-formed count (zero when tmux is absent on
+        // CI), never an error against a live daemon.
+        let (_state, url) = spawn_test_daemon().await;
+        let executor = CommandExecutor::new(url);
+        match executor.execute(TrustyCommand::Discover).await {
+            CommandResult::Discovered { count } => {
+                // Count is a usize; the call simply must succeed.
+                let _ = count;
+            }
+            other => panic!("expected Discovered, got {other:?}"),
         }
     }
 

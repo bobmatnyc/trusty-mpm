@@ -568,7 +568,11 @@ mod tests {
     ) {
         use std::future::IntoFuture;
         use trusty_mpm_daemon::{api, state::DaemonState};
-        let state = DaemonState::shared();
+        // Root the daemon's persisted state at a throwaway temp directory so
+        // the test never reads (or writes) the operator's real pairing record.
+        // `keep` leaks the directory so it outlives the background server.
+        let root = tempfile::tempdir().unwrap().keep();
+        let state = std::sync::Arc::new(DaemonState::with_root(root));
         let router = api::router(std::sync::Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

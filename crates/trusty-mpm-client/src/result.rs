@@ -122,6 +122,11 @@ pub enum CommandResult {
         /// The tmux session name that was adopted.
         session: String,
     },
+    /// `/discover` — auto-discovery scanned tmux and adopted Claude Code sessions.
+    Discovered {
+        /// Number of tmux sessions newly registered by the scan.
+        count: usize,
+    },
     /// A discovered project was registered with the daemon ("Set Active").
     ProjectRegistered {
         /// The absolute path of the registered project.

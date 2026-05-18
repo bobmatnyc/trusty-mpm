@@ -594,6 +594,30 @@ impl DaemonClient {
         Ok(resp.status().is_success())
     }
 
+    /// Auto-discover tmux sessions running Claude Code via
+    /// `POST /sessions/discover`.
+    ///
+    /// Why: the `/discover` command (TUI and Telegram) triggers a daemon scan
+    /// of every tmux pane and adopts the ones running Claude Code.
+    /// What: POSTs to `/sessions/discover`; returns the count of newly-adopted
+    /// sessions reported by the daemon.
+    /// Test: `discover_sessions_returns_count` in the daemon's `api_tests.rs`.
+    pub async fn discover_sessions(&self) -> anyhow::Result<usize> {
+        let url = format!("{}/sessions/discover", self.base);
+        let body: serde_json::Value = self
+            .http
+            .post(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body
+            .get("discovered")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize)
+    }
+
     /// Analyze a project's Claude Code config via `GET /claude-config`.
     ///
     /// Why: the `/config` command surfaces analyzer recommendations.

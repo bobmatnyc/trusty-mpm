@@ -86,6 +86,16 @@ impl<'s> PairingService<'s> {
             chat_id,
         }
     }
+
+    /// Clear the pairing, in memory and on disk.
+    ///
+    /// Why: `POST /pair/reset` lets the operator unpair; the persisted record
+    /// must be removed so a restart does not restore the old binding.
+    /// What: delegates to [`DaemonState::clear_pairing`].
+    /// Test: `reset_clears_pairing`.
+    pub fn reset(&self) {
+        self.state.clear_pairing();
+    }
 }
 
 #[cfg(test)]
@@ -103,7 +113,9 @@ mod tests {
 
     #[test]
     fn confirm_round_trip() {
-        let state = DaemonState::new();
+        // Rooted at a temp dir so the persisted pairing never touches HOME.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = DaemonState::with_root(dir.path().to_path_buf());
         let svc = PairingService::new(&state);
         let code = svc.request_code().code;
         svc.confirm(&code, 4242).expect("valid code confirms");
@@ -112,8 +124,21 @@ mod tests {
     }
 
     #[test]
+    fn reset_clears_pairing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = DaemonState::with_root(dir.path().to_path_buf());
+        let svc = PairingService::new(&state);
+        let code = svc.request_code().code;
+        svc.confirm(&code, 99).expect("valid code confirms");
+        assert!(svc.status().paired);
+        svc.reset();
+        assert!(!svc.status().paired);
+    }
+
+    #[test]
     fn confirm_rejects_bad_code() {
-        let state = DaemonState::new();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = DaemonState::with_root(dir.path().to_path_buf());
         let svc = PairingService::new(&state);
         let _ = svc.request_code();
         let err = svc.confirm("ZZZZZZ", 1).unwrap_err();

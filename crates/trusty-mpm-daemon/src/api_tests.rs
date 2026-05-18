@@ -578,8 +578,10 @@ async fn deploy_unknown_profile_is_404() {
 
 #[tokio::test]
 async fn pair_confirm_rejects_bad_code() {
-    // A code that was never issued must not pair the daemon.
-    let state = DaemonState::shared();
+    // A code that was never issued must not pair the daemon. The state is
+    // rooted at a temp dir so it ignores any real persisted pairing on disk.
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(DaemonState::with_root(dir.path().to_path_buf()));
     let _ = pair_request(State(Arc::clone(&state))).await;
     let Json(confirm) = pair_confirm(
         State(Arc::clone(&state)),
@@ -595,6 +597,27 @@ async fn pair_confirm_rejects_bad_code() {
     let Json(status) = pair_status(State(state)).await;
     assert!(!status.paired);
     assert!(status.chat_id.is_none());
+}
+
+#[tokio::test]
+async fn discover_sessions_returns_count() {
+    // `POST /sessions/discover` returns a well-formed count; with tmux absent
+    // (or no Claude panes) on CI it is zero, but the shape must be correct.
+    let state = DaemonState::shared();
+    let Json(resp) = discover_sessions(State(state)).await;
+    assert_eq!(resp.discovered, resp.sessions.len());
+}
+
+#[tokio::test]
+async fn pair_reset_clears_pairing() {
+    // `POST /pair/reset` always reports `reset: true` and leaves the daemon
+    // unpaired. The state is rooted at a temp dir so no disk write touches HOME.
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(DaemonState::with_root(dir.path().to_path_buf()));
+    let Json(resp) = pair_reset(State(Arc::clone(&state))).await;
+    assert!(resp.reset);
+    let Json(status) = pair_status(State(state)).await;
+    assert!(!status.paired);
 }
 
 #[tokio::test]
