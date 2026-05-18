@@ -1060,11 +1060,9 @@ fn print_compression_stats(body: &serde_json::Value) {
         .get("compressed_bytes")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let reduction = if original == 0 {
-        0
-    } else {
-        (100 * original.saturating_sub(compressed)) / original
-    };
+    let reduction = (100 * original.saturating_sub(compressed))
+        .checked_div(original)
+        .unwrap_or(0);
     println!("\n[summarized: {original} \u{2192} {compressed} bytes ({reduction}% reduction)]");
 }
 
