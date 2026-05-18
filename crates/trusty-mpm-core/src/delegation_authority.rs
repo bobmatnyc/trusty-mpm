@@ -172,7 +172,7 @@ pub fn scan_agents(agents_dir: &Path) -> Vec<AgentSummary> {
     }
 
     // Deterministic order so the rendered section is stable across runs.
-    summaries.sort_by(|a, b| a.name.cmp(&b.name));
+    summaries.sort_by_key(|a| a.name.clone());
     summaries
 }
 

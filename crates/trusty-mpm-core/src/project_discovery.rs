@@ -92,7 +92,7 @@ impl ProjectDiscovery {
 
         // Newest session first; projects with no session sort last (None < Some
         // under Option's ordering, so reverse-compare on the option).
-        projects.sort_by(|a, b| b.last_session.cmp(&a.last_session));
+        projects.sort_by_key(|p| std::cmp::Reverse(p.last_session));
         projects
     }
 }
