@@ -14,7 +14,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState},
 };
 
@@ -785,6 +785,37 @@ pub fn status_line(state: &DashboardState) -> String {
     }
 }
 
+/// Shared style for table header rows (Sessions, Circuit Breakers).
+///
+/// Why: header rows previously had no style, so column labels rendered in the
+/// plain body color and were nearly indistinguishable from data rows. A bold,
+/// reverse-video header reads clearly on both dark and light terminals because
+/// it swaps whatever the terminal's own foreground/background pair is rather
+/// than hard-coding a color that may clash with one theme.
+/// What: bold + reversed (`Modifier::REVERSED`).
+/// Test: `table_header_style_is_high_contrast`.
+fn table_header_style() -> Style {
+    Style::default()
+        .add_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::REVERSED)
+}
+
+/// Build a styled panel title line for a bordered block.
+///
+/// Why: panel titles (`Sessions`, `Daemon Log`, ...) rendered in the plain
+/// border color and were easy to miss. A bold cyan title is legible on both
+/// dark and light terminals and matches the dashboard's header accent.
+/// What: returns a bold cyan [`Line`] wrapping `text`.
+/// Test: `panel_title_is_bold`.
+fn panel_title(text: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(
+        text.into(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
 /// Compute a centred sub-rectangle for the help overlay.
 ///
 /// Why: the help overlay floats over the layout; it needs a fixed-size centred
@@ -934,7 +965,7 @@ fn render_command_zone(
     let output = List::new(output_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Command Output"),
+            .title(panel_title("Command Output")),
     );
     frame.render_widget(output, output_area);
 
@@ -943,7 +974,9 @@ fn render_command_zone(
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        // Inactive: use the terminal's default foreground rather than a dim
+        // `Gray` so the "[: or / to activate]" hint stays readable on all themes.
+        Style::default()
     };
     let hint = if bar.active {
         " [Tab: autocomplete  ↑↓: history]"
@@ -1015,8 +1048,15 @@ pub fn render_with_table_state(
         "trusty-mpm dashboard — daemon unreachable".to_string()
     };
     let header = Paragraph::new(vec![
-        Line::from(title).style(Style::default().fg(Color::Cyan)),
-        Line::from(status_line(state)).style(Style::default().fg(Color::Gray)),
+        Line::from(title).style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        // Status / controls bar: use the terminal's default foreground (no dim
+        // `Gray`, which is near-invisible on many light and dark themes) so the
+        // key hints stay legible regardless of the terminal palette.
+        Line::from(status_line(state)),
     ]);
     frame.render_widget(header, chunks[0]);
 
@@ -1036,9 +1076,13 @@ pub fn render_with_table_state(
             Constraint::Length(6),
         ],
     )
-    .header(Row::new(vec!["ID", "WORKDIR", "STATUS", "DELEG"]))
+    .header(Row::new(vec!["ID", "WORKDIR", "STATUS", "DELEG"]).style(table_header_style()))
     .row_highlight_style(Style::default().add_modifier(Modifier::BOLD))
-    .block(Block::default().borders(Borders::ALL).title("Sessions"));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(panel_title("Sessions")),
+    );
     frame.render_stateful_widget(sessions, middle[0], table_state);
 
     if let Some(focused) = state.active_session.as_deref() {
@@ -1050,7 +1094,7 @@ pub fn render_with_table_state(
         let output = List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("Session Output / History — {focused}")),
+                .title(panel_title(format!("Session Output / History — {focused}"))),
         );
         frame.render_widget(output, middle[1]);
     } else {
@@ -1062,11 +1106,11 @@ pub fn render_with_table_state(
                 Constraint::Length(6),
             ],
         )
-        .header(Row::new(vec!["AGENT", "STATE", "FAILS"]))
+        .header(Row::new(vec!["AGENT", "STATE", "FAILS"]).style(table_header_style()))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Circuit Breakers"),
+                .title(panel_title("Circuit Breakers")),
         );
         frame.render_widget(breakers, middle[1]);
     }
@@ -1081,7 +1125,7 @@ pub fn render_with_table_state(
     let events = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Recent Events"),
+            .title(panel_title("Recent Events")),
     );
     frame.render_widget(events, bottom[0]);
 
@@ -1090,8 +1134,11 @@ pub fn render_with_table_state(
         .iter()
         .map(|l| ListItem::new(l.as_str()))
         .collect();
-    let log_panel =
-        List::new(log_items).block(Block::default().borders(Borders::ALL).title("Daemon Log"));
+    let log_panel = List::new(log_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(panel_title("Daemon Log")),
+    );
     frame.render_widget(log_panel, bottom[1]);
 
     // The persistent command zone spans the full terminal width at the bottom:
@@ -1584,6 +1631,25 @@ mod tests {
         assert_eq!(breaker_state_color("half_open"), Color::Yellow);
         assert_eq!(breaker_state_color("open"), Color::Red);
         assert_eq!(breaker_state_color("weird"), Color::Gray);
+    }
+
+    #[test]
+    fn table_header_style_is_high_contrast() {
+        // Header rows must stand out from body rows: bold + reverse video reads
+        // clearly on both dark and light terminals without a hard-coded color.
+        let style = table_header_style();
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn panel_title_is_bold() {
+        // Panel titles render bold cyan so they are clearly readable.
+        let title = panel_title("Sessions");
+        let span = &title.spans[0];
+        assert_eq!(span.content, "Sessions");
+        assert_eq!(span.style.fg, Some(Color::Cyan));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

@@ -351,7 +351,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Project { action } => project(&client, &url, action).await,
         Command::Session { action } => session(&client, &url, action).await,
         Command::Events => events(&client, &url).await,
-        Command::Tui { url: tui_url, interval_ms } => {
+        Command::Tui {
+            url: tui_url,
+            interval_ms,
+        } => {
             let resolved = trusty_mpm_core::resolve_daemon_url(Some(&tui_url));
             trusty_mpm_tui::run(resolved, interval_ms).await
         }
@@ -1602,9 +1605,13 @@ async fn run_daemon(addr: SocketAddr, tailscale: bool, mcp: bool) -> anyhow::Res
     // Write lock file so clients can discover us.
     trusty_mpm_daemon::lock::write_lock(&base_url, tailscale_url.as_deref());
 
-    // Register a Ctrl-C handler to clean up the lock file on shutdown.
+    // Clean up the lock file on shutdown for BOTH Ctrl-C (SIGINT) and SIGTERM.
+    // `tm restart` stops the old daemon with `pkill`, which sends SIGTERM — if we
+    // only trapped SIGINT the lock file would leak with a dead PID, and the next
+    // client's `resolve_daemon_url` would fall back to the default port (often
+    // occupied by an unrelated process) and report "daemon unreachable".
     tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_shutdown_signal().await;
         trusty_mpm_daemon::lock::remove_lock();
         std::process::exit(0);
     });
@@ -1616,6 +1623,39 @@ async fn run_daemon(addr: SocketAddr, tailscale: bool, mcp: bool) -> anyhow::Res
     spawn_telegram_bot(&base_url);
 
     trusty_mpm_daemon::serve_http(state, listener).await
+}
+
+/// Block until the process receives a shutdown signal (SIGINT or SIGTERM).
+///
+/// Why: the daemon must remove its lock file on every graceful stop, not just
+/// Ctrl-C. `tm restart` stops the old daemon with `pkill`, which delivers
+/// SIGTERM; trapping only SIGINT would leak a stale lock file and break daemon
+/// discovery for the next client.
+/// What: races a `ctrl_c()` future against a Unix SIGTERM stream; on non-Unix
+/// platforms (no SIGTERM) it just awaits Ctrl-C.
+/// Test: covered indirectly by `tm restart` — the new daemon binds cleanly and
+/// the lock file reflects its address rather than the killed daemon's.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to register SIGTERM handler: {e}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Spawn the Telegram bot as a background task when a token is configured.
