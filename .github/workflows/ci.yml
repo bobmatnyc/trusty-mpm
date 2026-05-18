@@ -15,24 +15,49 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: trusty-mpm
+      # trusty-mpm depends on the trusty-common sibling repo via path deps
+      # (../trusty-common/crates/...). Check it out next to trusty-mpm so the
+      # workspace resolves without a publish cycle.
+      - uses: actions/checkout@v4
+        with:
+          repository: bobmatnyc/trusty-common
+          path: trusty-common
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: trusty-mpm
       - name: Build
+        working-directory: trusty-mpm
         run: cargo build --workspace
       - name: Test
+        working-directory: trusty-mpm
         run: cargo test --workspace
       - name: Clippy
+        working-directory: trusty-mpm
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Fmt
+        working-directory: trusty-mpm
         run: cargo fmt --check
 
   msrv:
-    name: MSRV check (1.85)
+    name: MSRV check (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85  # edition 2024 requires 1.85+
+        with:
+          path: trusty-mpm
+      - uses: actions/checkout@v4
+        with:
+          repository: bobmatnyc/trusty-common
+          path: trusty-common
+      - uses: dtolnay/rust-toolchain@1.88  # codebase uses let-chains (stable in 1.88)
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+        with:
+          workspaces: trusty-mpm
+      - name: cargo check
+        working-directory: trusty-mpm
+        run: cargo check --workspace

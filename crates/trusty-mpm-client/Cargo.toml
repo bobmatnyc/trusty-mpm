@@ -2,6 +2,7 @@
 name = "trusty-mpm-client"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Shared daemon HTTP client, command model, and executor for trusty-mpm UIs"

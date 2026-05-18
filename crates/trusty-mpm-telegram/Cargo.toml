@@ -2,6 +2,7 @@
 name = "trusty-mpm-telegram"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Telegram bot for remote management of the trusty-mpm daemon"

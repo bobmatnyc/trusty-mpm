@@ -2,6 +2,7 @@
 name = "trusty-mpm-daemon"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Long-running trusty-mpm daemon: session control, hook interception, artifact serving"
