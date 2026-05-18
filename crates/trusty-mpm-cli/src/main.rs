@@ -1307,7 +1307,17 @@ async fn status(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
 /// Test: covered indirectly by running `tm start` against a live/dead daemon;
 /// the logic mirrors the probe already used by `status`.
 async fn daemon_healthy(client: &reqwest::Client, url: &str) -> bool {
-    match client.get(format!("{url}/health")).send().await {
+    // Verify /health is 200 AND /sessions is 200. Code-intelligence on the same
+    // port returns 200 for /health but 404 for /sessions, so checking both
+    // discriminates our daemon from other HTTP servers on the same port.
+    let health_ok = match client.get(format!("{url}/health")).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(_) => return false,
+    };
+    if !health_ok {
+        return false;
+    }
+    match client.get(format!("{url}/sessions")).send().await {
         Ok(r) => r.status().is_success(),
         Err(_) => false,
     }
@@ -1351,9 +1361,20 @@ async fn restart(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
 }
 
 async fn start(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
-    if daemon_healthy(client, url).await {
-        println!("Daemon already running on :7880");
-        return print_status(client, url).await;
+    // Prefer the lock file URL — it's the address our daemon actually bound to,
+    // not whatever default URL the CLI was given (which may point at a different
+    // process on the same port, e.g. code-intelligence on :7880).
+    let lock_url = trusty_mpm_core::resolve_daemon_url(None);
+    let check_url = if lock_url != trusty_mpm_core::DEFAULT_DAEMON_URL
+        || url == trusty_mpm_core::DEFAULT_DAEMON_URL
+    {
+        lock_url.clone()
+    } else {
+        url.to_string()
+    };
+    if daemon_healthy(client, &check_url).await {
+        println!("Daemon already running on {check_url}");
+        return print_status(client, &check_url).await;
     }
 
     // Resolve the log file under `~/.trusty-mpm/`, creating the dir if absent.
@@ -1367,7 +1388,12 @@ async fn start(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     let stderr = stdout.try_clone()?;
 
     // Spawn `tm daemon` detached, pointed at our own binary so the spawned
-    // daemon is always the same build as this CLI.
+    // daemon is always the same build as this CLI. We do NOT pass TRUSTY_MPM_ADDR
+    // — the daemon picks its own port (falling back to ephemeral if needed) and
+    // records the actual address in the lock file. We discover it from there.
+    let lock_path = trusty_mpm_core::lock_file_path();
+    // Remove any stale lock file before spawning so we can detect the new write.
+    let _ = std::fs::remove_file(&lock_path);
     let exe = std::env::current_exe()?;
     std::process::Command::new(&exe)
         .arg("daemon")
@@ -1376,21 +1402,28 @@ async fn start(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
         .stderr(std::process::Stdio::from(stderr))
         .spawn()?;
 
-    // Poll `/health` for up to 5 seconds (10 × 500ms) so a slow boot still
-    // resolves before we give up.
+    // Poll the lock file for up to 5 seconds. The daemon writes it as soon as
+    // it has a bound address — use that URL for the health check.
     print!("Starting daemon... ");
     use std::io::Write as _;
     std::io::stdout().flush().ok();
     let mut healthy = false;
+    // Use the lock-file URL if available, fall back to the cli url.
+    let mut actual_url = url.to_string();
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if daemon_healthy(client, url).await {
+        // Re-resolve: once the lock file appears it wins over the default.
+        actual_url = trusty_mpm_core::resolve_daemon_url(None);
+        if daemon_healthy(client, &actual_url).await {
             healthy = true;
             break;
         }
     }
     if healthy {
         println!("done");
+        if actual_url != url {
+            println!("(listening on {actual_url})");
+        }
     } else {
         println!("failed");
         println!(
@@ -1400,7 +1433,7 @@ async fn start(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    print_status(client, url).await
+    print_status(client, &actual_url).await
 }
 
 /// Print the daemon health line, session listing, and Telegram-bot note.
