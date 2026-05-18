@@ -74,7 +74,7 @@ pub fn resolve_target(target: &str, sessions: &[SessionSummary]) -> ResolveResul
         1 => ResolveResult::Found(dir_matches[0].id.clone()),
         _ => {
             // Sort by recency (descending) and return the most recent.
-            dir_matches.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+            dir_matches.sort_by_key(|m| std::cmp::Reverse(m.last_active));
             ResolveResult::Found(dir_matches[0].id.clone())
         }
     }

@@ -403,7 +403,7 @@ impl ConfigCheckpointer {
             })
             .collect();
         // Newest first. `created_at` is RFC3339, which sorts lexically.
-        checkpoints.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        checkpoints.sort_by_key(|c| std::cmp::Reverse(c.created_at.clone()));
         Ok(checkpoints)
     }
 
