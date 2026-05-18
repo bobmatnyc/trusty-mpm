@@ -92,6 +92,12 @@ enum Command {
         #[arg(long)]
         mcp: bool,
     },
+    /// Launch a properly configured claude session and attach to it in the
+    /// current terminal (behaves like running `claude-mpm`).
+    Launch {
+        /// Project directory to launch in (defaults to the current directory).
+        dir: Option<String>,
+    },
     /// Connect to an existing session by ID, name prefix, or project path.
     /// Opens the TUI focused on the matched session.
     Connect {
@@ -378,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
             tailscale,
             mcp,
         } => run_daemon(addr, tailscale, mcp).await,
+        Command::Launch { dir } => launch(&client, &url, dir).await,
         Command::Connect { target, json } => connect_cmd(&client, &url, &target, json).await,
         Command::Optimizer { action } => optimizer(&client, &url, action).await,
         Command::Overseer { action } => overseer(&client, &url, action).await,
@@ -1014,6 +1021,236 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
         }
     }
     Ok(())
+}
+
+/// `launch` subcommand — launch a configured claude session and attach to it.
+///
+/// Why: `tm launch` should reproduce the `claude-mpm` experience — one command
+/// that prepares the framework, registers the session, starts `claude` in a
+/// tmux host, and hands the current terminal over to it. The user sees a
+/// summary banner, then `claude` itself.
+/// What: resolves `dir`, runs `prepare_session`, registers the session with the
+/// daemon (`POST /sessions`, falling back to a generated name when the daemon
+/// is unreachable), writes the system-prompt file, prints the banner, creates a
+/// detached tmux session running `claude`, and `attach`es to it (blocking until
+/// the user detaches/exits).
+/// Test: `cli_parses_launch`, `cli_parses_launch_with_dir`.
+async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> anyhow::Result<()> {
+    // 1. Resolve the target directory (absolute, so the banner is unambiguous).
+    let path = resolve_dir(dir)?;
+    let path = path.canonicalize().unwrap_or(path);
+    let workdir = path.to_string_lossy().to_string();
+
+    // 2. Prepare the framework: deploy composed agents and merge CLAUDE.md so a
+    //    plain `claude` process behaves as a trusty-mpm PM session. A prep
+    //    failure is logged but not fatal — the session can still launch.
+    let fw = trusty_mpm_core::paths::FrameworkPaths::default();
+    if let Err(err) = trusty_mpm_core::session_launch::prepare_session(&fw, &path) {
+        eprintln!("warning: session preparation failed: {err}");
+    }
+
+    // 3. Register the session with the daemon to obtain a tmux name. When the
+    //    daemon is unreachable we can still launch — fall back to a generated
+    //    `tmpm-<adjective>-<noun>` name derived from a fresh UUID.
+    #[derive(Deserialize)]
+    struct Body {
+        #[serde(default)]
+        name: String,
+    }
+    let tmux_name = match client
+        .post(format!("{url}/sessions"))
+        .json(&serde_json::json!({
+            "workdir": path,
+            "project_path": path,
+        }))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(resp) => match resp.json::<Body>().await {
+                Ok(body) if !body.name.is_empty() => body.name,
+                _ => fallback_session_name(),
+            },
+            Err(err) => {
+                eprintln!("warning: daemon rejected session registration: {err}");
+                fallback_session_name()
+            }
+        },
+        Err(err) => {
+            eprintln!("warning: daemon unreachable ({err}); launching without registration");
+            fallback_session_name()
+        }
+    };
+
+    // 4. Build the combined `--append-system-prompt` text and write it to a
+    //    temp file so `claude` reads it at startup. The file path (when
+    //    written) is surfaced in the banner.
+    let (claude_cmd, prompt_path) = match trusty_mpm_core::session_launch::build_system_prompt() {
+        Some(prompt) => {
+            let file = std::env::temp_dir().join(format!(
+                "trusty-mpm-system-prompt-{}.txt",
+                trusty_mpm_core::session::SessionId::new().0
+            ));
+            match std::fs::write(&file, &prompt) {
+                Ok(()) => (
+                    format!("claude --append-system-prompt-file {}", file.display()),
+                    Some(file),
+                ),
+                Err(err) => {
+                    eprintln!("warning: failed to write system prompt file: {err}");
+                    ("claude".to_string(), None)
+                }
+            }
+        }
+        None => ("claude".to_string(), None),
+    };
+
+    // 5. Print the summary banner.
+    print_launch_banner(&workdir, &tmux_name, prompt_path.as_deref());
+    println!("Launching claude...");
+
+    // 6. Create a detached tmux session in the project directory.
+    let new_session = std::process::Command::new("tmux")
+        .args(["new-session", "-d", "-s", &tmux_name, "-c", &workdir])
+        .status();
+    if !matches!(new_session, Ok(s) if s.success()) {
+        anyhow::bail!("failed to create tmux session {tmux_name} in {workdir}");
+    }
+
+    // 7. Start `claude` inside the tmux session.
+    let send = std::process::Command::new("tmux")
+        .args(["send-keys", "-t", &tmux_name, &claude_cmd, "Enter"])
+        .status();
+    if !matches!(send, Ok(s) if s.success()) {
+        anyhow::bail!("tmux session {tmux_name} created but failed to start claude");
+    }
+
+    // 8. Attach to the session — this takes over the current terminal and
+    //    blocks until the user detaches or exits claude.
+    let status = std::process::Command::new("tmux")
+        .args(["attach-session", "-t", &tmux_name])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("tmux attach-session exited with failure");
+    }
+    Ok(())
+}
+
+/// Generate a fallback `tmpm-<adjective>-<noun>` session name from a fresh UUID.
+///
+/// Why: when the daemon is unreachable `tm launch` still needs a tmux session
+/// name; reusing the daemon's `name_from_uuid` scheme keeps generated names
+/// indistinguishable from daemon-assigned ones.
+/// What: returns `name_from_uuid` of a newly generated v4 UUID.
+/// Test: `fallback_session_name_has_tmpm_prefix`.
+fn fallback_session_name() -> String {
+    trusty_mpm_core::names::name_from_uuid(&trusty_mpm_core::session::SessionId::new().0)
+}
+
+/// Print the `tm launch` summary banner using unicode box-drawing characters.
+///
+/// Why: `tm launch` should give the operator an at-a-glance summary of what was
+/// configured before the terminal is taken over by `claude`.
+/// What: prints a fixed-width (53-char interior) box with version, project,
+/// session, memory, search, and prompt fields. Memory/search detection probes
+/// for config directories and binaries on `PATH`.
+/// Test: `launch_banner_does_not_panic`.
+fn print_launch_banner(workdir: &str, tmux_name: &str, prompt_path: Option<&std::path::Path>) {
+    /// Interior width of the banner box, in characters.
+    const WIDTH: usize = 53;
+
+    // Render one banner row, truncating then padding `content` to `WIDTH`.
+    let row = |content: String| {
+        let mut text = content;
+        if text.chars().count() > WIDTH {
+            text = text.chars().take(WIDTH).collect();
+        }
+        let pad = WIDTH - text.chars().count();
+        println!("│{text}{}│", " ".repeat(pad));
+    };
+
+    let memory = detect_memory();
+    let search = detect_tool("trusty-search");
+    let prompt = match prompt_path {
+        Some(p) => format!("{} (loaded)", p.display()),
+        None => "(default)".to_string(),
+    };
+
+    let version = env!("CARGO_PKG_VERSION");
+    let header = "  trusty-mpm";
+    // Right-align the version within the interior width.
+    let version_field = format!("v{version}");
+    let header_pad = WIDTH
+        .saturating_sub(header.chars().count())
+        .saturating_sub(version_field.chars().count())
+        .saturating_sub(2);
+
+    println!("┌{}┐", "─".repeat(WIDTH));
+    println!("│{header}{}{version_field}  │", " ".repeat(header_pad));
+    row(format!("  Project:  {workdir}"));
+    row(format!("  Session:  {tmux_name}"));
+    row(format!("  Memory:   {memory}"));
+    row(format!("  Search:   {search}"));
+    row(format!("  Prompt:   {prompt}"));
+    println!("└{}┘", "─".repeat(WIDTH));
+}
+
+/// Detect whether the `trusty-memory` MCP integration is available.
+///
+/// Why: the launch banner reports which trusty companions are wired up.
+/// What: returns `"trusty-memory"` when `~/.config/trusty-memory` exists or the
+/// `trusty-memory` binary is on `PATH`, else `"(not detected)"`.
+/// Test: covered indirectly by `launch_banner_does_not_panic`.
+fn detect_memory() -> String {
+    let config = dirs_config_dir().map(|c| c.join("trusty-memory"));
+    let has_config = config.map(|c| c.exists()).unwrap_or(false);
+    if has_config || binary_on_path("trusty-memory") {
+        "trusty-memory".to_string()
+    } else {
+        "(not detected)".to_string()
+    }
+}
+
+/// Detect whether a named tool binary is available on `PATH`.
+///
+/// Why: the launch banner reports `trusty-search` availability.
+/// What: returns the tool name when its binary is on `PATH`, else
+/// `"(not detected)"`.
+/// Test: covered indirectly by `launch_banner_does_not_panic`.
+fn detect_tool(name: &str) -> String {
+    if binary_on_path(name) {
+        name.to_string()
+    } else {
+        "(not detected)".to_string()
+    }
+}
+
+/// Return the user's config directory (`~/.config` on Linux/macOS).
+///
+/// Why: `detect_memory` probes `~/.config/trusty-memory` without pulling in a
+/// platform-dirs dependency.
+/// What: returns `$XDG_CONFIG_HOME` when set, else `$HOME/.config`.
+/// Test: covered indirectly by `launch_banner_does_not_panic`.
+fn dirs_config_dir() -> Option<std::path::PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(std::path::PathBuf::from(xdg));
+    }
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+}
+
+/// Check whether an executable named `name` exists on `PATH`.
+///
+/// Why: banner detection of `trusty-memory` / `trusty-search` needs a
+/// dependency-free `which`-style lookup.
+/// What: scans each `PATH` entry for an existing `name` file.
+/// Test: covered indirectly by `launch_banner_does_not_panic`.
+fn binary_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
 }
 
 /// Resolve a session id-or-name to its UUID string via `GET /sessions`.
@@ -1804,6 +2041,42 @@ mod tests {
     fn cli_project_requires_action() {
         // `project` with no action is an error.
         assert!(Cli::try_parse_from(["trusty-mpm", "project"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_launch() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "launch"]).unwrap();
+        match cli.command {
+            Command::Launch { dir } => assert_eq!(dir, None),
+            other => panic!("expected launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_launch_with_dir() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "launch", "/work/p"]).unwrap();
+        match cli.command {
+            Command::Launch { dir } => assert_eq!(dir.as_deref(), Some("/work/p")),
+            other => panic!("expected launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_session_name_has_tmpm_prefix() {
+        let name = fallback_session_name();
+        assert!(name.starts_with("tmpm-"), "got {name}");
+    }
+
+    #[test]
+    fn launch_banner_does_not_panic() {
+        // Why: the banner does width math and probes PATH; exercise it to catch
+        // arithmetic underflow or formatting regressions.
+        print_launch_banner("/Users/test/project", "tmpm-quiet-falcon", None);
+        print_launch_banner(
+            "/Users/test/project",
+            "tmpm-quiet-falcon",
+            Some(std::path::Path::new("/tmp/system-prompt.txt")),
+        );
     }
 
     #[test]
