@@ -102,6 +102,39 @@ async fn poll_daemon(state: &mut DashboardState, client: &DaemonClient) {
     // poll — it stays useful even when the daemon is unreachable.
     state.log_lines = dashboard::read_log_tail(20);
     state.clamp_selection();
+    // Refresh the focused session's detail panel from its tmux pane snapshot;
+    // a `None` result (no tmux / unknown session) leaves `session_output` empty
+    // so the panel falls back to the session's recent hook events.
+    refresh_session_output(state, client).await;
+}
+
+/// Refresh the focused session's detail-panel output from its tmux snapshot.
+///
+/// Why: selecting a session opens a "Session Output / History" panel that must
+/// refresh every poll; tmux-origin sessions show a live pane snapshot.
+/// What: when a session is focused and reachable, captures its tmux pane via
+/// `GET /tmux/sessions/{name}/snapshot` and stores the lines in
+/// `session_output`; clears `session_output` when no session is focused or the
+/// snapshot is unavailable (so the panel falls back to hook events).
+/// Test: the panel formatting is covered by `session_output_panel_lines_*`;
+/// this glue is exercised by launching the dashboard.
+async fn refresh_session_output(state: &mut DashboardState, client: &DaemonClient) {
+    let Some(focused) = state.active_session.clone() else {
+        state.session_output.clear();
+        return;
+    };
+    if !state.daemon_reachable {
+        state.session_output.clear();
+        return;
+    }
+    match client.snapshot_tmux_session(&focused).await {
+        Ok(Some(snapshot)) => {
+            state.session_output = snapshot.lines().map(str::to_string).collect();
+        }
+        // No tmux pane (native-origin session) or transport failure: clear so
+        // the panel falls back to the session's recent hook events.
+        Ok(None) | Err(_) => state.session_output.clear(),
+    }
 }
 
 /// The dashboard event loop: poll the daemon, render, handle input.
@@ -186,8 +219,16 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 continue;
             }
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc if !state.show_help => return Ok(()),
-                KeyCode::Esc => state.show_help = false,
+                // `q` always quits. `Esc` first closes the help overlay, then
+                // deselects a focused session, and only quits when neither
+                // applies — so it never quits out from under an open panel.
+                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Esc if state.show_help => state.show_help = false,
+                KeyCode::Esc if state.active_session.is_some() => {
+                    state.clear_active_session();
+                    state.last_action = Some("session deselected".to_string());
+                }
+                KeyCode::Esc => return Ok(()),
                 KeyCode::Char('?') => state.show_help = !state.show_help,
                 // `:` and `/` both activate the persistent command bar.
                 KeyCode::Char(':') | KeyCode::Char('/') => state.command_bar.activate(),
@@ -195,10 +236,12 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 KeyCode::Down | KeyCode::Char('j') => state.select_down(),
                 KeyCode::Enter => {
                     // Enter on a highlighted session row focuses it for the
-                    // command bar's summarized-chat mode.
+                    // command bar's summarized-chat mode and opens its
+                    // detail panel — populated immediately, not next tick.
                     match state.set_active_session() {
                         Some(name) => {
                             state.last_action = Some(format!("Focused session: {name}"));
+                            refresh_session_output(&mut state, client).await;
                         }
                         None => state.last_action = Some("no sessions to focus".to_string()),
                     }

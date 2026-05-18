@@ -21,7 +21,7 @@ use ratatui::{
 use crate::client::{BreakerRow, EventRow, SessionRow};
 
 /// One-line key hint shown in the status bar before any action is taken.
-pub const KEY_HINT: &str = "keys: ↑↓ navigate | p pause | r resume | x stop | o iTerm2 tab | : / command | ? help | q quit";
+pub const KEY_HINT: &str = "keys: ↑↓ navigate | ↵ focus | p pause | r resume | x stop | o iTerm2 tab | : / command | Esc back | q quit";
 
 /// Maximum number of executed commands kept in the command-bar history.
 pub const COMMAND_HISTORY_LIMIT: usize = 20;
@@ -308,6 +308,16 @@ pub struct DashboardState {
     /// Test: `set_active_session_uses_selected_target`,
     /// `command_input_line_shows_focused_session`.
     pub active_session: Option<String>,
+    /// Captured output for the focused session's detail panel.
+    ///
+    /// Why: selecting a session opens a "Session Output / History" panel beside
+    /// the session list; the event loop refreshes this every poll with a tmux
+    /// pane snapshot (tmux-origin sessions) or the session's recent hook events
+    /// (native-origin sessions).
+    /// What: the panel's text lines, newest content last; empty when no session
+    /// is focused or the daemon returned nothing.
+    /// Test: `session_output_panel_lines_*` unit tests.
+    pub session_output: Vec<String>,
     /// Whether the event loop should exit (set by `/exit` or `/quit`).
     ///
     /// Why: `/exit` and `/quit` must leave the dashboard exactly like the `q`
@@ -379,14 +389,31 @@ impl DashboardState {
     /// Mark the currently-highlighted session as the command-bar's target.
     ///
     /// Why: pressing Enter on a session row "focuses" it so plain text typed in
-    /// the CMD> bar is routed to that session's summarized-chat mode.
-    /// What: copies [`Self::selected_target`] into [`Self::active_session`];
-    /// returns the focused name, or `None` when the session list is empty.
+    /// the CMD> bar is routed to that session's summarized-chat mode and the
+    /// session-output detail panel opens beside the list.
+    /// What: copies [`Self::selected_target`] into [`Self::active_session`] and
+    /// clears any stale [`Self::session_output`] so the panel repaints on the
+    /// next poll; returns the focused name, or `None` when the list is empty.
     /// Test: `set_active_session_uses_selected_target`.
     pub fn set_active_session(&mut self) -> Option<String> {
         let target = self.selected_target().filter(|t| !t.is_empty());
         self.active_session = target.clone();
+        self.session_output.clear();
         target
+    }
+
+    /// Deselect the focused session, closing the detail panel.
+    ///
+    /// Why: pressing Esc while the command bar is inactive must drop the
+    /// focused session so the top area returns to the full session list.
+    /// What: clears [`Self::active_session`] and [`Self::session_output`];
+    /// returns `true` when a session had been focused.
+    /// Test: `clear_active_session_drops_focus`.
+    pub fn clear_active_session(&mut self) -> bool {
+        let had = self.active_session.is_some();
+        self.active_session = None;
+        self.session_output.clear();
+        had
     }
 
     /// Build the [`SessionSummary`] slice the resolver searches.
@@ -598,11 +625,75 @@ pub(crate) fn short_session(id: &trusty_mpm_core::session::SessionId) -> String 
     id.0.to_string().chars().take(8).collect()
 }
 
+/// Extract the most useful human-readable detail from a hook event payload.
+///
+/// Why: a bare `FileChanged` row tells the operator nothing — the changed file,
+/// the tool name, or the session name is what they actually need to see.
+/// What: keys on the [`HookEvent`] variant to pull the relevant field from the
+/// opaque payload — `FileChanged` → the path's basename, tool events → the
+/// `tool` name, session events → a session name, otherwise the first useful
+/// string field — returning an empty string when nothing meaningful is present.
+/// Test: `event_detail_*` unit tests cover each branch.
+pub fn event_detail(
+    event: trusty_mpm_core::hook::HookEvent,
+    payload: &serde_json::Value,
+) -> String {
+    use trusty_mpm_core::hook::HookEvent;
+
+    /// Pull a string field from the payload, returning "" when absent.
+    fn field<'a>(payload: &'a serde_json::Value, key: &str) -> &'a str {
+        payload.get(key).and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    match event {
+        HookEvent::FileChanged => {
+            let path = field(payload, "path");
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_string()
+        }
+        HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => {
+            field(payload, "tool").to_string()
+        }
+        HookEvent::SessionStart | HookEvent::SessionEnd => {
+            let name = field(payload, "session_name");
+            if name.is_empty() {
+                field(payload, "name").to_string()
+            } else {
+                name.to_string()
+            }
+        }
+        HookEvent::SubagentStart | HookEvent::SubagentStop | HookEvent::SubagentStopFailure => {
+            field(payload, "agent").to_string()
+        }
+        HookEvent::SkillActivated => field(payload, "skill").to_string(),
+        HookEvent::WorktreeCreate | HookEvent::WorktreeRemove => field(payload, "path").to_string(),
+        HookEvent::UserPromptSubmit => {
+            let prompt = field(payload, "prompt");
+            prompt.chars().take(40).collect()
+        }
+        _ => {
+            // Fall back to the first useful string field commonly present.
+            for key in ["message", "tool", "path", "name", "reason"] {
+                let v = field(payload, key);
+                if !v.is_empty() {
+                    return v.chars().take(40).collect();
+                }
+            }
+            String::new()
+        }
+    }
+}
+
 /// Build the formatted lines for the recent-events panel.
 ///
 /// Why: separating line formatting from the ratatui `List` lets tests assert
 /// the text without a terminal backend.
-/// What: the last 20 events, each as `{event:<22} {session_short:<10} {at}`.
+/// What: the last 20 events, each as
+/// `{event:<22} {detail:<20} {session_short:<10} {at}` where `detail` is the
+/// per-event detail from [`event_detail`] (filename, tool name, …).
 /// Test: `event_lines_format_recent_events`.
 pub fn event_lines(state: &DashboardState) -> Vec<String> {
     let start = state.events.len().saturating_sub(20);
@@ -610,9 +701,68 @@ pub fn event_lines(state: &DashboardState) -> Vec<String> {
         .iter()
         .map(|e| {
             let session = short_session(&e.session);
-            format!("{:<22} {:<10} {}", e.event.wire_name(), session, e.at)
+            let detail = event_detail(e.event, &e.payload);
+            format!(
+                "{:<22} {:<20} {:<10} {}",
+                e.event.wire_name(),
+                detail,
+                session,
+                e.at
+            )
         })
         .collect()
+}
+
+/// Maximum number of lines kept in the session-output detail panel.
+pub const SESSION_OUTPUT_LIMIT: usize = 50;
+
+/// Build the lines shown in the session-output detail panel.
+///
+/// Why: the panel content comes from one of two sources depending on the
+/// session's origin — the event loop fills [`DashboardState::session_output`]
+/// with a tmux snapshot for tmux-origin sessions and falls back here to the
+/// session's recent hook events; keeping the fallback formatting testable means
+/// it can be asserted without a terminal.
+/// What: returns the trailing [`SESSION_OUTPUT_LIMIT`] lines of
+/// `session_output` when it is non-empty; otherwise formats the events whose
+/// session matches `active_session` (resolved by friendly name or UUID prefix)
+/// as `{event:<22} {detail}` lines; a placeholder when nothing is available.
+/// Test: `session_output_panel_lines_*`.
+pub fn session_output_panel_lines(state: &DashboardState) -> Vec<String> {
+    if !state.session_output.is_empty() {
+        let start = state
+            .session_output
+            .len()
+            .saturating_sub(SESSION_OUTPUT_LIMIT);
+        return state.session_output[start..].to_vec();
+    }
+    // Fall back to this session's recent hook events.
+    let Some(focused) = state.active_session.as_deref() else {
+        return vec!["(no session focused)".to_string()];
+    };
+    let session_id = state
+        .sessions
+        .iter()
+        .find(|s| s.tmux_name == focused || s.id.0.to_string() == focused)
+        .map(|s| s.id);
+    let matching: Vec<String> = state
+        .events
+        .iter()
+        .filter(|e| match session_id {
+            Some(id) => e.session == id,
+            None => true,
+        })
+        .map(|e| {
+            let detail = event_detail(e.event, &e.payload);
+            format!("{:<22} {detail}", e.event.wire_name())
+        })
+        .collect();
+    if matching.is_empty() {
+        vec![format!("(no recent output for {focused})")]
+    } else {
+        let start = matching.len().saturating_sub(SESSION_OUTPUT_LIMIT);
+        matching[start..].to_vec()
+    }
 }
 
 /// Build the status-bar line (header line 2).
@@ -660,7 +810,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// What: clears a centred box and draws a bordered `Paragraph` of the bindings.
 /// Test: the binding text is covered by `help_text_lists_all_bindings`.
 fn render_help_overlay(frame: &mut Frame) {
-    let area = centered_rect(54, 11, frame.area());
+    let area = centered_rect(54, 13, frame.area());
     let text = help_text();
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -684,13 +834,15 @@ pub fn help_text() -> String {
     [
         "  ↑ / k     move selection up",
         "  ↓ / j     move selection down",
+        "  Enter     focus session + open output panel",
         "  p         pause selected session",
         "  r         resume selected session",
         "  x         stop selected session",
         "  o         open session in iTerm2 tab",
         "  : or /    activate the command bar",
         "  ?         toggle this help",
-        "  q / Esc   quit",
+        "  Esc       deselect session / close help",
+        "  q         quit",
     ]
     .join("\n")
 }
@@ -868,7 +1020,8 @@ pub fn render_with_table_state(
     ]);
     frame.render_widget(header, chunks[0]);
 
-    // Middle row: sessions (60%) beside circuit breakers (40%).
+    // Middle row: sessions beside either the circuit-breaker panel (no focused
+    // session) or the session-output detail panel (a session is focused).
     let middle = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -888,21 +1041,35 @@ pub fn render_with_table_state(
     .block(Block::default().borders(Borders::ALL).title("Sessions"));
     frame.render_stateful_widget(sessions, middle[0], table_state);
 
-    let breakers = Table::new(
-        breaker_rows(state),
-        [
-            Constraint::Min(12),
-            Constraint::Length(10),
-            Constraint::Length(6),
-        ],
-    )
-    .header(Row::new(vec!["AGENT", "STATE", "FAILS"]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Circuit Breakers"),
-    );
-    frame.render_widget(breakers, middle[1]);
+    if let Some(focused) = state.active_session.as_deref() {
+        // A session is focused: the right panel shows its live output/history.
+        let items: Vec<ListItem> = session_output_panel_lines(state)
+            .into_iter()
+            .map(ListItem::new)
+            .collect();
+        let output = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Session Output / History — {focused}")),
+        );
+        frame.render_widget(output, middle[1]);
+    } else {
+        let breakers = Table::new(
+            breaker_rows(state),
+            [
+                Constraint::Min(12),
+                Constraint::Length(10),
+                Constraint::Length(6),
+            ],
+        )
+        .header(Row::new(vec!["AGENT", "STATE", "FAILS"]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Circuit Breakers"),
+        );
+        frame.render_widget(breakers, middle[1]);
+    }
 
     // Events row: recent hook-event feed (50%) beside the daemon log tail (50%).
     let bottom = Layout::default()
@@ -1152,6 +1319,163 @@ mod tests {
             at: at.into(),
             payload: serde_json::Value::Null,
         }
+    }
+
+    /// Build an `EventRow` with an explicit payload.
+    fn event_with_payload(
+        event: trusty_mpm_core::hook::HookEvent,
+        at: &str,
+        payload: serde_json::Value,
+    ) -> EventRow {
+        EventRow {
+            session: sid("evt"),
+            event,
+            at: at.into(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn event_detail_filechanged_shows_basename() {
+        use trusty_mpm_core::hook::HookEvent;
+        let payload = serde_json::json!({ "path": "/home/me/proj/src/foo.rs" });
+        assert_eq!(event_detail(HookEvent::FileChanged, &payload), "foo.rs");
+    }
+
+    #[test]
+    fn event_detail_tool_events_show_tool_name() {
+        use trusty_mpm_core::hook::HookEvent;
+        let payload = serde_json::json!({ "tool": "Bash" });
+        assert_eq!(event_detail(HookEvent::PreToolUse, &payload), "Bash");
+        assert_eq!(event_detail(HookEvent::PostToolUse, &payload), "Bash");
+    }
+
+    #[test]
+    fn event_detail_session_events_show_name() {
+        use trusty_mpm_core::hook::HookEvent;
+        let payload = serde_json::json!({ "session_name": "my-project" });
+        assert_eq!(
+            event_detail(HookEvent::SessionStart, &payload),
+            "my-project"
+        );
+    }
+
+    #[test]
+    fn event_detail_empty_when_no_useful_field() {
+        use trusty_mpm_core::hook::HookEvent;
+        assert_eq!(
+            event_detail(HookEvent::FileChanged, &serde_json::Value::Null),
+            ""
+        );
+        assert_eq!(
+            event_detail(HookEvent::TokenUsageUpdate, &serde_json::json!({})),
+            ""
+        );
+    }
+
+    #[test]
+    fn event_detail_fallback_uses_message_field() {
+        use trusty_mpm_core::hook::HookEvent;
+        let payload = serde_json::json!({ "message": "disk full" });
+        assert_eq!(event_detail(HookEvent::Notification, &payload), "disk full");
+    }
+
+    #[test]
+    fn event_lines_include_detail_column() {
+        use trusty_mpm_core::hook::HookEvent;
+        let state = DashboardState {
+            events: vec![event_with_payload(
+                HookEvent::FileChanged,
+                "2024-01-01T00:00:00Z",
+                serde_json::json!({ "path": "/a/b/foo.rs" }),
+            )],
+            ..DashboardState::default()
+        };
+        let lines = event_lines(&state);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("FileChanged"));
+        assert!(lines[0].contains("foo.rs"));
+    }
+
+    #[test]
+    fn session_output_panel_lines_uses_captured_output() {
+        // A non-empty `session_output` is shown verbatim (trailing-limited).
+        let state = DashboardState {
+            active_session: Some("frontend".into()),
+            session_output: vec!["line one".into(), "line two".into()],
+            ..DashboardState::default()
+        };
+        let lines = session_output_panel_lines(&state);
+        assert_eq!(lines, vec!["line one".to_string(), "line two".to_string()]);
+    }
+
+    #[test]
+    fn session_output_panel_lines_caps_at_limit() {
+        let state = DashboardState {
+            active_session: Some("frontend".into()),
+            session_output: vec!["x".to_string(); SESSION_OUTPUT_LIMIT + 10],
+            ..DashboardState::default()
+        };
+        assert_eq!(
+            session_output_panel_lines(&state).len(),
+            SESSION_OUTPUT_LIMIT
+        );
+    }
+
+    #[test]
+    fn session_output_panel_lines_falls_back_to_events() {
+        // With no captured tmux output, the panel shows the focused session's
+        // recent hook events.
+        use trusty_mpm_core::hook::HookEvent;
+        let mut row = event_with_payload(
+            HookEvent::PreToolUse,
+            "2024-01-01T00:00:00Z",
+            serde_json::json!({ "tool": "Bash" }),
+        );
+        row.session = sid("frontend");
+        let state = DashboardState {
+            active_session: Some("frontend".into()),
+            sessions: vec![session("frontend", "/p", "active", "frontend")],
+            events: vec![row],
+            ..DashboardState::default()
+        };
+        let lines = session_output_panel_lines(&state);
+        assert!(lines.iter().any(|l| l.contains("PreToolUse")));
+        assert!(lines.iter().any(|l| l.contains("Bash")));
+    }
+
+    #[test]
+    fn session_output_panel_lines_placeholder_when_no_focus() {
+        let state = DashboardState::default();
+        assert_eq!(
+            session_output_panel_lines(&state),
+            vec!["(no session focused)".to_string()]
+        );
+    }
+
+    #[test]
+    fn clear_active_session_drops_focus() {
+        let mut state = DashboardState {
+            active_session: Some("frontend".into()),
+            session_output: vec!["stale".into()],
+            ..DashboardState::default()
+        };
+        assert!(state.clear_active_session());
+        assert!(state.active_session.is_none());
+        assert!(state.session_output.is_empty());
+        // Clearing again reports nothing was focused.
+        assert!(!state.clear_active_session());
+    }
+
+    #[test]
+    fn set_active_session_clears_stale_output() {
+        let mut state = DashboardState {
+            sessions: vec![session("aaa", "/p/a", "active", "frontend")],
+            session_output: vec!["stale".into()],
+            ..DashboardState::default()
+        };
+        assert_eq!(state.set_active_session(), Some("frontend".to_string()));
+        assert!(state.session_output.is_empty());
     }
 
     #[test]
