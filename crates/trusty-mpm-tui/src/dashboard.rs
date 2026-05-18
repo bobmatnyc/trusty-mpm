@@ -34,7 +34,7 @@ pub const COMMAND_HISTORY_LIMIT: usize = 20;
 /// What: the bare command verbs, each as it would appear after the leading `/`.
 /// Test: `known_commands_contains_core_verbs`.
 pub const KNOWN_COMMANDS: &[&str] = &[
-    "pair", "projects", "sessions", "tmux", "status", "adopt", "help", "connect",
+    "pair", "projects", "sessions", "tmux", "status", "adopt", "connect", "chat", "send", "help",
 ];
 
 /// The persistent slash-command bar pinned to the bottom of the dashboard.
@@ -289,6 +289,14 @@ pub struct DashboardState {
     /// are captured for editing or fall through to single-key shortcuts.
     /// Test: `command_bar_*` unit tests.
     pub command_bar: CommandBar,
+    /// Rolling LLM chat history for the `/chat` command.
+    ///
+    /// Why: the `/chat` command drives the daemon's stateless `POST /llm/chat`
+    /// endpoint; the TUI holds the conversation window so successive `/chat`
+    /// calls form one continuous conversation.
+    /// What: the message history, updated after every successful `/chat` turn.
+    /// Test: `dispatch_chat_writes_error_when_daemon_down`.
+    pub chat_history: Vec<trusty_mpm_client::ChatMessage>,
 }
 
 impl DashboardState {
@@ -671,6 +679,8 @@ pub fn command_help_lines() -> Vec<String> {
         "  /status           show daemon status".to_string(),
         "  /adopt <name>     adopt a tmux session by name".to_string(),
         "  /connect <id>     focus a session by fuzzy target".to_string(),
+        "  /chat <message>   ask the LLM chat assistant".to_string(),
+        "  /send <s> <cmd>   send a prompt to a Claude Code session".to_string(),
         "  /help             show this help".to_string(),
         "Tab: autocomplete   ↑/↓: history   Esc: close".to_string(),
     ]

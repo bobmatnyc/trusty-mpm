@@ -12,7 +12,7 @@
 //! deserialization; live HTTP is exercised by the executor tests against an
 //! in-process test daemon and by the daemon's own API tests.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use trusty_mpm_core::session::{SessionId, SessionStatus};
 
@@ -218,6 +218,37 @@ pub struct PairStatus {
     pub chat_id: Option<i64>,
 }
 
+/// One message in an LLM chat conversation.
+///
+/// Why: the `/chat` command (TUI) and free-text Telegram messages route to the
+/// daemon's `POST /llm/chat`, which keeps no chat state of its own — the UI
+/// holds the rolling history and sends it with each turn.
+/// What: a `role` (`"user"` or `"assistant"`) and the message `content`,
+/// wire-compatible with the daemon's `ChatMessage`.
+/// Test: `llm_chat_message_round_trips`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// Message role: `"user"` or `"assistant"`.
+    pub role: String,
+    /// Message text content.
+    pub content: String,
+}
+
+/// Outcome of a `POST /llm/chat` call.
+///
+/// Why: the caller needs both the assistant's reply and the updated history so
+/// it can persist the conversation window for the next turn.
+/// What: the assistant `reply` text and the updated `history`.
+/// Test: `llm_chat_response_deserializes`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmChatOutcome {
+    /// The assistant's reply text.
+    pub reply: String,
+    /// The updated conversation history, ready for the next turn.
+    #[serde(default)]
+    pub history: Vec<ChatMessage>,
+}
+
 impl DaemonClient {
     /// Build a client targeting `base` (e.g. `http://127.0.0.1:7880`).
     ///
@@ -411,6 +442,38 @@ impl DaemonClient {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string())
+    }
+
+    /// Send a command into a session's tmux pane via `POST /sessions/{id}/command`.
+    ///
+    /// Why: the Telegram `/send` command and the TUI's `/send` drive a running
+    /// Claude Code session remotely — type a prompt, read back the pane.
+    /// What: POSTs `{ command }`; returns `Ok(Some(output))` with the captured
+    /// pane text on success, `Ok(None)` when the session is unknown (`404`), and
+    /// `Err` on transport failure.
+    /// Test: covered by the daemon's session-command tests.
+    pub async fn send_session_command(
+        &self,
+        id: &str,
+        command: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let url = format!("{}/sessions/{id}/command", self.base);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "command": command }))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body: serde_json::Value = resp.error_for_status()?.json().await?;
+        Ok(Some(
+            body.get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ))
     }
 
     /// Fetch the overseer status via `GET /overseer`.
@@ -684,6 +747,34 @@ impl DaemonClient {
         Ok(body)
     }
 
+    /// Send a chat message to the daemon's LLM assistant via `POST /llm/chat`.
+    ///
+    /// Why: free-text Telegram messages and the TUI's `/chat` command route to
+    /// the daemon's conversational endpoint; the UI owns the rolling history
+    /// and threads it through each turn.
+    /// What: POSTs `{ message, history }`; returns `Ok(Some(outcome))` with the
+    /// reply and updated history on success, `Ok(None)` when the daemon answers
+    /// `503` (LLM chat not configured), and `Err` on transport failure.
+    /// Test: `llm_chat_response_deserializes` covers the wire shape.
+    pub async fn llm_chat(
+        &self,
+        message: &str,
+        history: &[ChatMessage],
+    ) -> anyhow::Result<Option<LlmChatOutcome>> {
+        let url = format!("{}/llm/chat", self.base);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "message": message, "history": history }))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Ok(None);
+        }
+        let outcome: LlmChatOutcome = resp.error_for_status()?.json().await?;
+        Ok(Some(outcome))
+    }
+
     /// Query pairing status via `GET /pair/status`.
     ///
     /// Why: the `/start` command branches on whether the daemon is paired.
@@ -841,6 +932,37 @@ mod tests {
         assert!(!confirm.success);
         assert_eq!(confirm.error.as_deref(), Some("invalid or expired code"));
         assert_eq!(confirm.chat_id, None);
+    }
+
+    #[test]
+    fn llm_chat_message_round_trips() {
+        // A ChatMessage serializes to the `{role, content}` wire shape the
+        // daemon expects and deserializes back unchanged.
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["role"], "user");
+        assert_eq!(json["content"], "hello");
+        let back: ChatMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn llm_chat_response_deserializes() {
+        // The `POST /llm/chat` response carries the reply and updated history.
+        let json = serde_json::json!({
+            "reply": "hi there",
+            "history": [
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": "hi there" },
+            ],
+        });
+        let outcome: LlmChatOutcome = serde_json::from_value(json).unwrap();
+        assert_eq!(outcome.reply, "hi there");
+        assert_eq!(outcome.history.len(), 2);
+        assert_eq!(outcome.history[1].role, "assistant");
     }
 
     #[test]

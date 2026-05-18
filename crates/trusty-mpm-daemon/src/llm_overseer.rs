@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use trusty_mpm_core::overseer::{Overseer, OverseerContext, OverseerDecision};
@@ -27,6 +28,80 @@ const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Why: the overseer sits on the hook hot path; a slow model must never stall
 /// a Claude Code tool call. On timeout the overseer fails open (`Allow`).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Hard timeout for an interactive LLM chat call.
+///
+/// Why: chat is not on the hook hot path, so it can afford a longer budget than
+/// the overseer's 3-second verdict timeout, but a runaway request must still
+/// fail rather than hang the caller forever.
+const CHAT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of messages kept in a rolling chat history (10 exchanges).
+///
+/// Why: the conversation window must stay bounded so the prompt never grows
+/// without limit; ten user/assistant exchanges is a practical context size.
+pub const CHAT_HISTORY_LIMIT: usize = 20;
+
+/// System prompt for the general-purpose LLM chat assistant.
+const CHAT_SYSTEM_PROMPT: &str = "You are a helpful assistant integrated with \
+trusty-mpm, a Claude Code session manager. You can discuss sessions, projects, \
+tmux, and general questions. Be concise.";
+
+/// One message in an LLM chat conversation.
+///
+/// Why: [`LlmOverseer::chat`] maintains a rolling conversation window; each turn
+/// is a `{ role, content }` pair matching the OpenRouter messages array shape,
+/// so callers (and the HTTP layer) can serialize the history directly.
+/// What: a `role` (`"user"` or `"assistant"`) and the message `content`.
+/// Test: `chat_history_is_capped`, `build_chat_messages_includes_history`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// Message role: `"user"` or `"assistant"`.
+    pub role: String,
+    /// Message text content.
+    pub content: String,
+}
+
+impl ChatMessage {
+    /// A user-authored chat message.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: content.into(),
+        }
+    }
+
+    /// An assistant-authored chat message.
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+        }
+    }
+}
+
+/// A failure surfaced by an interactive LLM chat call.
+///
+/// Why: chat callers (the HTTP handler, the TUI) need to distinguish "not
+/// configured" from a transport or parse failure so they can render the right
+/// message; a typed error keeps that distinction explicit.
+/// What: one variant per failure mode of [`LlmOverseer::chat`].
+/// Test: `chat_without_key_is_not_configured`.
+#[derive(Debug, thiserror::Error)]
+pub enum LlmError {
+    /// The overseer has no API key, so chat cannot run.
+    #[error("LLM chat is not configured (no API key)")]
+    NotConfigured,
+    /// The HTTP request to OpenRouter failed.
+    #[error("LLM request failed: {0}")]
+    Http(String),
+    /// The OpenRouter response body could not be parsed as JSON.
+    #[error("LLM response could not be parsed: {0}")]
+    Parse(String),
+    /// OpenRouter returned no assistant text.
+    #[error("LLM returned an empty response")]
+    EmptyResponse,
+}
 
 /// System prompt instructing the model to act as a security overseer.
 const SYSTEM_PROMPT: &str = "You are a security overseer for an AI coding \
@@ -50,6 +125,13 @@ pub struct LlmOverseer {
     model: String,
     /// Blocking HTTP client with the overseer timeout baked in.
     client: reqwest::blocking::Client,
+    /// Async HTTP client used by the interactive `chat` path.
+    ///
+    /// Why: [`Self::evaluate`] runs on the synchronous hook path, but
+    /// [`Self::chat`] is called from async axum handlers where a blocking
+    /// client would stall the runtime; chat gets its own async client with a
+    /// longer timeout.
+    chat_client: reqwest::Client,
 }
 
 impl LlmOverseer {
@@ -68,11 +150,70 @@ impl LlmOverseer {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .unwrap_or_default();
+        let chat_client = reqwest::Client::builder()
+            .timeout(CHAT_TIMEOUT)
+            .build()
+            .unwrap_or_default();
         Self {
             api_key,
             model: model.into(),
             client,
+            chat_client,
         }
+    }
+
+    /// Send a user message and return the model's reply text.
+    ///
+    /// Why: the LLM overseer already resolves an API key and a model; the
+    /// Telegram bot and TUI want a general conversational endpoint that reuses
+    /// that same auth rather than standing up a second OpenRouter client.
+    /// What: appends `user_msg` to `history`, posts the system prompt plus the
+    /// full (capped) history to OpenRouter, appends the assistant reply to
+    /// `history`, and returns the reply text. `history` is trimmed to the last
+    /// [`CHAT_HISTORY_LIMIT`] messages (oldest pairs dropped) before sending.
+    /// On any failure `history` is left holding only the user message so the
+    /// caller can retry without a dangling half-exchange.
+    /// Test: `chat_history_is_capped`, `chat_without_key_is_not_configured`.
+    pub async fn chat(
+        &self,
+        history: &mut Vec<ChatMessage>,
+        user_msg: &str,
+    ) -> Result<String, LlmError> {
+        if self.api_key.is_empty() {
+            return Err(LlmError::NotConfigured);
+        }
+
+        history.push(ChatMessage::user(user_msg));
+        cap_history(history);
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": build_chat_messages(history),
+            "temperature": 0.7,
+        });
+
+        let response = self
+            .chat_client
+            .post(OPENROUTER_URL)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|e| LlmError::Parse(e.to_string()))?;
+
+        let reply = extract_reply(&json);
+        if reply.trim().is_empty() {
+            return Err(LlmError::EmptyResponse);
+        }
+
+        history.push(ChatMessage::assistant(reply.clone()));
+        cap_history(history);
+        Ok(reply)
     }
 
     /// Query OpenRouter for a verdict on one tool-use request.
@@ -241,6 +382,43 @@ fn read_dotenv_key(path: &std::path::Path, var_name: &str) -> Option<String> {
     None
 }
 
+/// Trim a chat history to the last [`CHAT_HISTORY_LIMIT`] messages.
+///
+/// Why: the conversation window must stay bounded so the prompt sent to
+/// OpenRouter never grows without limit; dropping from the front keeps the most
+/// recent (most relevant) context.
+/// What: removes the oldest messages until `history.len() <= CHAT_HISTORY_LIMIT`.
+/// Test: `chat_history_is_capped`, `cap_history_keeps_recent`.
+fn cap_history(history: &mut Vec<ChatMessage>) {
+    if history.len() > CHAT_HISTORY_LIMIT {
+        let overflow = history.len() - CHAT_HISTORY_LIMIT;
+        history.drain(0..overflow);
+    }
+}
+
+/// Build the OpenRouter `messages` array: system prompt then the history.
+///
+/// Why: every chat request leads with the assistant's system prompt followed by
+/// the full conversation window; isolating the assembly keeps [`LlmOverseer::chat`]
+/// readable and the shape testable without the network.
+/// What: returns a JSON array with the system message first, then each history
+/// message as `{ role, content }`.
+/// Test: `build_chat_messages_includes_history`.
+fn build_chat_messages(history: &[ChatMessage]) -> Vec<Value> {
+    let mut messages = Vec::with_capacity(history.len() + 1);
+    messages.push(serde_json::json!({
+        "role": "system",
+        "content": CHAT_SYSTEM_PROMPT,
+    }));
+    for msg in history {
+        messages.push(serde_json::json!({
+            "role": msg.role,
+            "content": msg.content,
+        }));
+    }
+    messages
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +543,70 @@ mod tests {
         // An absent file is not an error — it just yields None.
         let value = read_dotenv_key(std::path::Path::new("/no/such/.env"), "ANY");
         assert!(value.is_none());
+    }
+
+    #[test]
+    fn cap_history_keeps_recent() {
+        // An over-limit history is trimmed to the last CHAT_HISTORY_LIMIT,
+        // keeping the most recent messages.
+        let mut history: Vec<ChatMessage> = (0..CHAT_HISTORY_LIMIT + 4)
+            .map(|i| ChatMessage::user(format!("msg-{i}")))
+            .collect();
+        cap_history(&mut history);
+        assert_eq!(history.len(), CHAT_HISTORY_LIMIT);
+        assert_eq!(
+            history.last().unwrap().content,
+            format!("msg-{}", CHAT_HISTORY_LIMIT + 3)
+        );
+    }
+
+    #[test]
+    fn cap_history_leaves_short_history() {
+        // A history within the limit is untouched.
+        let mut history = vec![ChatMessage::user("a"), ChatMessage::assistant("b")];
+        cap_history(&mut history);
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn build_chat_messages_includes_history() {
+        // The assembled array leads with the system prompt then the history.
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+        ];
+        let messages = build_chat_messages(&history);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "hello");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "hi there");
+    }
+
+    #[tokio::test]
+    async fn chat_without_key_is_not_configured() {
+        // With no API key the overseer reports NotConfigured rather than
+        // attempting a network call. The overseer is built on a blocking
+        // thread because constructing its blocking `reqwest` client stands up
+        // an internal runtime that must not be dropped in an async context.
+        let overseer = tokio::task::spawn_blocking(|| {
+            LlmOverseer::new("test-model", "TRUSTY_MPM_NO_SUCH_CHAT_KEY")
+        })
+        .await
+        .expect("build overseer");
+        let mut history = Vec::new();
+        let err = overseer.chat(&mut history, "hello").await.unwrap_err();
+        assert!(matches!(err, LlmError::NotConfigured));
+        // Drop the overseer (and its blocking client) off the async context.
+        tokio::task::spawn_blocking(move || drop(overseer))
+            .await
+            .expect("drop overseer");
+    }
+
+    #[test]
+    fn chat_message_constructors_set_role() {
+        assert_eq!(ChatMessage::user("x").role, "user");
+        assert_eq!(ChatMessage::assistant("y").role, "assistant");
     }
 }

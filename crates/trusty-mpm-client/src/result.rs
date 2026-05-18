@@ -146,6 +146,18 @@ pub enum CommandResult {
         /// The session id or name that was killed.
         session_id: String,
     },
+    /// `/send` — a prompt was sent to a session; carries the captured output.
+    CommandSent {
+        /// The resolved session id or friendly name.
+        session: String,
+        /// The captured pane output after the prompt ran (may be truncated).
+        output: String,
+    },
+    /// LLM chat reply for a free-text message.
+    ChatReply {
+        /// The assistant's reply text.
+        reply: String,
+    },
     /// `/approve` — a permission request was approved.
     Approved {
         /// The session id or name that was approved.

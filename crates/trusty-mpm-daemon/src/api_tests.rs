@@ -242,6 +242,23 @@ async fn hook_relay_runs_with_disabled_overseer() {
 }
 
 #[tokio::test]
+async fn llm_chat_without_overseer_is_503() {
+    // A default daemon has no OpenRouter key, so `POST /llm/chat` reports the
+    // capability as unavailable rather than attempting a network call.
+    let state = DaemonState::shared();
+    let err = llm_chat(
+        State(state),
+        Json(LlmChatRequest {
+            message: "hello".into(),
+            history: Vec::new(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn openapi_spec_is_valid() {
     // `GET /api-docs/openapi.json` must return 200 with a document that
     // carries the `openapi` version key and the daemon's title.

@@ -280,6 +280,37 @@ pub struct RestartResponse {
     pub restarted: String,
 }
 
+/// Request body for `POST /llm/chat`.
+///
+/// Why: the Telegram bot and TUI hold conversation history client-side and send
+/// it with each turn so the daemon stays stateless about chat sessions.
+/// What: the new user `message` plus the prior conversation `history`.
+/// Test: `llm_chat_without_overseer_is_503` covers the no-overseer path.
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct LlmChatRequest {
+    /// The user's message text.
+    pub message: String,
+    /// Prior conversation history (oldest first); empty starts a new chat.
+    #[serde(default)]
+    #[schema(value_type = Vec<Object>)]
+    pub history: Vec<crate::llm_overseer::ChatMessage>,
+}
+
+/// Response of `POST /llm/chat`.
+///
+/// Why: the caller needs both the assistant's reply and the updated history
+/// (with the user message and reply appended, capped to the rolling window) so
+/// it can store the history for the next turn.
+/// What: the assistant `reply` text and the updated `history`.
+/// Test: `llm_chat_without_overseer_is_503`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LlmChatResponse {
+    /// The assistant's reply text.
+    pub reply: String,
+    /// The updated conversation history, ready for the next turn.
+    pub history: Vec<crate::llm_overseer::ChatMessage>,
+}
+
 /// Response of `POST /pair/confirm`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PairConfirmResponse {

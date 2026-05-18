@@ -74,6 +74,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/breakers", get(breakers))
         .route("/optimizer", get(get_optimizer))
         .route("/overseer", get(get_overseer))
+        .route("/llm/chat", post(llm_chat))
         .route("/tmux/sessions", get(list_tmux_sessions))
         .route("/tmux/sessions/{name}/snapshot", get(tmux_snapshot))
         .route("/tmux/adopt", post(adopt_tmux_session))
@@ -656,6 +657,43 @@ pub async fn get_overseer(State(state): State<Arc<DaemonState>>) -> Json<Oversee
             handler: state.overseer_handler().to_string(),
         },
     })
+}
+
+/// `POST /llm/chat` — send a message to the LLM chat assistant.
+///
+/// Why: the Telegram bot routes free-text (non-command) messages here, and the
+/// TUI's `/chat` command does the same; both want a conversational endpoint
+/// that reuses the overseer's already-resolved OpenRouter credentials.
+/// What: requires a configured LLM overseer (else `503`), runs
+/// [`LlmOverseer::chat`] over the client-supplied history, and returns the
+/// assistant reply plus the updated history. The daemon stays stateless about
+/// chat sessions — the caller owns the history.
+/// Test: `llm_chat_without_overseer_is_503`.
+#[utoipa::path(
+    post,
+    path = "/llm/chat",
+    tag = "config",
+    request_body = LlmChatRequest,
+    responses(
+        (status = 200, description = "Assistant reply and updated history"),
+        (status = 503, description = "LLM chat is not configured on this daemon"),
+    )
+)]
+pub async fn llm_chat(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<LlmChatRequest>,
+) -> Result<Json<LlmChatResponse>, DaemonError> {
+    let overseer = state.llm_overseer().ok_or_else(|| {
+        DaemonError::ServiceUnavailable(
+            "LLM chat is not configured (no OpenRouter API key)".to_string(),
+        )
+    })?;
+    let mut history = body.history;
+    let reply = overseer
+        .chat(&mut history, &body.message)
+        .await
+        .map_err(|e| DaemonError::Internal(e.to_string()))?;
+    Ok(Json(LlmChatResponse { reply, history }))
 }
 
 /// `GET /optimizer` — current token-use optimizer configuration.

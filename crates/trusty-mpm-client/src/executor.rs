@@ -11,8 +11,14 @@
 //! Test: `cargo test -p trusty-mpm-client` covers the pure `/help` path and the
 //! HTTP paths against an in-process test daemon.
 
-use crate::client::DaemonClient;
+use crate::client::{DaemonClient, SessionRow};
 use crate::command::{TrustyCommand, help_text};
+
+/// Maximum captured-output length returned by `/send` (Telegram's message cap).
+///
+/// Why: Telegram rejects messages longer than ~4096 characters; truncating the
+/// captured pane keeps the reply deliverable on every UI.
+pub const MAX_OUTPUT_CHARS: usize = 4000;
 use crate::result::{
     CommandResult, DecisionCounts, DiscoveredProjectSummary, RecommendationSummary, SessionSummary,
     TmuxSessionSummary,
@@ -78,6 +84,7 @@ impl CommandExecutor {
             TrustyCommand::Config { project } => self.config(&project).await,
             TrustyCommand::Snapshot { session } => self.snapshot(&session).await,
             TrustyCommand::Kill { session_id } => self.kill(&session_id).await,
+            TrustyCommand::Send { session, prompt } => self.send(&session, &prompt).await,
             TrustyCommand::Start => self.pair_state().await,
             TrustyCommand::Pair { code: None } => self.pair_state().await,
             TrustyCommand::Pair { code: Some(_) } => {
@@ -327,6 +334,39 @@ impl CommandExecutor {
         }
     }
 
+    /// `/send` — resolve a session and send a prompt to its tmux pane.
+    ///
+    /// Why: `/send <session> <prompt>` drives a running Claude Code session
+    /// remotely; the session is identified by id, friendly name, or a name
+    /// prefix, so the executor resolves it against `GET /sessions` first.
+    /// What: fetches the session list, finds the first session whose id or
+    /// `tmux_name` matches `session` (exact, then prefix), posts the prompt via
+    /// `POST /sessions/{id}/command`, and returns the captured pane output
+    /// truncated to [`MAX_OUTPUT_CHARS`] (Telegram's message limit). An unknown
+    /// session or unreachable daemon yields a [`CommandResult::Error`].
+    /// Test: `execute_send_unknown_session_errors`,
+    /// `execute_send_against_test_daemon`.
+    async fn send(&self, session: &str, prompt: &str) -> CommandResult {
+        if prompt.trim().is_empty() {
+            return CommandResult::Error("send: a prompt is required".to_string());
+        }
+        let rows = match self.client.sessions().await {
+            Ok(rows) => rows,
+            Err(e) => return CommandResult::Error(format!("daemon unreachable: {e}")),
+        };
+        let Some(target) = resolve_session(&rows, session) else {
+            return CommandResult::Error(format!("session {session} not found"));
+        };
+        match self.client.send_session_command(&target, prompt).await {
+            Ok(Some(output)) => CommandResult::CommandSent {
+                session: target,
+                output: truncate_output(&output),
+            },
+            Ok(None) => CommandResult::Error(format!("session {session} not found")),
+            Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
+        }
+    }
+
     /// `/start` and `/pair` (no code) — query the pairing status.
     async fn pair_state(&self) -> CommandResult {
         match self.client.pair_status().await {
@@ -336,6 +376,55 @@ impl CommandExecutor {
             Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
         }
     }
+}
+
+/// Resolve a session reference (id, name, or prefix) to a definitive target.
+///
+/// Why: `/send` accepts a fuzzy session reference; resolving it against the
+/// live session list keeps the daemon call unambiguous.
+/// What: returns the first session whose id or `tmux_name` equals `query`, or —
+/// failing an exact match — whose `tmux_name` starts with `query`. The id and
+/// friendly name are both acceptable targets for `POST /sessions/{id}/command`.
+/// Test: `resolve_session_exact_and_prefix`.
+fn resolve_session(rows: &[SessionRow], query: &str) -> Option<String> {
+    if let Some(row) = rows
+        .iter()
+        .find(|r| r.id.0.to_string() == query || r.tmux_name == query)
+    {
+        return Some(target_of(row));
+    }
+    rows.iter()
+        .find(|r| !r.tmux_name.is_empty() && r.tmux_name.starts_with(query))
+        .map(target_of)
+}
+
+/// The path-segment target for a session: its friendly name when set, else its id.
+///
+/// Why: `POST /sessions/{id}/command` resolves either form; the friendly name
+/// is more readable in the reply, so it is preferred when present.
+/// What: returns `tmux_name` when non-empty, otherwise the UUID string.
+/// Test: covered by `resolve_session_exact_and_prefix`.
+fn target_of(row: &SessionRow) -> String {
+    if row.tmux_name.is_empty() {
+        row.id.0.to_string()
+    } else {
+        row.tmux_name.clone()
+    }
+}
+
+/// Truncate captured output to [`MAX_OUTPUT_CHARS`] on a character boundary.
+///
+/// Why: a session's pane capture can exceed Telegram's message limit; the
+/// reply must stay deliverable.
+/// What: returns `text` unchanged when short enough, otherwise the first
+/// [`MAX_OUTPUT_CHARS`] characters followed by a truncation marker.
+/// Test: `truncate_output_caps_long_text`.
+fn truncate_output(text: &str) -> String {
+    if text.chars().count() <= MAX_OUTPUT_CHARS {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(MAX_OUTPUT_CHARS).collect();
+    format!("{head}\n… (output truncated)")
 }
 
 /// Render a [`SessionStatus`] as its wire label.
@@ -551,6 +640,86 @@ mod tests {
         {
             CommandResult::SessionDetail { events, .. } => assert!(events.is_empty()),
             other => panic!("expected SessionDetail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_session_exact_and_prefix() {
+        use trusty_mpm_core::session::{SessionId, SessionStatus};
+        let rows = vec![
+            SessionRow {
+                id: SessionId(uuid::Uuid::nil()),
+                workdir: "/tmp/a".into(),
+                status: SessionStatus::Active,
+                active_delegations: 0,
+                tmux_name: "tmpm-blue-fox".into(),
+                last_seen: Default::default(),
+            },
+            SessionRow {
+                id: SessionId(uuid::Uuid::from_u128(1)),
+                workdir: "/tmp/b".into(),
+                status: SessionStatus::Active,
+                active_delegations: 0,
+                tmux_name: "frontend".into(),
+                last_seen: Default::default(),
+            },
+        ];
+        // Exact friendly-name match.
+        assert_eq!(
+            resolve_session(&rows, "frontend").as_deref(),
+            Some("frontend")
+        );
+        // Prefix match.
+        assert_eq!(
+            resolve_session(&rows, "tmpm-blue").as_deref(),
+            Some("tmpm-blue-fox")
+        );
+        // Exact id match resolves to the friendly name.
+        assert_eq!(
+            resolve_session(&rows, &uuid::Uuid::nil().to_string()).as_deref(),
+            Some("tmpm-blue-fox")
+        );
+        assert!(resolve_session(&rows, "no-such").is_none());
+    }
+
+    #[test]
+    fn truncate_output_caps_long_text() {
+        let short = "hello";
+        assert_eq!(truncate_output(short), short);
+        let long = "x".repeat(MAX_OUTPUT_CHARS + 100);
+        let truncated = truncate_output(&long);
+        assert!(truncated.contains("output truncated"));
+        assert!(truncated.chars().count() <= MAX_OUTPUT_CHARS + 32);
+    }
+
+    #[tokio::test]
+    async fn execute_send_unknown_session_errors() {
+        let (_state, url) = spawn_test_daemon().await;
+        let executor = CommandExecutor::new(url);
+        match executor
+            .execute(TrustyCommand::Send {
+                session: "no-such-session".into(),
+                prompt: "hello".into(),
+            })
+            .await
+        {
+            CommandResult::Error(msg) => assert!(msg.contains("not found")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_send_empty_prompt_errors() {
+        let executor = CommandExecutor::new("http://unused");
+        match executor
+            .execute(TrustyCommand::Send {
+                session: "frontend".into(),
+                prompt: "   ".into(),
+            })
+            .await
+        {
+            CommandResult::Error(msg) => assert!(msg.contains("prompt")),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 

@@ -400,6 +400,63 @@ async fn dispatch_command(state: &mut DashboardState, client: &DaemonClient, typ
                 vec![msg]
             }
         }
+        "chat" => {
+            if arg.is_empty() {
+                vec!["chat: usage: /chat <message>".to_string()]
+            } else {
+                match client.llm_chat(&arg, &state.chat_history).await {
+                    Ok(Some(outcome)) => {
+                        state.chat_history = outcome.history;
+                        outcome.reply.lines().map(str::to_string).collect()
+                    }
+                    Ok(None) => vec![
+                        "chat: LLM not configured — set OPENROUTER_API_KEY and enable the overseer"
+                            .to_string(),
+                    ],
+                    Err(e) => vec![format!("chat: daemon error: {e}")],
+                }
+            }
+        }
+        "send" => {
+            // `/send <session> <prompt>`: first token is the session, the
+            // remainder is the (possibly multi-word) prompt.
+            match arg.split_once(char::is_whitespace) {
+                Some((session, prompt)) if !prompt.trim().is_empty() => {
+                    match client.sessions().await {
+                        Ok(rows) => {
+                            match rows.iter().find(|r| {
+                                r.id.0.to_string() == session
+                                    || r.tmux_name == session
+                                    || (!r.tmux_name.is_empty() && r.tmux_name.starts_with(session))
+                            }) {
+                                Some(row) => {
+                                    let target = if row.tmux_name.is_empty() {
+                                        row.id.0.to_string()
+                                    } else {
+                                        row.tmux_name.clone()
+                                    };
+                                    match client.send_session_command(&target, prompt.trim()).await
+                                    {
+                                        Ok(Some(output)) => {
+                                            std::iter::once(format!("sent to {target}:"))
+                                                .chain(output.lines().map(str::to_string))
+                                                .collect()
+                                        }
+                                        Ok(None) => {
+                                            vec![format!("send: session {session} not found")]
+                                        }
+                                        Err(e) => vec![format!("send: daemon error: {e}")],
+                                    }
+                                }
+                                None => vec![format!("send: session {session} not found")],
+                            }
+                        }
+                        Err(e) => vec![format!("send: daemon error: {e}")],
+                    }
+                }
+                _ => vec!["send: usage: /send <session> <prompt>".to_string()],
+            }
+        }
         other => vec![format!("unknown command: /{other}  (try /help)")],
     };
     state.command_bar.set_output(lines);
@@ -519,6 +576,39 @@ mod tests {
         let client = DaemonClient::new("http://127.0.0.1:0");
         let mut state = DashboardState::default();
         dispatch_command(&mut state, &client, "/adopt").await;
+        assert!(state.command_bar.output[0].contains("usage"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_without_arg_shows_usage() {
+        // `/chat` with no message must explain its usage, not call the daemon.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "/chat").await;
+        assert!(state.command_bar.output[0].contains("usage"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_writes_error_when_daemon_down() {
+        // `/chat <msg>` against an unreachable daemon surfaces the failure.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "/chat hello there").await;
+        assert!(
+            state
+                .command_bar
+                .output
+                .iter()
+                .any(|l| l.contains("chat: daemon error"))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_without_prompt_shows_usage() {
+        // `/send <session>` with no prompt must explain its usage.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let mut state = DashboardState::default();
+        dispatch_command(&mut state, &client, "/send frontend").await;
         assert!(state.command_bar.output[0].contains("usage"));
     }
 

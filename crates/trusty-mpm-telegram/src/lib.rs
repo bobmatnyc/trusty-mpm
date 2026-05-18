@@ -18,6 +18,7 @@ pub mod alerts;
 pub mod commands;
 pub mod formatter;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,7 +31,20 @@ use tokio_util::sync::CancellationToken;
 use alerts::{AlertConfig, LastSeen};
 use commands::TelegramCommand;
 use formatter::TelegramFormatter;
-use trusty_mpm_client::{CommandExecutor, CommandResult, TrustyCommand};
+use trusty_mpm_client::{ChatMessage, CommandExecutor, CommandResult, TrustyCommand};
+
+/// Per-chat LLM conversation history, keyed by Telegram `chat_id`.
+///
+/// Why: free-text (non-command) messages route to the daemon's LLM chat, which
+/// is stateless about conversations — the bot holds the rolling history per
+/// chat and threads it through each turn.
+/// What: an `Arc<Mutex<…>>` of chat-id → message-history so every teloxide
+/// handler task shares one conversation store.
+type ChatHistories = Arc<Mutex<HashMap<i64, Vec<ChatMessage>>>>;
+
+/// The reply shown when LLM chat is requested but not configured.
+const LLM_NOT_CONFIGURED: &str =
+    "LLM chat not configured — set OPENROUTER_API_KEY in .env.local and enable the overseer";
 
 /// Poll interval for the per-session event push-alert loop.
 const SESSION_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -180,13 +194,15 @@ pub async fn run(
     // The one executor every handler shares — all daemon I/O goes through it.
     let executor = Arc::new(CommandExecutor::new(url));
     let opts = Arc::new(options);
+    // Per-chat LLM conversation history for free-text messages.
+    let histories: ChatHistories = Arc::new(Mutex::new(HashMap::new()));
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message))
         .branch(Update::filter_callback_query().endpoint(on_callback));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![executor, opts])
+        .dependencies(dptree::deps![executor, opts, histories])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -211,6 +227,7 @@ async fn on_message(
     msg: Message,
     executor: Arc<CommandExecutor>,
     options: Arc<BotOptions>,
+    histories: ChatHistories,
 ) -> ResponseResult<()> {
     let Some(text) = msg.text() else {
         return Ok(());
@@ -229,8 +246,14 @@ async fn on_message(
     let command = match TelegramCommand::parse(text, "trusty_mpm_bot") {
         Ok(cmd) => cmd,
         Err(_) => {
-            bot.send_message(msg.chat.id, "Unknown command — try /help")
-                .await?;
+            // Not a slash command — route the free text to LLM chat (unless the
+            // message is empty, in which case there is nothing to ask).
+            if !text.trim().is_empty() {
+                let reply = llm_chat_reply(&executor, &histories, msg.chat.id.0, text).await;
+                bot.send_message(msg.chat.id, reply)
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+            }
             return Ok(());
         }
     };
@@ -274,6 +297,38 @@ async fn dispatch_command(
         // Everything else — including `/pair` and `/start` with no code —
         // converts to the shared command model and runs through the executor.
         _ => executor.execute(TrustyCommand::from(command)).await,
+    }
+}
+
+/// Route a free-text message to the daemon's LLM chat and render the reply.
+///
+/// Why: messages that are not slash commands are treated as conversation; the
+/// bot holds the per-chat history and threads it through `POST /llm/chat`.
+/// What: loads this chat's history, calls [`DaemonClient::llm_chat`], stores the
+/// updated history on success, and returns the assistant reply (HTML-escaped).
+/// When the daemon reports LLM chat is not configured (`503`) it returns the
+/// [`LLM_NOT_CONFIGURED`] hint; a transport failure returns an error line.
+/// Test: `llm_chat_reply_reports_unconfigured` covers the not-configured path.
+async fn llm_chat_reply(
+    executor: &CommandExecutor,
+    histories: &ChatHistories,
+    chat_id: i64,
+    text: &str,
+) -> String {
+    let history = {
+        let guard = histories.lock().expect("chat history mutex poisoned");
+        guard.get(&chat_id).cloned().unwrap_or_default()
+    };
+    match executor.client().llm_chat(text, &history).await {
+        Ok(Some(outcome)) => {
+            histories
+                .lock()
+                .expect("chat history mutex poisoned")
+                .insert(chat_id, outcome.history);
+            formatter::html_escape(&outcome.reply)
+        }
+        Ok(None) => LLM_NOT_CONFIGURED.to_string(),
+        Err(e) => format!("❌ chat: daemon error: {e}"),
     }
 }
 
@@ -519,6 +574,19 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(axum::serve(listener, router).into_future());
         (state, format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn llm_chat_reply_reports_unconfigured() {
+        // A default test daemon has no OpenRouter key, so a free-text message
+        // gets the not-configured hint rather than a model reply.
+        let (_state, url) = spawn_test_daemon().await;
+        let executor = CommandExecutor::new(url);
+        let histories: ChatHistories = Arc::new(Mutex::new(HashMap::new()));
+        let reply = llm_chat_reply(&executor, &histories, 42, "hello there").await;
+        assert_eq!(reply, LLM_NOT_CONFIGURED);
+        // No history is stored when chat is unconfigured.
+        assert!(histories.lock().unwrap().get(&42).is_none());
     }
 
     #[tokio::test]

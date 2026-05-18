@@ -74,6 +74,17 @@ pub enum TrustyCommand {
         /// The pairing code to confirm, or `None` to query status.
         code: Option<String>,
     },
+    /// Send a prompt to a Claude Code session's tmux pane.
+    ///
+    /// Why: `/send <session> <prompt>` drives a running session remotely —
+    /// type a prompt, let it run, read back the captured pane output.
+    /// What: the session id/name/prefix to resolve and the prompt to send.
+    Send {
+        /// Session id, friendly name, or name prefix to resolve.
+        session: String,
+        /// The prompt line to type into the session's tmux pane.
+        prompt: String,
+    },
     /// First-contact command: report pairing status and onboarding guidance.
     Start,
     /// Show the command list.
@@ -98,6 +109,7 @@ pub fn help_text() -> &'static str {
      /config <path> — analyze Claude Code config for a project\n\
      /snapshot <session> — capture a tmux pane\n\
      /kill <id> — kill a session\n\
+     /send <session> <prompt> — send a prompt to a Claude Code session\n\
      /alerts — show alert subscriptions\n\
      /pair <code> — pair this bot with your daemon\n\
      /start — pairing status and onboarding\n\
@@ -123,6 +135,7 @@ mod tests {
             "/config",
             "/snapshot",
             "/kill",
+            "/send",
             "/alerts",
             "/pair",
             "/start",

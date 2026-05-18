@@ -72,6 +72,10 @@ pub enum DaemonError {
     /// An unexpected internal failure (IO, serialization, ...).
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A requested capability is not configured on this daemon.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 impl DaemonError {
@@ -88,6 +92,7 @@ impl DaemonError {
             Self::OverseerBlocked { .. } => StatusCode::FORBIDDEN,
             Self::InvalidRequest(_) | Self::InvalidPairCode => StatusCode::BAD_REQUEST,
             Self::TmuxUnavailable(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -155,6 +160,10 @@ mod tests {
         assert_eq!(
             DaemonError::Internal("x".into()).status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            DaemonError::ServiceUnavailable("x".into()).status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

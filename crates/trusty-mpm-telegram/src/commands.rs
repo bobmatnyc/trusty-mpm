@@ -57,6 +57,13 @@ pub enum TelegramCommand {
     /// Kill a session — `/kill <id>`.
     #[command(description = "Kill a session")]
     Kill(String),
+    /// Send a prompt to a Claude Code session — `/send <session> <prompt>`.
+    ///
+    /// The whole argument tail is captured as one string; the first whitespace-
+    /// separated token is the session, the remainder is the prompt (so a
+    /// multi-word prompt is preserved).
+    #[command(description = "Send a prompt to a Claude Code session")]
+    Send(String),
     /// Show alert subscriptions.
     #[command(description = "Show alert subscriptions")]
     Alerts,
@@ -92,6 +99,10 @@ impl From<TelegramCommand> for TrustyCommand {
             TelegramCommand::Config(project) => TrustyCommand::Config { project },
             TelegramCommand::Snapshot(session) => TrustyCommand::Snapshot { session },
             TelegramCommand::Kill(session_id) => TrustyCommand::Kill { session_id },
+            TelegramCommand::Send(args) => {
+                let (session, prompt) = split_send_args(&args);
+                TrustyCommand::Send { session, prompt }
+            }
             TelegramCommand::Alerts => TrustyCommand::Alerts,
             TelegramCommand::Pair(code) => TrustyCommand::Pair {
                 code: non_empty(code),
@@ -99,6 +110,23 @@ impl From<TelegramCommand> for TrustyCommand {
             TelegramCommand::Start(_) => TrustyCommand::Start,
             TelegramCommand::Help => TrustyCommand::Help,
         }
+    }
+}
+
+/// Split a `/send` argument tail into `(session, prompt)`.
+///
+/// Why: `/send <session> <prompt>` carries the session as the first token and
+/// the (possibly multi-word) prompt as the remainder; teloxide hands the whole
+/// tail as one string, so the split happens here.
+/// What: returns the first whitespace-separated token as `session` and the
+/// trimmed remainder as `prompt`; both are empty strings when absent (the
+/// executor then reports the missing argument).
+/// Test: `split_send_args_separates_session_and_prompt`.
+fn split_send_args(args: &str) -> (String, String) {
+    let trimmed = args.trim();
+    match trimmed.split_once(char::is_whitespace) {
+        Some((session, prompt)) => (session.to_string(), prompt.trim().to_string()),
+        None => (trimmed.to_string(), String::new()),
     }
 }
 
@@ -159,14 +187,39 @@ mod tests {
 
     #[test]
     fn bot_commands_lists_every_command() {
-        // teloxide's generated descriptor must enumerate all fifteen commands.
+        // teloxide's generated descriptor must enumerate all sixteen commands.
         let descriptions = TelegramCommand::bot_commands();
-        assert_eq!(descriptions.len(), 15);
+        assert_eq!(descriptions.len(), 16);
         assert!(descriptions.iter().any(|c| c.command == "/sessions"));
         assert!(descriptions.iter().any(|c| c.command == "/pair"));
         assert!(descriptions.iter().any(|c| c.command == "/start"));
         assert!(descriptions.iter().any(|c| c.command == "/projects"));
         assert!(descriptions.iter().any(|c| c.command == "/adopt"));
+        assert!(descriptions.iter().any(|c| c.command == "/send"));
+    }
+
+    #[test]
+    fn split_send_args_separates_session_and_prompt() {
+        // The first token is the session; the remainder (multi-word) is the prompt.
+        let (session, prompt) = split_send_args("frontend run the tests please");
+        assert_eq!(session, "frontend");
+        assert_eq!(prompt, "run the tests please");
+        // A session with no prompt yields an empty prompt.
+        let (session, prompt) = split_send_args("frontend");
+        assert_eq!(session, "frontend");
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn send_command_converts_to_trusty_command() {
+        // `/send` threads the session and prompt through to the shared command.
+        assert_eq!(
+            TrustyCommand::from(TelegramCommand::Send("frontend build now".into())),
+            TrustyCommand::Send {
+                session: "frontend".into(),
+                prompt: "build now".into(),
+            }
+        );
     }
 
     #[test]

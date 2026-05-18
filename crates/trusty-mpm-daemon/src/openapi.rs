@@ -47,6 +47,7 @@ use utoipa::OpenApi;
         crate::api::breakers,
         crate::api::get_optimizer,
         crate::api::get_overseer,
+        crate::api::llm_chat,
         crate::api::list_tmux_sessions,
         crate::api::tmux_snapshot,
         crate::api::adopt_tmux_session,
@@ -85,6 +86,7 @@ use utoipa::OpenApi;
         crate::api::RestoreRequest,
         crate::api::DeployProfileRequest,
         crate::api::PairConfirmRequest,
+        crate::api::LlmChatRequest,
     )),
     tags(
         (name = "sessions", description = "Session lifecycle management"),

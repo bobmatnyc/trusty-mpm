@@ -137,6 +137,14 @@ impl TelegramFormatter {
             CommandResult::Killed { session_id } => {
                 format!("🗑️ Session {} killed", short_id(session_id))
             }
+            CommandResult::CommandSent { session, output } => {
+                if output.trim().is_empty() {
+                    format!("📨 Sent to <code>{session}</code> — no output captured")
+                } else {
+                    format!("<b>📨 {session}</b>\n<pre>{}</pre>", html_escape(output))
+                }
+            }
+            CommandResult::ChatReply { reply } => html_escape(reply),
             CommandResult::Approved { session_id } => {
                 format!("✅ Permission approved for session {session_id}")
             }
@@ -312,7 +320,7 @@ fn short_id(id: &str) -> String {
 /// would break the message or be silently dropped by Telegram.
 /// What: replaces `&`, `<`, `>` with their HTML entities.
 /// Test: covered indirectly by the snapshot formatting test.
-fn html_escape(s: &str) -> String {
+pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

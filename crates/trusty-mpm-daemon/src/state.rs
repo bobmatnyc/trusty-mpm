@@ -88,6 +88,14 @@ pub struct DaemonState {
     /// Name of the active overseer strategy, for the `GET /overseer` endpoint
     /// and the audit log (`"deterministic"` or `"composite-llm"`).
     overseer_handler: String,
+    /// Standalone LLM overseer for the interactive `POST /llm/chat` endpoint.
+    ///
+    /// Why: the overseer composed into `overseer` is hidden behind
+    /// `dyn Overseer`, which has no `chat` method; the chat endpoint needs the
+    /// concrete [`LlmOverseer`]. It is `Some` only when an OpenRouter API key
+    /// resolved — i.e. exactly when LLM chat is available.
+    /// Test: `llm_overseer_is_none_without_key`.
+    llm: Option<Arc<crate::llm_overseer::LlmOverseer>>,
     /// Append-only JSONL logger for every overseer decision.
     audit: Arc<AuditLogger>,
     /// The Telegram chat id paired with this daemon, when one has confirmed a
@@ -147,9 +155,27 @@ fn load_optimizer_config() -> OptimizerConfig {
 /// builds the overseer via [`build_overseer`]; a missing/malformed file yields
 /// the disabled default config (handled inside `OverseerConfig::load_from`).
 /// Test: `new_overseer_is_disabled_when_file_missing`.
-fn load_overseer() -> (Arc<dyn Overseer>, String) {
+fn load_overseer() -> OverseerBuild {
     let path = FrameworkPaths::default().overseer_config();
     build_overseer(OverseerConfig::load_from(&path))
+}
+
+/// The overseer strategy plus the optional standalone LLM chat handler.
+///
+/// Why: [`build_overseer`] resolves both the `dyn Overseer` used for hook
+/// oversight and — when an OpenRouter key is present — a concrete
+/// [`LlmOverseer`] reused for the `POST /llm/chat` endpoint; returning them as
+/// one named struct keeps both daemon constructors aligned.
+/// What: the composed overseer, its handler name, and `Some(LlmOverseer)` when
+/// LLM chat is available.
+/// Test: `overseer_is_deterministic_without_llm`.
+struct OverseerBuild {
+    /// The composed overseer used on the hook path.
+    overseer: Arc<dyn Overseer>,
+    /// The active strategy name (`"deterministic"` or `"composite-llm"`).
+    handler: String,
+    /// Standalone LLM overseer for interactive chat, when a key resolved.
+    llm: Option<Arc<crate::llm_overseer::LlmOverseer>>,
 }
 
 /// Assemble the overseer strategy from a loaded [`OverseerConfig`].
@@ -160,34 +186,47 @@ fn load_overseer() -> (Arc<dyn Overseer>, String) {
 /// What: always builds a [`DeterministicOverseer`]; when the LLM section is
 /// enabled and the configured API key resolves, wraps both in a
 /// [`CompositeOverseer`] (deterministic first, LLM for uncertain cases).
-/// Returns the overseer and its handler name (`"deterministic"` or
-/// `"composite-llm"`).
+/// Returns the overseer, its handler name, and the standalone LLM chat handler.
 /// Test: `overseer_is_deterministic_without_llm`,
 /// `overseer_falls_back_when_llm_key_missing`.
-fn build_overseer(config: OverseerConfig) -> (Arc<dyn Overseer>, String) {
+fn build_overseer(config: OverseerConfig) -> OverseerBuild {
     let deterministic = DeterministicOverseer::new(config.clone());
     if config.llm.enabled {
-        let llm = crate::llm_overseer::LlmOverseer::new(
+        let llm = Arc::new(crate::llm_overseer::LlmOverseer::new(
             config.llm.model.clone(),
             &config.llm.api_key_env,
-        );
+        ));
         if llm.is_enabled() {
             tracing::info!(
                 "LLM overseer active (model {}); composing with deterministic rules",
                 config.llm.model
             );
+            // The composite needs an owned overseer; build a second
+            // `LlmOverseer` for it so the `Arc` above stays free for chat.
+            let composite_llm = crate::llm_overseer::LlmOverseer::new(
+                config.llm.model.clone(),
+                &config.llm.api_key_env,
+            );
             let composite = crate::overseer_compose::CompositeOverseer::new(
                 Box::new(deterministic),
-                Box::new(llm),
+                Box::new(composite_llm),
             );
-            return (Arc::new(composite), "composite-llm".to_string());
+            return OverseerBuild {
+                overseer: Arc::new(composite),
+                handler: "composite-llm".to_string(),
+                llm: Some(llm),
+            };
         }
         tracing::warn!(
             "[llm] enabled but no API key in ${}; falling back to deterministic overseer",
             config.llm.api_key_env
         );
     }
-    (Arc::new(deterministic), "deterministic".to_string())
+    OverseerBuild {
+        overseer: Arc::new(deterministic),
+        handler: "deterministic".to_string(),
+        llm: None,
+    }
 }
 
 /// Resolve the daemon's logs directory (`~/.trusty-mpm/logs`).
@@ -216,7 +255,7 @@ impl DaemonState {
     /// `new_overseer_is_disabled_when_file_missing`.
     pub fn new() -> Self {
         let optimizer = load_optimizer_config();
-        let (overseer, overseer_handler) = load_overseer();
+        let build = load_overseer();
         Self {
             sessions: DashMap::new(),
             delegations: DashMap::new(),
@@ -228,8 +267,9 @@ impl DaemonState {
             trusty_addrs: Mutex::new(None),
             optimizer: Arc::new(parking_lot::RwLock::new(optimizer)),
             projects: Arc::new(RwLock::new(HashMap::new())),
-            overseer,
-            overseer_handler,
+            overseer: build.overseer,
+            overseer_handler: build.handler,
+            llm: build.llm,
             audit: Arc::new(AuditLogger::new(&logs_dir())),
             paired_chat_id: Mutex::new(None),
             pair_code: Mutex::new(None),
@@ -262,7 +302,7 @@ impl DaemonState {
             }
         };
         let overseer_cfg = OverseerConfig::load_from(&paths.overseer_config());
-        let (overseer, overseer_handler) = build_overseer(overseer_cfg);
+        let build = build_overseer(overseer_cfg);
         Self {
             sessions: DashMap::new(),
             delegations: DashMap::new(),
@@ -274,8 +314,9 @@ impl DaemonState {
             trusty_addrs: Mutex::new(None),
             optimizer: Arc::new(parking_lot::RwLock::new(optimizer)),
             projects: Arc::new(RwLock::new(HashMap::new())),
-            overseer,
-            overseer_handler,
+            overseer: build.overseer,
+            overseer_handler: build.handler,
+            llm: build.llm,
             audit: Arc::new(AuditLogger::new(&paths.root.join("logs"))),
             paired_chat_id: Mutex::new(None),
             pair_code: Mutex::new(None),
@@ -656,6 +697,18 @@ impl DaemonState {
         Arc::clone(&self.audit)
     }
 
+    /// The standalone LLM overseer for interactive chat, if configured.
+    ///
+    /// Why: `POST /llm/chat` needs the concrete [`LlmOverseer`] (the hook-path
+    /// overseer is hidden behind `dyn Overseer`); this is `Some` exactly when an
+    /// OpenRouter API key resolved at startup.
+    /// What: returns a clone of the `Arc<LlmOverseer>`, or `None` when LLM chat
+    /// is not configured.
+    /// Test: `llm_overseer_is_none_without_key`.
+    pub fn llm_overseer(&self) -> Option<Arc<crate::llm_overseer::LlmOverseer>> {
+        self.llm.clone()
+    }
+
     // ---- hook events ----------------------------------------------------
 
     /// Append a hook event to the bounded history ring buffer.
@@ -934,9 +987,10 @@ mod tests {
         // With the `[llm]` section absent/disabled, the overseer is the plain
         // deterministic strategy and (with no rules) reports disabled.
         let cfg = OverseerConfig::default();
-        let (overseer, handler) = build_overseer(cfg);
-        assert!(!overseer.is_enabled());
-        assert_eq!(handler, "deterministic");
+        let build = build_overseer(cfg);
+        assert!(!build.overseer.is_enabled());
+        assert_eq!(build.handler, "deterministic");
+        assert!(build.llm.is_none());
     }
 
     #[test]
@@ -946,10 +1000,18 @@ mod tests {
         let mut cfg = OverseerConfig::default();
         cfg.llm.enabled = true;
         cfg.llm.api_key_env = "TRUSTY_MPM_DEFINITELY_NOT_SET".to_string(); // pragma: allowlist secret
-        let (overseer, handler) = build_overseer(cfg);
+        let build = build_overseer(cfg);
         // Deterministic with no rules and disabled top-level flag → disabled.
-        assert!(!overseer.is_enabled());
-        assert_eq!(handler, "deterministic");
+        assert!(!build.overseer.is_enabled());
+        assert_eq!(build.handler, "deterministic");
+        assert!(build.llm.is_none());
+    }
+
+    #[test]
+    fn llm_overseer_is_none_without_key() {
+        // A default daemon (no OpenRouter key) exposes no LLM chat handler.
+        let state = DaemonState::new();
+        assert!(state.llm_overseer().is_none());
     }
 
     #[test]
