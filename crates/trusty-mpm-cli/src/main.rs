@@ -341,15 +341,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let client = reqwest::Client::new();
+    // Resolve the daemon URL once: explicit --url/TRUSTY_MPM_URL wins, then
+    // lock file (daemon may bind to an ephemeral port), then default.
+    let url = trusty_mpm_core::resolve_daemon_url(Some(&cli.url));
     match cli.command {
-        Command::Status => status(&client, &cli.url).await,
-        Command::Start => start(&client, &cli.url).await,
-        Command::Restart => restart(&client, &cli.url).await,
-        Command::Project { action } => project(&client, &cli.url, action).await,
-        Command::Session { action } => session(&client, &cli.url, action).await,
-        Command::Events => events(&client, &cli.url).await,
-        Command::Tui { url, interval_ms } => {
-            let resolved = trusty_mpm_core::resolve_daemon_url(Some(&url));
+        Command::Status => status(&client, &url).await,
+        Command::Start => start(&client, &url).await,
+        Command::Restart => restart(&client, &url).await,
+        Command::Project { action } => project(&client, &url, action).await,
+        Command::Session { action } => session(&client, &url, action).await,
+        Command::Events => events(&client, &url).await,
+        Command::Tui { url: tui_url, interval_ms } => {
+            let resolved = trusty_mpm_core::resolve_daemon_url(Some(&tui_url));
             trusty_mpm_tui::run(resolved, interval_ms).await
         }
         Command::Gui => {
@@ -365,16 +368,16 @@ async fn main() -> anyhow::Result<()> {
                 )
             }
         }
-        Command::Telegram { cmd } => telegram(&cli.url, cmd).await,
+        Command::Telegram { cmd } => telegram(&url, cmd).await,
         Command::Install { force } => install(force),
         Command::Daemon {
             addr,
             tailscale,
             mcp,
         } => run_daemon(addr, tailscale, mcp).await,
-        Command::Connect { target, json } => connect_cmd(&client, &cli.url, &target, json).await,
-        Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
-        Command::Overseer { action } => overseer(&client, &cli.url, action).await,
+        Command::Connect { target, json } => connect_cmd(&client, &url, &target, json).await,
+        Command::Optimizer { action } => optimizer(&client, &url, action).await,
+        Command::Overseer { action } => overseer(&client, &url, action).await,
     }
 }
 

@@ -21,24 +21,33 @@ pub fn lock_file_path() -> PathBuf {
 }
 
 /// Resolve the daemon URL in priority order:
-/// 1. `explicit` — from `--url` flag or `TRUSTY_MPM_URL` env var (if Some and non-empty)
+/// 1. `explicit` — from `--url` flag or `TRUSTY_MPM_URL` env var (if Some,
+///    non-empty, AND not just the default). A caller passing the clap default
+///    value is treated the same as passing None so the lock file can win.
 /// 2. Lock file `~/.config/trusty-mpm/daemon.lock` (if present and PID alive)
 /// 3. `DEFAULT_DAEMON_URL`
 pub fn resolve_daemon_url(explicit: Option<&str>) -> String {
-    // 1. Explicit override wins.
+    // 1. Explicit override wins — but only if it's a real override, not the
+    //    clap-injected default. When the caller passes DEFAULT_DAEMON_URL we
+    //    fall through to the lock file so `tm tui` and `tm status` find a
+    //    daemon running on an ephemeral port.
     if let Some(url) = explicit
         && !url.is_empty()
+        && url != DEFAULT_DAEMON_URL
     {
         return url.to_string();
     }
 
-    // 2. Lock file.
+    // 2. Lock file — records the actual bound address written by the daemon.
     if let Some(url) = read_lock_file_url() {
         return url;
     }
 
-    // 3. Default.
-    DEFAULT_DAEMON_URL.to_string()
+    // 3. Fall back to the default (or the explicit default the caller passed).
+    explicit
+        .filter(|u| !u.is_empty())
+        .unwrap_or(DEFAULT_DAEMON_URL)
+        .to_string()
 }
 
 /// Read the daemon URL from the lock file if present and the PID is alive.
