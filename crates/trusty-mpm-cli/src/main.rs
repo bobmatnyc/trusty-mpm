@@ -1037,9 +1037,29 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
 /// Test: `cli_parses_launch`, `cli_parses_launch_with_dir`.
 async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> anyhow::Result<()> {
     // 1. Resolve the target directory (absolute, so the banner is unambiguous).
+    //    `resolve_dir` already defaults to the process cwd when `dir` is None.
     let path = resolve_dir(dir)?;
     let path = path.canonicalize().unwrap_or(path);
     let workdir = path.to_string_lossy().to_string();
+
+    // 1b. If a session already exists for this directory and its tmux session
+    //     is still alive, reconnect to it instead of launching a new one. A
+    //     daemon that is unreachable, or a stale record with no live tmux
+    //     session, simply falls through to the normal launch sequence below.
+    if let Some(existing) = find_existing_session(client, url, &workdir).await
+        && !existing.is_empty()
+        && tmux_has_session(&existing)
+    {
+        print_launch_banner_reconnecting(&workdir, &existing);
+        println!("Reconnecting to existing session...");
+        let status = std::process::Command::new("tmux")
+            .args(["attach-session", "-t", &existing])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("tmux attach-session exited with failure");
+        }
+        return Ok(());
+    }
 
     // 2. Prepare the framework: deploy composed agents and merge CLAUDE.md so a
     //    plain `claude` process behaves as a trusty-mpm PM session. A prep
@@ -1209,6 +1229,106 @@ fn print_launch_banner(workdir: &str, tmux_name: &str, prompt_path: Option<&std:
     row(format!("  Memory:   {memory}"));
     row(format!("  Search:   {search}"));
     row(format!("  Prompt:   {prompt}"));
+    println!("└{}┘", "─".repeat(WIDTH));
+}
+
+/// Find a live session whose `workdir` matches `workdir` via `GET /sessions`.
+///
+/// Why: `tm launch` should reconnect to an existing session for a directory
+/// rather than spawning a duplicate; the daemon owns the session registry, so
+/// the match must be resolved against the live `GET /sessions` list.
+/// What: fetches `GET /sessions`, normalizes each `workdir` (strip trailing
+/// slash, canonicalize) and compares against the normalized target; returns the
+/// first matching session's `tmux_name`, or `None` when the daemon is
+/// unreachable or no session matches.
+/// Test: `normalize_workdir_strips_trailing_slash`.
+async fn find_existing_session(
+    client: &reqwest::Client,
+    url: &str,
+    workdir: &str,
+) -> Option<String> {
+    /// One session row including its tmux name, as returned by `GET /sessions`.
+    #[derive(Deserialize)]
+    struct Row {
+        #[serde(default)]
+        workdir: String,
+        #[serde(default)]
+        tmux_name: String,
+    }
+
+    let target = normalize_workdir(workdir);
+    let resp = client.get(format!("{url}/sessions")).send().await.ok()?;
+    let rows: Vec<Row> = resp.error_for_status().ok()?.json().await.ok()?;
+    rows.into_iter()
+        .find(|r| !r.tmux_name.is_empty() && normalize_workdir(&r.workdir) == target)
+        .map(|r| r.tmux_name)
+}
+
+/// Normalize a working-directory path for equality comparison.
+///
+/// Why: two paths can name the same directory yet differ textually (trailing
+/// slash, relative vs absolute, symlinks); `tm launch` reconnect detection must
+/// treat them as equal.
+/// What: canonicalizes the path when it exists, otherwise strips a trailing
+/// slash from the lossy string form.
+/// Test: `normalize_workdir_strips_trailing_slash`.
+fn normalize_workdir(workdir: &str) -> String {
+    let path = std::path::Path::new(workdir);
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical.to_string_lossy().to_string();
+    }
+    workdir.trim_end_matches('/').to_string()
+}
+
+/// Check whether a tmux session named `name` currently exists.
+///
+/// Why: the daemon may hold a stale session record after its tmux session has
+/// exited; `tm launch` must verify the tmux session is live before attaching,
+/// otherwise it would fall through to a normal launch.
+/// What: runs `tmux has-session -t <name>` and returns true on exit code 0.
+/// Test: covered indirectly by the launch reconnect integration path.
+fn tmux_has_session(name: &str) -> bool {
+    matches!(
+        std::process::Command::new("tmux")
+            .args(["has-session", "-t", name])
+            .status(),
+        Ok(status) if status.success()
+    )
+}
+
+/// Print the `tm launch` banner with a "reconnecting" status line.
+///
+/// Why: when `tm launch` attaches to a pre-existing session the operator should
+/// see that no new session was created.
+/// What: prints the same fixed-width box as `print_launch_banner` but with a
+/// `Status:` row noting the reconnect instead of the memory/search/prompt rows.
+/// Test: `launch_reconnect_banner_does_not_panic`.
+fn print_launch_banner_reconnecting(workdir: &str, tmux_name: &str) {
+    /// Interior width of the banner box, in characters.
+    const WIDTH: usize = 53;
+
+    let row = |content: String| {
+        let mut text = content;
+        if text.chars().count() > WIDTH {
+            text = text.chars().take(WIDTH).collect();
+        }
+        let pad = WIDTH - text.chars().count();
+        println!("│{text}{}│", " ".repeat(pad));
+    };
+
+    let version = env!("CARGO_PKG_VERSION");
+    let header = "  trusty-mpm";
+    let version_field = format!("v{version}");
+    let header_pad = WIDTH
+        .saturating_sub(header.chars().count())
+        .saturating_sub(version_field.chars().count())
+        .saturating_sub(2);
+
+    println!("┌{}┐", "─".repeat(WIDTH));
+    println!("│{header}{}{version_field}  │", " ".repeat(header_pad));
+    row(format!("  Project:  {workdir}"));
+    row(format!("  Session:  {tmux_name}"));
+    row("  Status:   reconnecting to existing session".to_string());
     println!("└{}┘", "─".repeat(WIDTH));
 }
 
@@ -2094,6 +2214,25 @@ mod tests {
             "tmpm-quiet-falcon",
             Some(std::path::Path::new("/tmp/system-prompt.txt")),
         );
+    }
+
+    #[test]
+    fn launch_reconnect_banner_does_not_panic() {
+        // Why: the reconnect banner does the same width math as the launch
+        // banner; exercise it to catch arithmetic underflow regressions.
+        print_launch_banner_reconnecting("/Users/test/project", "tmpm-quiet-falcon");
+    }
+
+    #[test]
+    fn normalize_workdir_strips_trailing_slash() {
+        // Why: a daemon-stored workdir and the resolved cwd may differ only by a
+        // trailing slash; reconnect detection must treat them as equal. Use a
+        // path that does not exist so canonicalize falls through to the
+        // string-normalization branch deterministically.
+        let with = normalize_workdir("/no/such/dir/");
+        let without = normalize_workdir("/no/such/dir");
+        assert_eq!(with, without);
+        assert_eq!(without, "/no/such/dir");
     }
 
     #[test]
