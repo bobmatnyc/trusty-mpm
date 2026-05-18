@@ -738,11 +738,11 @@ fn render_command_zone(frame: &mut Frame, bar: &CommandBar, output_area: Rect, i
 /// Draw the dashboard frame.
 ///
 /// Why: the single entry point the event loop calls each tick.
-/// What: a panel layout — a two-line header (title + status bar); a middle row
-/// split 60/40 between the sessions table and the circuit-breaker table; an
-/// events/log row; then the persistent command zone (output panel + input
-/// line) pinned to the bottom. When `show_help` is set, a centred help overlay
-/// floats over the layout.
+/// What: a vertical layout spanning the whole terminal — a two-line header
+/// (title + status bar); a flexing top area holding the session/breaker/event
+/// panels; a full-width 3-line command-output strip; and a full-width 3-line
+/// CMD> input strip at the very bottom. When `show_help` is set, a centred help
+/// overlay floats over the layout.
 /// Test: rendering is exercised by the integration smoke test; row/line content
 /// is unit-tested via `session_rows`, `breaker_rows`, and `event_lines`.
 pub fn render(frame: &mut Frame, state: &DashboardState) {
@@ -765,16 +765,28 @@ pub fn render_with_table_state(
     state: &DashboardState,
     table_state: &mut TableState,
 ) {
+    // Whole-terminal vertical split: header, a flexing top area for the
+    // panels, then the full-width command-output strip and CMD> input strip
+    // pinned to the very bottom.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // header (title + status bar)
-            Constraint::Min(6),     // sessions + breakers
-            Constraint::Length(10), // events + log tail
-            Constraint::Length(4),  // command output panel
-            Constraint::Length(3),  // command input line
+            Constraint::Length(2), // header (title + status bar)
+            Constraint::Min(6),    // top panels (sessions/breakers + events/log)
+            Constraint::Length(3), // full-width command output strip
+            Constraint::Length(3), // full-width CMD> input strip
         ])
         .split(frame.area());
+
+    // The top area is itself split vertically into the panel rows; this keeps
+    // the panels inside the flexing chunk and never inside the command strips.
+    let top = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),     // sessions + breakers
+            Constraint::Length(10), // events + log tail
+        ])
+        .split(chunks[1]);
 
     let title = if state.daemon_reachable {
         format!("trusty-mpm dashboard — {} session(s)", state.sessions.len())
@@ -791,7 +803,7 @@ pub fn render_with_table_state(
     let middle = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(chunks[1]);
+        .split(top[0]);
 
     let sessions = Table::new(
         session_rows(state, state.selected_session),
@@ -823,11 +835,11 @@ pub fn render_with_table_state(
     );
     frame.render_widget(breakers, middle[1]);
 
-    // Bottom row: recent hook-event feed (50%) beside the daemon log tail (50%).
+    // Events row: recent hook-event feed (50%) beside the daemon log tail (50%).
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[2]);
+        .split(top[1]);
 
     let items: Vec<ListItem> = event_lines(state).into_iter().map(ListItem::new).collect();
     let events = List::new(items).block(
@@ -846,8 +858,9 @@ pub fn render_with_table_state(
         List::new(log_items).block(Block::default().borders(Borders::ALL).title("Daemon Log"));
     frame.render_widget(log_panel, bottom[1]);
 
-    // The persistent command zone is always visible at the bottom.
-    render_command_zone(frame, &state.command_bar, chunks[3], chunks[4]);
+    // The persistent command zone spans the full terminal width at the bottom:
+    // a 3-line output strip above a 3-line CMD> input strip.
+    render_command_zone(frame, &state.command_bar, chunks[2], chunks[3]);
 
     if state.show_help {
         render_help_overlay(frame);

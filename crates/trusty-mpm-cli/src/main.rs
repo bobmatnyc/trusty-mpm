@@ -66,24 +66,11 @@ enum Command {
     /// Launch the Tauri desktop GUI (or open the web build in the browser
     /// when Tauri is unavailable).
     Gui,
-    /// Run the Telegram remote-management bot.
+    /// Manage the Telegram remote-management bot (pair, status, start, stop).
     Telegram {
-        /// Base URL of the trusty-mpm daemon.
-        #[arg(long, env = "TRUSTY_MPM_URL", default_value = DEFAULT_URL)]
-        url: String,
-        /// Telegram bot token. When omitted, resolved from `.env.local` /
-        /// `.env` / the `TELEGRAM_BOT_TOKEN` environment variable.
-        #[arg(long)]
-        token: Option<String>,
-        /// Chat id to push unsolicited alerts to.
-        #[arg(long)]
-        alert_chat_id: Option<i64>,
-        /// Restrict the bot to this Telegram user id.
-        #[arg(long)]
-        allowed_user_id: Option<i64>,
-        /// Validate configuration and exit without connecting to Telegram.
-        #[arg(long)]
-        check: bool,
+        /// Telegram action to perform.
+        #[command(subcommand)]
+        cmd: TelegramCmd,
     },
     /// Install the bundled framework artifacts to `~/.trusty-mpm/framework/`.
     Install {
@@ -125,8 +112,45 @@ enum Command {
         #[command(subcommand)]
         action: OverseerAction,
     },
-    /// Request a one-time code to pair the Telegram bot with this daemon.
+}
+
+/// Actions for the `telegram` subcommand.
+///
+/// Why: every Telegram-related operation — pairing, status, and lifecycle —
+/// now lives under one `tm telegram <subcommand>` group instead of scattered
+/// top-level commands, so the bot's controls are discoverable in one place.
+/// What: `Pair` requests a one-time pairing code; `Status` reports the daemon's
+/// paired/unpaired state; `Start` runs the bot process in the foreground;
+/// `Stop` kills a running bot process.
+/// Test: `cli_parses_telegram_pair`, `cli_parses_telegram_status`,
+/// `cli_parses_telegram_start`, `cli_parses_telegram_stop`.
+#[derive(Debug, Subcommand)]
+enum TelegramCmd {
+    /// Request a one-time pairing code for the Telegram bot.
     Pair,
+    /// Show Telegram bot pairing status.
+    Status,
+    /// Start the Telegram bot process.
+    Start {
+        /// Base URL of the trusty-mpm daemon.
+        #[arg(long, env = "TRUSTY_MPM_URL", default_value = DEFAULT_URL)]
+        url: String,
+        /// Telegram bot token. When omitted, resolved from `.env.local` /
+        /// `.env` / the `TELEGRAM_BOT_TOKEN` environment variable.
+        #[arg(long)]
+        token: Option<String>,
+        /// Chat id to push unsolicited alerts to.
+        #[arg(long)]
+        alert_chat_id: Option<i64>,
+        /// Restrict the bot to this Telegram user id.
+        #[arg(long)]
+        allowed_user_id: Option<i64>,
+        /// Validate configuration and exit without connecting to Telegram.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Stop the Telegram bot process if running.
+    Stop,
 }
 
 /// Actions for the `project` subcommand.
@@ -329,8 +353,33 @@ async fn main() -> anyhow::Result<()> {
             trusty_mpm_gui::run();
             Ok(())
         }
-        Command::Telegram {
-            url,
+        Command::Telegram { cmd } => telegram(&cli.url, cmd).await,
+        Command::Install { force } => install(force),
+        Command::Daemon {
+            addr,
+            tailscale,
+            mcp,
+        } => run_daemon(addr, tailscale, mcp).await,
+        Command::Connect { target, json } => connect_cmd(&client, &cli.url, &target, json).await,
+        Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
+        Command::Overseer { action } => overseer(&client, &cli.url, action).await,
+    }
+}
+
+/// `telegram` subcommand — manage the Telegram bot (pair, status, start, stop).
+///
+/// Why: every Telegram operation belongs under one discoverable command group;
+/// this dispatcher routes the [`TelegramCmd`] variants to their handlers.
+/// What: `Pair` requests a pairing code, `Status` queries the daemon's pairing
+/// state, `Start` runs the bot process in the foreground, `Stop` kills it.
+/// Test: variant routing is covered by the `cli_parses_telegram_*` tests; the
+/// handlers themselves are exercised against a live daemon.
+async fn telegram(url: &str, cmd: TelegramCmd) -> anyhow::Result<()> {
+    match cmd {
+        TelegramCmd::Pair => telegram_pair(url).await,
+        TelegramCmd::Status => telegram_status(url).await,
+        TelegramCmd::Start {
+            url: start_url,
             token,
             alert_chat_id,
             allowed_user_id,
@@ -341,30 +390,21 @@ async fn main() -> anyhow::Result<()> {
                 allowed_user_id,
                 alert_chat_id,
             };
-            trusty_mpm_telegram::run(url, token, check, options).await
+            trusty_mpm_telegram::run(start_url, token, check, options).await
         }
-        Command::Install { force } => install(force),
-        Command::Daemon {
-            addr,
-            tailscale,
-            mcp,
-        } => run_daemon(addr, tailscale, mcp).await,
-        Command::Connect { target, json } => connect_cmd(&client, &cli.url, &target, json).await,
-        Command::Optimizer { action } => optimizer(&client, &cli.url, action).await,
-        Command::Overseer { action } => overseer(&client, &cli.url, action).await,
-        Command::Pair => pair(&cli.url).await,
+        TelegramCmd::Stop => telegram_stop(),
     }
 }
 
-/// `pair` subcommand — request a Telegram-bot pairing code.
+/// `telegram pair` — request a Telegram-bot pairing code.
 ///
 /// Why: pairing the Telegram bot to this daemon needs an out-of-band shared
-/// secret; `tm pair` asks the local daemon for a short code and prints both the
-/// `/pair` command and a `t.me` deep link the operator can use.
+/// secret; `tm telegram pair` asks the local daemon for a short code and prints
+/// both the `/pair` command and a `t.me` deep link the operator can use.
 /// What: calls `POST /pair/request` via the shared [`CommandExecutor`] and
 /// prints the code, its TTL, the `/pair <code>` command, and the deep link.
 /// Test: covered by the executor's `pair_request_returns_code` test.
-async fn pair(url: &str) -> anyhow::Result<()> {
+async fn telegram_pair(url: &str) -> anyhow::Result<()> {
     use trusty_mpm_client::{CommandExecutor, CommandResult};
     let executor = CommandExecutor::new(url.to_string());
     match executor.pair_request().await {
@@ -382,6 +422,47 @@ async fn pair(url: &str) -> anyhow::Result<()> {
         }
         CommandResult::Error(msg) => eprintln!("pairing failed: {msg}"),
         other => eprintln!("unexpected pairing result: {other:?}"),
+    }
+    Ok(())
+}
+
+/// `telegram status` — show the daemon's Telegram pairing state.
+///
+/// Why: operators need to know whether a Telegram chat is already paired with
+/// the daemon — and which one — without digging through logs.
+/// What: calls `GET /pair/status` via the shared [`DaemonClient`] and prints
+/// `paired` plus the registered `chat_id`, or `unpaired` when no chat is bound.
+/// Test: covered by the client's `pair_status_deserializes` test.
+async fn telegram_status(url: &str) -> anyhow::Result<()> {
+    use trusty_mpm_client::DaemonClient;
+    let client = DaemonClient::new(url.to_string());
+    match client.pair_status().await {
+        Ok(status) if status.paired => match status.chat_id {
+            Some(chat_id) => println!("Telegram: paired (chat_id: {chat_id})"),
+            None => println!("Telegram: paired"),
+        },
+        Ok(_) => println!("Telegram: unpaired — run `tm telegram pair` to begin"),
+        Err(e) => eprintln!("daemon unreachable: {e}"),
+    }
+    Ok(())
+}
+
+/// `telegram stop` — kill the Telegram bot process if one is running.
+///
+/// Why: the bot may be running standalone (`tm telegram start`) or alongside
+/// the daemon; `tm telegram stop` gives the operator a single way to take it
+/// down without hunting for the PID.
+/// What: runs `pkill -f "trusty-mpm telegram start"` to terminate any
+/// foreground bot process; reports whether a process was killed.
+/// Test: exercised manually — process management is not unit-testable here.
+fn telegram_stop() -> anyhow::Result<()> {
+    let status = std::process::Command::new("pkill")
+        .args(["-f", "telegram start"])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("Telegram bot stopped"),
+        Ok(_) => println!("no Telegram bot process found"),
+        Err(e) => eprintln!("failed to stop Telegram bot: {e}"),
     }
     Ok(())
 }
@@ -1723,34 +1804,79 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_telegram_with_check() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "telegram", "--check"]).unwrap();
+    fn cli_parses_telegram_pair() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "telegram", "pair"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Telegram {
+                cmd: TelegramCmd::Pair
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_telegram_status() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "telegram", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Telegram {
+                cmd: TelegramCmd::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_telegram_stop() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "telegram", "stop"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Telegram {
+                cmd: TelegramCmd::Stop
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_telegram_requires_subcommand() {
+        // `telegram` with no action is an error now that it is a group.
+        assert!(Cli::try_parse_from(["trusty-mpm", "telegram"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_telegram_start_with_check() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "telegram", "start", "--check"]).unwrap();
         match cli.command {
-            Command::Telegram { check, token, .. } => {
+            Command::Telegram {
+                cmd: TelegramCmd::Start { check, token, .. },
+            } => {
                 assert!(check);
                 assert_eq!(token, None);
             }
-            other => panic!("expected Telegram, got {other:?}"),
+            other => panic!("expected Telegram start, got {other:?}"),
         }
     }
 
     #[test]
-    fn cli_parses_telegram_with_token() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "telegram", "--token", "secret"]).unwrap();
+    fn cli_parses_telegram_start_with_token() {
+        let cli =
+            Cli::try_parse_from(["trusty-mpm", "telegram", "start", "--token", "secret"]).unwrap();
         match cli.command {
-            Command::Telegram { token, check, .. } => {
+            Command::Telegram {
+                cmd: TelegramCmd::Start { token, check, .. },
+            } => {
                 assert_eq!(token.as_deref(), Some("secret"));
                 assert!(!check);
             }
-            other => panic!("expected Telegram, got {other:?}"),
+            other => panic!("expected Telegram start, got {other:?}"),
         }
     }
 
     #[test]
-    fn cli_parses_telegram_alert_and_user_flags() {
+    fn cli_parses_telegram_start_alert_and_user_flags() {
         let cli = Cli::try_parse_from([
             "trusty-mpm",
             "telegram",
+            "start",
             "--alert-chat-id",
             "12345",
             "--allowed-user-id",
@@ -1759,14 +1885,17 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Telegram {
-                alert_chat_id,
-                allowed_user_id,
-                ..
+                cmd:
+                    TelegramCmd::Start {
+                        alert_chat_id,
+                        allowed_user_id,
+                        ..
+                    },
             } => {
                 assert_eq!(alert_chat_id, Some(12345));
                 assert_eq!(allowed_user_id, Some(67890));
             }
-            other => panic!("expected Telegram, got {other:?}"),
+            other => panic!("expected Telegram start, got {other:?}"),
         }
     }
 
@@ -2210,12 +2339,6 @@ mod tests {
     #[test]
     fn cli_connect_requires_target() {
         assert!(Cli::try_parse_from(["trusty-mpm", "connect"]).is_err());
-    }
-
-    #[test]
-    fn cli_parses_pair() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "pair"]).unwrap();
-        assert!(matches!(cli.command, Command::Pair));
     }
 
     #[test]
