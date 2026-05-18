@@ -41,6 +41,12 @@ pub struct PrepReport {
     /// session still launches in that case, just with the operator's default
     /// style.
     pub output_style: Option<PathBuf>,
+    /// Whether the `trusty-memory` hook block was written to the project's
+    /// `.claude/settings.json`.
+    ///
+    /// `false` when writing the project hooks failed; the session still
+    /// launches, it just won't fire the trusty-memory hooks.
+    pub hooks_written: bool,
 }
 
 /// A failure raised while preparing a session for launch.
@@ -113,6 +119,24 @@ pub fn prepare_session(fw: &FrameworkPaths, project_dir: &Path) -> Result<PrepRe
         tracing::warn!("failed to set trusty-mpm output style: {err}");
     }
 
+    // Write the `trusty-memory` hook block into the project settings so the
+    // hooks fire only for trusty-mpm sessions. Non-fatal: the session still
+    // launches, it just won't record memory via the hooks.
+    let hooks_written = match write_project_hooks(project_dir) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!("failed to write trusty-memory project hooks: {err}");
+            false
+        }
+    };
+
+    // Remove the now-redundant global `trusty-memory` hook entries so they no
+    // longer fire for every Claude Code session (including claude-mpm). The
+    // project hooks above scope them to trusty-mpm sessions. Non-fatal.
+    if let Err(err) = remove_global_trusty_memory_hooks() {
+        tracing::warn!("failed to remove global trusty-memory hooks: {err}");
+    }
+
     // Deploy the bundled output-style definition so Claude Code can resolve the
     // `trusty-mpm` name written into `.claude/settings.json` above. Non-fatal:
     // a missing style file just falls back to the operator's default.
@@ -135,6 +159,7 @@ pub fn prepare_session(fw: &FrameworkPaths, project_dir: &Path) -> Result<PrepRe
         instructions,
         stash,
         output_style,
+        hooks_written,
     })
 }
 
@@ -170,17 +195,41 @@ fn deploy_output_style(home: &Path) -> Result<PathBuf, PrepError> {
 /// trusty-mpm sessions should advertise themselves as `trusty-mpm`.
 const OUTPUT_STYLE: &str = "trusty-mpm";
 
-/// Merge `"outputStyle": "trusty-mpm"` into the project's `.claude/settings.json`.
+/// trusty-mpm-specific spinner tips shown during Claude Code loading.
+///
+/// Why: Claude Code's loading spinner renders tips from
+/// `spinnerTipsOverride.tips`; the operator's global settings carry generic
+/// claude-mpm tips, so trusty-mpm sessions override them with project-relevant
+/// guidance (the `tm` CLI, the `make check` gate, the API-first layering rule).
+const SPINNER_TIPS: &[&str] = &[
+    "tm launch — start a configured claude session for this project",
+    "make check = cargo test + clippy + fmt — must pass before any PR",
+    "API → CLI → TUI: implement at the lowest layer first",
+    "Delegate Rust code to rust-engineer — PM never edits .rs files",
+    "gh issue create to track work; commits include Closes #N",
+    "tmux ls shows all active tmpm-<folder> sessions",
+    "tm session list shows daemon-managed sessions",
+    "/compact at ~50% context to stay focused",
+    "Layer new features behind the HTTP API before wiring CLI or TUI",
+];
+
+/// Merge trusty-mpm output-style and spinner-tip settings into the project's
+/// `.claude/settings.json`.
 ///
 /// Why: Claude Code reads the output style from `.claude/settings.json` under
 /// the `outputStyle` key (there is no `--style` CLI flag); writing it in the
 /// project directory makes every `claude` launched there show
-/// `style:trusty-mpm` without disturbing the operator's global settings.
+/// `style:trusty-mpm` without disturbing the operator's global settings. The
+/// same file drives the loading-spinner tips, so trusty-mpm-specific tips are
+/// written alongside to override the operator's generic claude-mpm tips.
 /// What: reads an existing `<project>/.claude/settings.json` (preserving all
-/// other keys), sets `outputStyle` to [`OUTPUT_STYLE`], and writes it back
-/// pretty-printed. Creates the file and `.claude/` directory when absent.
+/// other keys), sets `outputStyle` to [`OUTPUT_STYLE`], enables
+/// `spinnerTipsEnabled`, sets `spinnerTipsOverride.tips` to [`SPINNER_TIPS`],
+/// and writes it back pretty-printed. Creates the file and `.claude/` directory
+/// when absent.
 /// Test: `prepare_session_sets_output_style`,
-/// `write_output_style_preserves_existing_keys`.
+/// `write_output_style_preserves_existing_keys`,
+/// `write_output_style_sets_spinner_tips`.
 fn write_output_style(project_dir: &Path) -> Result<(), PrepError> {
     let claude_dir = project_dir.join(".claude");
     std::fs::create_dir_all(&claude_dir).map_err(|source| PrepError::Io {
@@ -200,6 +249,8 @@ fn write_output_style(project_dir: &Path) -> Result<(), PrepError> {
     };
 
     settings["outputStyle"] = serde_json::Value::String(OUTPUT_STYLE.to_string());
+    settings["spinnerTipsEnabled"] = serde_json::Value::Bool(true);
+    settings["spinnerTipsOverride"] = serde_json::json!({ "tips": SPINNER_TIPS });
 
     let serialized = serde_json::to_string_pretty(&settings)
         .map_err(|err| PrepError::Deploy(err.to_string()))?;
@@ -208,6 +259,200 @@ fn write_output_style(project_dir: &Path) -> Result<(), PrepError> {
         source,
     })?;
     Ok(())
+}
+
+/// The `trusty-memory` hook block written into the project's
+/// `.claude/settings.json`.
+///
+/// Why: these hooks must fire only for trusty-mpm-managed sessions, not for
+/// every Claude Code instance on the machine. Writing them at the project
+/// level (rather than `~/.claude/settings.json`) scopes them to projects
+/// prepared by trusty-mpm. The block covers all four Claude Code hook event
+/// types so memory captures the full session lifecycle.
+const TRUSTY_MEMORY_HOOKS: &str = r#"{
+  "PostToolUse": [
+    {
+      "matcher": "Write|Edit|Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "trusty-memory hooks fire claude.post-tool-use",
+          "timeout": 60
+        }
+      ]
+    }
+  ],
+  "PreToolUse": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "trusty-memory hooks fire claude.pre-tool-use",
+          "timeout": 60
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "trusty-memory hooks fire claude.stop",
+          "timeout": 60
+        }
+      ]
+    }
+  ],
+  "UserPromptSubmit": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "trusty-memory hooks fire claude.user-prompt",
+          "timeout": 60
+        }
+      ]
+    }
+  ]
+}"#;
+
+/// Write the `trusty-memory` hook block into the project's `.claude/settings.json`.
+///
+/// Why: `trusty-memory` hooks must fire only for trusty-mpm-managed sessions.
+/// Scoping them to the project settings (instead of the operator's global
+/// `~/.claude/settings.json`) means they no longer run for unrelated Claude
+/// Code sessions such as claude-mpm.
+/// What: reads an existing `<project>/.claude/settings.json` (preserving all
+/// other keys), *replaces* the entire `hooks` key with [`TRUSTY_MEMORY_HOOKS`],
+/// and writes it back pretty-printed. Replacing — rather than merging — the
+/// `hooks` key avoids double-firing if this runs twice. Creates the file and
+/// `.claude/` directory when absent.
+/// Test: `write_project_hooks_writes_all_event_types`,
+/// `write_project_hooks_replaces_existing`.
+fn write_project_hooks(project_dir: &Path) -> Result<(), PrepError> {
+    let claude_dir = project_dir.join(".claude");
+    std::fs::create_dir_all(&claude_dir).map_err(|source| PrepError::Io {
+        path: claude_dir.clone(),
+        source,
+    })?;
+    let settings_path = claude_dir.join("settings.json");
+
+    // Load existing settings to preserve unrelated keys; tolerate a missing or
+    // malformed file by starting from an empty object.
+    let mut settings = match std::fs::read_to_string(&settings_path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+        Err(_) => serde_json::Value::Object(serde_json::Map::new()),
+    };
+
+    // Replace the entire `hooks` key. The bundled block is a constant and is
+    // guaranteed to parse.
+    let hooks: serde_json::Value =
+        serde_json::from_str(TRUSTY_MEMORY_HOOKS).expect("bundled hook block is valid JSON");
+    settings["hooks"] = hooks;
+
+    let serialized = serde_json::to_string_pretty(&settings)
+        .map_err(|err| PrepError::Deploy(err.to_string()))?;
+    std::fs::write(&settings_path, serialized).map_err(|source| PrepError::Io {
+        path: settings_path.clone(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Hook event types the global `trusty-memory` entries were registered under.
+const GLOBAL_TRUSTY_MEMORY_EVENTS: &[&str] = &["PostToolUse", "Stop", "UserPromptSubmit"];
+
+/// Remove the `trusty-memory` hook entries from `~/.claude/settings.json`.
+///
+/// Why: `trusty-memory` hooks were previously registered globally, so they
+/// fired for every Claude Code session. Now that [`write_project_hooks`]
+/// scopes them to trusty-mpm projects, the global entries must be removed to
+/// stop them double-firing (and firing for unrelated sessions like claude-mpm).
+/// What: reads `~/.claude/settings.json`, and for each event in
+/// [`GLOBAL_TRUSTY_MEMORY_EVENTS`] filters out handler groups whose `hooks`
+/// array contains a command matching `trusty-memory hooks fire`. An event key
+/// whose array becomes empty is removed entirely. Writes the file back. A
+/// missing or malformed file is treated as success (nothing to clean up).
+/// Test: `remove_global_hooks_removes_trusty_memory_entries`.
+fn remove_global_trusty_memory_hooks() -> Result<(), PrepError> {
+    let home = match dirs::home_dir() {
+        Some(home) => home,
+        None => {
+            tracing::warn!("skipping global trusty-memory hook removal: home unresolved");
+            return Ok(());
+        }
+    };
+    let settings_path = home.join(".claude").join("settings.json");
+    clean_global_trusty_memory_hooks(&settings_path)
+}
+
+/// Filter `trusty-memory` hook entries out of the settings file at `settings_path`.
+///
+/// Why: split from [`remove_global_trusty_memory_hooks`] so tests can target a
+/// temp file instead of the operator's real `~/.claude/settings.json`.
+/// What: see [`remove_global_trusty_memory_hooks`]. A missing or malformed
+/// file is a no-op success.
+/// Test: `remove_global_hooks_removes_trusty_memory_entries`.
+fn clean_global_trusty_memory_hooks(settings_path: &Path) -> Result<(), PrepError> {
+    let text = match std::fs::read_to_string(settings_path) {
+        Ok(text) => text,
+        // Missing file: nothing to clean up.
+        Err(_) => return Ok(()),
+    };
+    let mut settings = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) if value.is_object() => value,
+        // Malformed or non-object: leave it untouched rather than risk loss.
+        _ => return Ok(()),
+    };
+
+    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return Ok(());
+    };
+
+    for event in GLOBAL_TRUSTY_MEMORY_EVENTS {
+        let Some(groups) = hooks.get_mut(*event).and_then(|g| g.as_array_mut()) else {
+            continue;
+        };
+        groups.retain(|group| !group_is_trusty_memory(group));
+        if groups.is_empty() {
+            hooks.remove(*event);
+        }
+    }
+
+    let serialized = serde_json::to_string_pretty(&settings)
+        .map_err(|err| PrepError::Deploy(err.to_string()))?;
+    std::fs::write(settings_path, serialized).map_err(|source| PrepError::Io {
+        path: settings_path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Whether a hook handler group is a `trusty-memory` entry.
+///
+/// Why: identifies the groups [`clean_global_trusty_memory_hooks`] must drop.
+/// What: returns `true` when any command in the group's `hooks` array contains
+/// the substring `trusty-memory hooks fire`.
+/// Test: covered indirectly by `remove_global_hooks_removes_trusty_memory_entries`.
+fn group_is_trusty_memory(group: &serde_json::Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|handlers| {
+            handlers.iter().any(|handler| {
+                handler
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|cmd| cmd.contains("trusty-memory hooks fire"))
+            })
+        })
 }
 
 /// Build the `--append-system-prompt` text for a launched session.
@@ -331,6 +576,153 @@ mod tests {
         .unwrap();
         assert_eq!(value["outputStyle"], serde_json::json!("trusty-mpm"));
         assert_eq!(value["theme"], serde_json::json!("dark"));
+    }
+
+    #[test]
+    fn write_output_style_sets_spinner_tips() {
+        // Why: trusty-mpm sessions must override the operator's generic
+        // claude-mpm spinner tips with project-specific ones; the settings.json
+        // merge must enable tips and write a non-empty tips array.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+
+        write_output_style(project).expect("write succeeds");
+
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(project.join(".claude").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["spinnerTipsEnabled"], serde_json::json!(true));
+        let tips = value["spinnerTipsOverride"]["tips"]
+            .as_array()
+            .expect("spinnerTipsOverride.tips must be an array");
+        assert!(!tips.is_empty(), "spinner tips must be non-empty");
+        assert!(tips.iter().all(|tip| tip.is_string()));
+    }
+
+    #[test]
+    fn write_project_hooks_writes_all_event_types() {
+        // Why: the trusty-memory hooks must be scoped to the project and cover
+        // the full session lifecycle — all four Claude Code hook events.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+
+        write_project_hooks(project).expect("write succeeds");
+
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(project.join(".claude").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let hooks = value["hooks"].as_object().expect("hooks must be an object");
+        for event in ["PostToolUse", "PreToolUse", "Stop", "UserPromptSubmit"] {
+            let groups = hooks[event]
+                .as_array()
+                .unwrap_or_else(|| panic!("{event} must be an array"));
+            assert!(!groups.is_empty(), "{event} must have a handler group");
+            let cmd = groups[0]["hooks"][0]["command"]
+                .as_str()
+                .expect("command must be a string");
+            assert!(
+                cmd.contains("trusty-memory hooks fire"),
+                "{event} command must invoke trusty-memory"
+            );
+        }
+    }
+
+    #[test]
+    fn write_project_hooks_replaces_existing() {
+        // Why: re-running prep must replace the hooks block, not append to it,
+        // so handler arrays never duplicate and cause double-firing.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+
+        write_project_hooks(project).expect("first write succeeds");
+        write_project_hooks(project).expect("second write succeeds");
+
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(project.join(".claude").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let post = value["hooks"]["PostToolUse"]
+            .as_array()
+            .expect("PostToolUse must be an array");
+        assert_eq!(
+            post.len(),
+            1,
+            "re-running must replace, not append, handler groups"
+        );
+        // Unrelated keys must survive the replace.
+        write_project_hooks(project).expect("third write succeeds");
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(project.join(".claude").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            value["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn remove_global_hooks_removes_trusty_memory_entries() {
+        // Why: the global trusty-memory hook entries must be cleaned out so
+        // they no longer fire for unrelated Claude Code sessions; non-trusty
+        // entries and empty-becoming events must be handled correctly.
+        let tmp = tempdir().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{
+              "theme": "dark",
+              "hooks": {
+                "PostToolUse": [
+                  { "matcher": "*", "hooks": [ { "type": "command", "command": "bash track.sh" } ] },
+                  { "matcher": "Write|Edit|Bash", "hooks": [ { "type": "command", "command": "trusty-memory hooks fire claude.post-tool-use" } ] }
+                ],
+                "Stop": [
+                  { "matcher": "", "hooks": [ { "type": "command", "command": "trusty-memory hooks fire claude.stop" } ] }
+                ],
+                "UserPromptSubmit": [
+                  { "matcher": "", "hooks": [ { "type": "command", "command": "trusty-memory hooks fire claude.user-prompt" } ] }
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        clean_global_trusty_memory_hooks(&settings_path).expect("clean succeeds");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        // Unrelated keys survive.
+        assert_eq!(value["theme"], serde_json::json!("dark"));
+        // Non-trusty PostToolUse entry survives; trusty one is gone.
+        let post = value["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        assert!(
+            post[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("track.sh")
+        );
+        // Stop and UserPromptSubmit only had trusty entries, so the keys are gone.
+        assert!(
+            value["hooks"].get("Stop").is_none(),
+            "empty Stop event must be removed"
+        );
+        assert!(
+            value["hooks"].get("UserPromptSubmit").is_none(),
+            "empty UserPromptSubmit event must be removed"
+        );
+    }
+
+    #[test]
+    fn remove_global_hooks_tolerates_missing_file() {
+        // Why: cleanup is non-fatal and idempotent — a missing settings file
+        // (operator never created one) must be a no-op success.
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("nope.json");
+        clean_global_trusty_memory_hooks(&missing).expect("missing file is a no-op");
     }
 
     #[test]

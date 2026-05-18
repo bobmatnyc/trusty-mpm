@@ -55,8 +55,21 @@ pub struct RemoveSessionResponse {
 /// Response of `DELETE /sessions/dead`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReapResponse {
-    /// Number of dead sessions reaped.
+    /// Number of dead sessions reaped (tmux session gone, entry removed).
     pub removed: usize,
+    /// Number of alive tmux sessions marked `Stopped` because their `claude`
+    /// process exited.
+    #[serde(default)]
+    pub stopped: usize,
+}
+
+/// Response of `PATCH /sessions/{id}/pid`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetPidResponse {
+    /// The session id the PID was recorded on.
+    pub session_id: String,
+    /// The OS-level `claude` process PID now tracked for the session.
+    pub pid: u32,
 }
 
 /// Response of `POST /sessions/discover`.

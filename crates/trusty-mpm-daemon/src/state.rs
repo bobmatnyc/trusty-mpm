@@ -33,6 +33,23 @@ use crate::audit::AuditLogger;
 use crate::optimizer::OptimizerConfig;
 use crate::tmux::TmuxDriver;
 
+/// Outcome of a reap sweep over the session registry.
+///
+/// Why: the reaper now does two distinct things — it *removes* tmux sessions
+/// whose tmux window is gone, and it *marks Stopped* alive tmux sessions whose
+/// tracked `claude` process has exited. Callers (and the dashboard) need to
+/// tell those apart, so the sweep reports both counts.
+/// What: `reaped` is the number of entries deleted from the registry;
+/// `stopped` is the number transitioned to [`SessionStatus::Stopped`] in place.
+/// Test: `reap_dead_sessions`, `reap_marks_stopped_when_pid_dead`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReapResult {
+    /// Sessions removed from the registry (tmux session gone).
+    pub reaped: usize,
+    /// Sessions transitioned to `Stopped` (tmux alive but `claude` process dead).
+    pub stopped: usize,
+}
+
 /// How many recent hook events the daemon retains for the dashboard feed.
 ///
 /// Why: the live event feed needs scrollback, but an unbounded log would leak
@@ -440,6 +457,18 @@ impl DaemonState {
         self.sessions.insert(session.id, session);
     }
 
+    /// Record the OS-level `claude` process PID on a registered session.
+    ///
+    /// Why: the CLI and the daemon discover the real `claude` PID inside a tmux
+    /// pane *after* launch; reporting it back lets the reaper check process
+    /// liveness rather than relying on the tmux session alone.
+    /// What: sets `session.pid = Some(pid)` under a write guard; returns `true`
+    /// when the session existed, `false` for an unknown id.
+    /// Test: `set_session_pid_updates_field`.
+    pub fn set_session_pid(&self, id: SessionId, pid: u32) -> bool {
+        self.update_session(&id, |s| s.pid = Some(pid))
+    }
+
     /// Remove a session and its associated memory snapshot.
     pub fn remove_session(&self, id: SessionId) -> Option<Session> {
         self.memory.remove(&id);
@@ -509,51 +538,76 @@ impl DaemonState {
             .map(|e| e.value().clone())
     }
 
-    /// Drop registry entries whose tmux session no longer exists.
+    /// Drop dead tmux sessions and mark Stopped ones whose process has exited.
     ///
     /// Why: sessions accumulate forever otherwise — a dead tmux session leaves a
-    /// stale registry entry behind. The daemon's housekeeping loop calls this
-    /// periodically, and `DELETE /sessions/dead` calls it on demand.
+    /// stale registry entry behind. Additionally a tmux session can outlive the
+    /// `claude` process inside it (the pane drops to a bare shell); such a
+    /// session should be visibly `Stopped`, not silently "active". The daemon's
+    /// housekeeping loop calls this periodically, and `DELETE /sessions/dead`
+    /// calls it on demand.
     /// What: discovers the live tmux session names via `driver.list_sessions()`,
-    /// then removes any session whose `tmux_name` is absent from that set;
-    /// returns the number reaped. A failed tmux listing reaps nothing (returns
-    /// `0`) rather than wrongly deleting every session.
-    /// Test: `reap_dead_sessions`.
-    pub fn reap_dead_sessions(&self, driver: &TmuxDriver) -> usize {
+    /// then delegates to [`reap_against`](Self::reap_against). A failed tmux
+    /// listing reaps nothing (returns a zeroed [`ReapResult`]) rather than
+    /// wrongly deleting every session.
+    /// Test: `reap_dead_sessions`, `reap_marks_stopped_when_pid_dead`.
+    pub fn reap_dead_sessions(&self, driver: &TmuxDriver) -> ReapResult {
         let live: std::collections::HashSet<String> = match driver.list_sessions() {
             Ok(sessions) => sessions.into_iter().map(|s| s.name).collect(),
             Err(e) => {
                 tracing::warn!("reap skipped — tmux list-sessions failed: {e}");
-                return 0;
+                return ReapResult::default();
             }
         };
         self.reap_against(&live)
     }
 
-    /// Remove every tmux-hosted session whose `tmux_name` is not in `live`.
+    /// Remove dead tmux sessions and mark Stopped ones with a dead process.
     ///
     /// Why: separating the set-difference logic from the tmux call makes the
     /// reaping rule unit-testable without spawning a tmux process. Native
     /// (`SessionHost::Native`) sessions have no tmux session, so the tmux
     /// liveness check must skip them — otherwise every discovered Terminal.app
     /// process would be reaped the instant after it was discovered.
-    /// What: collects the dead ids of tmux-origin sessions absent from `live`,
-    /// then removes each; returns the count. Native sessions are left untouched.
-    /// Test: `reap_dead_sessions`, `reap_keeps_native_sessions`.
-    fn reap_against(&self, live: &std::collections::HashSet<String>) -> usize {
-        let dead: Vec<SessionId> = self
-            .sessions
-            .iter()
-            .filter(|e| {
-                e.value().origin == trusty_mpm_core::session::SessionHost::Tmux
-                    && !live.contains(&e.value().tmux_name)
-            })
-            .map(|e| *e.key())
-            .collect();
+    /// What: for tmux-origin sessions —
+    /// - if the `tmux_name` is absent from `live`, the entry is removed;
+    /// - if the `tmux_name` is alive but the session has a tracked `pid` whose
+    ///   `claude` process has exited, the session is marked
+    ///   [`SessionStatus::Stopped`] in place (kept so the operator can see it).
+    ///
+    /// Returns the [`ReapResult`] with both counts. Native sessions are left
+    /// untouched.
+    /// Test: `reap_dead_sessions`, `reap_keeps_native_sessions`,
+    /// `reap_marks_stopped_when_pid_dead`.
+    fn reap_against(&self, live: &std::collections::HashSet<String>) -> ReapResult {
+        use trusty_mpm_core::session::{SessionHost, SessionStatus};
+
+        let mut dead: Vec<SessionId> = Vec::new();
+        let mut stopped_ids: Vec<SessionId> = Vec::new();
+        for entry in self.sessions.iter() {
+            let session = entry.value();
+            if session.origin != SessionHost::Tmux {
+                continue;
+            }
+            if !live.contains(&session.tmux_name) {
+                dead.push(*entry.key());
+            } else if session.status != SessionStatus::Stopped
+                && let Some(pid) = session.pid
+                && !trusty_mpm_core::process::is_process_alive(pid)
+            {
+                stopped_ids.push(*entry.key());
+            }
+        }
         for id in &dead {
             self.remove_session(*id);
         }
-        dead.len()
+        for id in &stopped_ids {
+            self.update_session(id, |s| s.status = SessionStatus::Stopped);
+        }
+        ReapResult {
+            reaped: dead.len(),
+            stopped: stopped_ids.len(),
+        }
     }
 
     // ---- projects -------------------------------------------------------
@@ -975,15 +1029,16 @@ mod tests {
             [alive_a.tmux_name.clone(), alive_b.tmux_name.clone()]
                 .into_iter()
                 .collect();
-        let removed = state.reap_against(&live);
+        let result = state.reap_against(&live);
 
-        assert_eq!(removed, 1);
+        assert_eq!(result.reaped, 1);
+        assert_eq!(result.stopped, 0);
         assert!(state.session(id_a).is_some());
         assert!(state.session(id_b).is_some());
         assert!(state.session(id_dead).is_none());
 
         // Reaping again is idempotent — nothing left to remove.
-        assert_eq!(state.reap_against(&live), 0);
+        assert_eq!(state.reap_against(&live), ReapResult::default());
     }
 
     #[test]
@@ -993,8 +1048,8 @@ mod tests {
         let state = DaemonState::new();
         state.register_session(sample_session());
         state.register_session(sample_session());
-        let removed = state.reap_against(&std::collections::HashSet::new());
-        assert_eq!(removed, 2);
+        let result = state.reap_against(&std::collections::HashSet::new());
+        assert_eq!(result.reaped, 2);
         assert!(state.list_sessions().is_empty());
     }
 
@@ -1012,12 +1067,49 @@ mod tests {
         state.register_session(native);
         state.register_session(tmux);
 
-        let removed = state.reap_against(&std::collections::HashSet::new());
+        let result = state.reap_against(&std::collections::HashSet::new());
 
         // Only the tmux-hosted session is reaped.
-        assert_eq!(removed, 1);
+        assert_eq!(result.reaped, 1);
         assert!(state.session(native_id).is_some());
         assert!(state.session(tmux_id).is_none());
+    }
+
+    #[test]
+    fn set_session_pid_updates_field() {
+        // Registering a session leaves `pid` unset; set_session_pid records it.
+        let state = DaemonState::new();
+        let s = sample_session();
+        let id = s.id;
+        state.register_session(s);
+        assert_eq!(state.session(id).unwrap().pid, None);
+
+        assert!(state.set_session_pid(id, 4242));
+        assert_eq!(state.session(id).unwrap().pid, Some(4242));
+
+        // An unknown id is reported as not updated.
+        assert!(!state.set_session_pid(SessionId::new(), 1));
+    }
+
+    #[test]
+    fn reap_marks_stopped_when_pid_dead() {
+        // A tmux session that is still alive but whose tracked `claude` process
+        // has exited (u32::MAX is a guaranteed-dead PID) must be marked Stopped
+        // — not removed — so the operator can still see it.
+        let state = DaemonState::new();
+        let mut session = sample_session();
+        session.pid = Some(u32::MAX);
+        let id = session.id;
+        let tmux_name = session.tmux_name.clone();
+        state.register_session(session);
+
+        let live: std::collections::HashSet<String> = [tmux_name].into_iter().collect();
+        let result = state.reap_against(&live);
+
+        assert_eq!(result.reaped, 0);
+        assert_eq!(result.stopped, 1);
+        let after = state.session(id).expect("session is kept, not removed");
+        assert_eq!(after.status, SessionStatus::Stopped);
     }
 
     #[test]

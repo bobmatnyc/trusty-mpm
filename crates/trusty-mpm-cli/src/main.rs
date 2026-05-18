@@ -1076,9 +1076,11 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
     struct Body {
         #[serde(default)]
         name: String,
+        /// The registered session's id; `None` when the daemon is unreachable.
+        id: Option<trusty_mpm_core::session::SessionId>,
     }
     let folder_name = fallback_session_name(&path);
-    let tmux_name = match client
+    let (tmux_name, session_id) = match client
         .post(format!("{url}/sessions"))
         .json(&serde_json::json!({
             "workdir": path,
@@ -1090,17 +1092,18 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
     {
         Ok(resp) => match resp.error_for_status() {
             Ok(resp) => match resp.json::<Body>().await {
-                Ok(body) if !body.name.is_empty() => body.name,
-                _ => folder_name.clone(),
+                Ok(body) if !body.name.is_empty() => (body.name, body.id),
+                Ok(body) => (folder_name.clone(), body.id),
+                _ => (folder_name.clone(), None),
             },
             Err(err) => {
                 eprintln!("warning: daemon rejected session registration: {err}");
-                folder_name.clone()
+                (folder_name.clone(), None)
             }
         },
         Err(err) => {
             eprintln!("warning: daemon unreachable ({err}); launching without registration");
-            folder_name.clone()
+            (folder_name.clone(), None)
         }
     };
 
@@ -1161,6 +1164,32 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
         .status();
     if !matches!(send, Ok(s) if s.success()) {
         anyhow::bail!("tmux session {tmux_name} created but failed to start claude");
+    }
+
+    // 7b. Find the claude process PID inside the tmux pane and report it to
+    //     the daemon so it can monitor process liveness. `claude` takes 1-3 s
+    //     to start after send-keys, so this retries for up to ~5 s.
+    if let Some(session_id) = session_id {
+        let claude_pid = trusty_mpm_core::process::find_claude_pid_in_tmux(
+            &tmux_name,
+            10,                                    // up to 10 attempts
+            std::time::Duration::from_millis(500), // 500 ms between attempts
+        );
+        if let Some(pid) = claude_pid {
+            // PATCH /sessions/{id}/pid — tell the daemon the real process PID.
+            // Best-effort; failure is logged but does not abort launch.
+            let _ = client
+                .patch(format!("{url}/sessions/{}/pid", session_id.0))
+                .json(&serde_json::json!({ "pid": pid }))
+                .send()
+                .await;
+            tracing::info!(
+                "claude process PID {pid} registered for session {}",
+                session_id.0
+            );
+        } else {
+            tracing::warn!("could not find claude PID for session {tmux_name} after retries");
+        }
     }
 
     // 8. Attach to the session — this takes over the current terminal and

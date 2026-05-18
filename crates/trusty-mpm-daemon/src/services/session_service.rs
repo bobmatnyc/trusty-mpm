@@ -27,9 +27,10 @@ const PAUSE_SUMMARY_CHARS: usize = 500;
 
 /// Outcome of a dead-session reap sweep.
 ///
-/// Why: the `DELETE /sessions/dead` handler reports both how many entries were
-/// reaped and which ones, so callers can log the specifics.
-/// What: the count and the list of removed friendly names.
+/// Why: the `DELETE /sessions/dead` handler reports how many entries were
+/// reaped, which ones, and how many alive tmux sessions were marked `Stopped`
+/// because their `claude` process exited, so callers can log the specifics.
+/// What: the removed count, the removed friendly names, and the stopped count.
 /// Test: `reap_removes_sessions_absent_from_tmux`.
 #[derive(Debug)]
 pub struct ReapResult {
@@ -37,6 +38,8 @@ pub struct ReapResult {
     pub reaped: usize,
     /// Friendly names of the removed sessions.
     pub sessions: Vec<String>,
+    /// Number of sessions transitioned to `Stopped` via the process check.
+    pub stopped: usize,
 }
 
 /// Outcome of pausing a session.
@@ -102,11 +105,11 @@ impl<'s> SessionService<'s> {
             .into_iter()
             .map(|s| s.tmux_name)
             .collect();
-        let reaped = match TmuxDriver::discover() {
+        let outcome = match TmuxDriver::discover() {
             Ok(driver) => self.state.reap_dead_sessions(&driver),
             Err(_) => {
                 tracing::info!("tmux unavailable; skipping dead-session reap");
-                0
+                crate::state::ReapResult::default()
             }
         };
         let after: std::collections::HashSet<String> = self
@@ -119,7 +122,11 @@ impl<'s> SessionService<'s> {
             .into_iter()
             .filter(|name| !after.contains(name))
             .collect();
-        ReapResult { reaped, sessions }
+        ReapResult {
+            reaped: outcome.reaped,
+            sessions,
+            stopped: outcome.stopped,
+        }
     }
 
     /// Pause a session, capturing its output and persisting the pause record.
@@ -208,6 +215,48 @@ impl<'s> SessionService<'s> {
         }
         Ok(session)
     }
+}
+
+/// Discover the `claude` PID inside a tmux pane and record it on a session.
+///
+/// Why: when the daemon brings a tmux session under management it should track
+/// the OS-level `claude` process so the reaper can detect a stopped session.
+/// PID discovery retries for a few seconds (claude takes 1-3 s to appear after
+/// `send-keys`), so it must not block the request handler — it runs in a
+/// short-lived background task.
+/// What: spawns a Tokio blocking task that calls
+/// [`trusty_mpm_core::process::find_claude_pid_in_tmux`]; on success it records
+/// the PID via [`DaemonState::set_session_pid`]. Failure is logged, never fatal.
+/// Test: `set_session_pid_updates_field` covers the state mutation it performs;
+/// the discovery itself is covered in `trusty-mpm-core`.
+pub fn spawn_pid_capture(
+    state: std::sync::Arc<DaemonState>,
+    id: trusty_mpm_core::session::SessionId,
+    tmux_name: String,
+) {
+    tokio::spawn(async move {
+        let captured = tokio::task::spawn_blocking(move || {
+            trusty_mpm_core::process::find_claude_pid_in_tmux(
+                &tmux_name,
+                10,
+                std::time::Duration::from_millis(500),
+            )
+        })
+        .await;
+        match captured {
+            Ok(Some(pid)) => {
+                if state.set_session_pid(id, pid) {
+                    tracing::info!("tracked claude PID {pid} for session {id:?}");
+                }
+            }
+            Ok(None) => {
+                tracing::warn!("could not find claude PID for session {id:?}");
+            }
+            Err(e) => {
+                tracing::warn!("PID-capture task failed for session {id:?}: {e}");
+            }
+        }
+    });
 }
 
 #[cfg(test)]

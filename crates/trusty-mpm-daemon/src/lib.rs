@@ -135,9 +135,15 @@ async fn reap_loop(state: Arc<DaemonState>) {
     loop {
         tick.tick().await;
         if let Ok(driver) = tmux::TmuxDriver::discover() {
-            let removed = state.reap_dead_sessions(&driver);
-            if removed > 0 {
-                info!("reaped {removed} dead session(s)");
+            let result = state.reap_dead_sessions(&driver);
+            if result.reaped > 0 {
+                info!("reaped {} dead session(s)", result.reaped);
+            }
+            if result.stopped > 0 {
+                info!(
+                    "marked {} session(s) stopped (claude process exited)",
+                    result.stopped
+                );
             }
         }
     }

@@ -65,6 +65,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/sessions/{id}/resume", post(resume_session))
         .route("/sessions/{id}/command", post(send_command))
         .route("/sessions/{id}/output", get(get_output))
+        .route("/sessions/{id}/pid", axum::routing::patch(set_session_pid))
         .route("/projects", get(list_projects).post(register_project))
         .route("/projects/current", get(current_project))
         .route("/projects/discover", get(discover_projects))
@@ -224,6 +225,12 @@ pub async fn register_session(
     let tmux_name = session.tmux_name.clone();
     state.register_session(session);
 
+    // Discover the `claude` PID inside the registered tmux pane in the
+    // background so the reaper can monitor process liveness. This is the
+    // daemon-side counterpart of the CLI's post-launch PID capture; it does not
+    // block the response, and a failure is logged, never fatal.
+    crate::services::session_service::spawn_pid_capture(Arc::clone(&state), id, tmux_name.clone());
+
     Json(RegisterSessionResponse {
         id,
         name: tmux_name,
@@ -270,7 +277,56 @@ pub async fn reap_sessions(State(state): State<Arc<DaemonState>>) -> Json<ReapRe
     let result = SessionService::new(&state).reap();
     Json(ReapResponse {
         removed: result.reaped,
+        stopped: result.stopped,
     })
+}
+
+/// JSON body for `PATCH /sessions/{id}/pid`.
+///
+/// Why: after launching `claude` inside a tmux pane the CLI discovers the real
+/// process PID and reports it back so the daemon can monitor process liveness.
+/// What: the OS-level `claude` process id.
+/// Test: `set_session_pid_records_pid`.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct SetPidRequest {
+    /// OS-level `claude` process id discovered inside the session's tmux pane.
+    pub pid: u32,
+}
+
+/// `PATCH /sessions/{id}/pid` — record the OS-level `claude` process PID.
+///
+/// Why: a tmux session can outlive the `claude` process inside it; tracking the
+/// real PID lets the reaper detect a stopped session. The CLI (and the daemon's
+/// own launch path) discover the PID a few seconds after `send-keys` and report
+/// it here.
+/// What: resolves the session by UUID, sets `session.pid`, and echoes the id
+/// and PID. An unknown id is `404`.
+/// Test: `set_session_pid_records_pid`, `set_session_pid_unknown_is_404`.
+#[utoipa::path(
+    patch,
+    path = "/sessions/{id}/pid",
+    tag = "sessions",
+    params(("id" = String, Path, description = "Session UUID")),
+    request_body = SetPidRequest,
+    responses(
+        (status = 200, description = "PID recorded for the session"),
+        (status = 404, description = "No session with that id"),
+    )
+)]
+pub async fn set_session_pid(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(body): Json<SetPidRequest>,
+) -> Result<Json<SetPidResponse>, DaemonError> {
+    let session = parse_id(&id)?;
+    if state.set_session_pid(session, body.pid) {
+        Ok(Json(SetPidResponse {
+            session_id: id,
+            pid: body.pid,
+        }))
+    } else {
+        Err(DaemonError::SessionNotFound { id })
+    }
 }
 
 /// `POST /sessions/discover` — auto-discover Claude Code sessions.
