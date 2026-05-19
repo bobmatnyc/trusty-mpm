@@ -23,40 +23,33 @@ const SECTION_SEPARATOR: &str = "\n\n---\n\n";
 // Bundled system-prompt assembly
 //
 // Why: trusty-mpm must own its own PM instructions rather than reading from a
-// `~/.claude-mpm/` install at runtime. The five source assets below are
+// `~/.claude-mpm/` install at runtime. The four source assets below are
 // embedded at compile time and assembled into a single `INSTRUCTIONS.md` that
 // is passed to `claude --append-system-prompt-file` on every session launch.
 // ---------------------------------------------------------------------------
 
 /// Token-optimized PM orchestration instructions (bundled at compile time).
 const PM_INSTRUCTIONS: &str = include_str!("../assets/instructions/PM_INSTRUCTIONS.md");
-/// Non-overridable BASE_PM framework floor (bundled at compile time).
-const BASE_PM: &str = include_str!("../assets/instructions/BASE_PM.md");
 /// 5-phase workflow execution details (bundled at compile time).
 const WORKFLOW: &str = include_str!("../assets/instructions/WORKFLOW.md");
 /// Agent delegation routing table (bundled at compile time).
 const AGENT_DELEGATION: &str = include_str!("../assets/instructions/AGENT_DELEGATION.md");
-/// Trusty MCP tool-priority block (bundled at compile time).
-const TRUSTY_TOOL_PRIORITY: &str = include_str!("../assets/instructions/TRUSTY_TOOL_PRIORITY.md");
+/// Non-overridable BASE_PM framework floor — includes the Trusty tool-priority
+/// block — bundled at compile time. Placed last so it cannot be overridden.
+const BASE_PM: &str = include_str!("../assets/instructions/BASE_PM.md");
 
 /// Assemble the full system prompt from bundled source components.
 ///
 /// Why: a launched `claude` session must receive identical, version-controlled
 /// PM instructions every time; embedding the sources and joining them here
 /// removes any dependency on an external `~/.claude-mpm/` install.
-/// What: concatenates the five bundled assets in the fixed order
-/// PM_INSTRUCTIONS → BASE_PM → WORKFLOW → AGENT_DELEGATION → TRUSTY_TOOL_PRIORITY,
-/// separated by a `---` rule.
+/// What: concatenates the four bundled assets in the fixed order
+/// PM_INSTRUCTIONS → WORKFLOW → AGENT_DELEGATION → BASE_PM, separated by a
+/// `---` rule. BASE_PM comes last as the non-overridable framework floor; it
+/// carries the Trusty MCP tool-priority block.
 /// Test: `assemble_system_prompt_contains_all_sections`.
 pub fn assemble_system_prompt() -> String {
-    [
-        PM_INSTRUCTIONS,
-        BASE_PM,
-        WORKFLOW,
-        AGENT_DELEGATION,
-        TRUSTY_TOOL_PRIORITY,
-    ]
-    .join("\n\n---\n\n")
+    [PM_INSTRUCTIONS, WORKFLOW, AGENT_DELEGATION, BASE_PM].join("\n\n---\n\n")
 }
 
 /// Write the assembled system prompt to the trusty-mpm framework directory.
@@ -389,8 +382,13 @@ mod tests {
         assert!(prompt.contains("# BASE_PM Framework Floor"));
         assert!(prompt.contains("# PM Workflow Configuration"));
         assert!(prompt.contains("# Agent Delegation Routing"));
-        assert!(prompt.contains("# Trusty Tool Priority"));
+        // The Trusty tool-priority block now lives inside the BASE_PM floor.
+        assert!(prompt.contains("## Trusty Tool Priority (Non-Overridable)"));
         assert!(prompt.contains("\n\n---\n\n"));
+        // BASE_PM is the non-overridable floor: it must come last.
+        let base = prompt.find("# BASE_PM Framework Floor").expect("base_pm");
+        let delegation = prompt.find("# Agent Delegation Routing").expect("delegation");
+        assert!(base > delegation, "BASE_PM floor must be appended last");
         // Ticketing-specific content was stripped from the bundled assets.
         assert!(!prompt.contains("mcp__mcp-ticketer__"));
         assert!(!prompt.contains("ticketing_agent"));

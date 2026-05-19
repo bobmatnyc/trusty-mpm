@@ -576,9 +576,9 @@ mod tests {
         // prompt must include the trusty tool-priority block so a launched
         // session knows to prefer `memory_recall` and `search_code`.
         let prompt = build_system_prompt().expect("trusty block is always present");
-        assert!(prompt.contains("# Trusty Tool Priority"));
-        assert!(prompt.contains("memory_recall"));
-        assert!(prompt.contains("search_code"));
+        assert!(prompt.contains("## Trusty Tool Priority (Non-Overridable)"));
+        assert!(prompt.contains("mcp__trusty-memory__memory_recall"));
+        assert!(prompt.contains("mcp__trusty-search__search_code"));
         // The bundled PM instructions are also part of the assembled prompt.
         assert!(prompt.contains("# PM Agent -- Claude MPM"));
     }
