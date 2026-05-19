@@ -40,6 +40,35 @@ pub struct FrameworkPaths {
     pub registry: PathBuf,
     /// `~/.claude/agents` — where Claude Code reads composed agent files.
     pub claude_agents: PathBuf,
+    /// `~/.claude/skills` — where Claude Code reads skill files.
+    pub claude_skills: PathBuf,
+    /// The trusty-mpm source checkout root, if one could be located.
+    ///
+    /// Why: the `agents/` git submodule (`agents/agents/`, `agents/skills/`)
+    /// is the preferred distribution source for agents and skills. It only
+    /// exists in a source checkout, so this is `None` for a binary-only
+    /// install — callers then fall back to the bundled assets.
+    /// What: the directory holding `.git` discovered by walking the running
+    /// binary's ancestors; `None` when no such directory is found.
+    pub trusty_mpm_root: Option<PathBuf>,
+}
+
+/// Locate the trusty-mpm source checkout root.
+///
+/// Why: the `agents/` submodule lives at `<root>/agents/` and is only present
+/// in a source checkout; resolving it requires finding that checkout from the
+/// running binary's location.
+/// What: walks the ancestors of the current executable's directory, returning
+/// the first that contains a `.git` entry (the repository root). Returns `None`
+/// when the executable path is unresolvable or no ancestor has `.git`.
+/// Test: `locate_root_finds_git_ancestor`, `locate_root_none_without_git`.
+fn locate_trusty_mpm_root(start: &Path) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        if ancestor.join(".git").exists() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
 }
 
 impl FrameworkPaths {
@@ -68,6 +97,9 @@ impl FrameworkPaths {
         let base = base.as_ref();
         let root = base.join(FRAMEWORK_DIR_NAME);
         let framework = root.join("framework");
+        let trusty_mpm_root = std::env::current_exe()
+            .ok()
+            .and_then(|exe| locate_trusty_mpm_root(&exe));
         Self {
             agents: framework.join("agents"),
             skills: framework.join("skills"),
@@ -75,6 +107,8 @@ impl FrameworkPaths {
             instructions: framework.join("instructions"),
             registry: root.join("registry"),
             claude_agents: base.join(".claude").join("agents"),
+            claude_skills: base.join(".claude").join("skills"),
+            trusty_mpm_root,
             framework,
             root,
         }
@@ -137,12 +171,40 @@ impl FrameworkPaths {
     /// Directory holding the trusty-mpm agent *source* files.
     ///
     /// Why: the agent build pipeline reads `extends:`-bearing source agents
-    /// from here and composes them before deployment.
-    /// What: `framework/agents` under the framework root — the same directory
-    /// `trusty-mpm install` writes the bundled agent sources into.
-    /// Test: `agent_source_dir_is_framework_agents`.
+    /// from here and composes them before deployment. When the `agents/` git
+    /// submodule is populated it is the authoritative, version-controlled
+    /// source; only a binary-only install falls back to the bundled assets.
+    /// What: prefers `<trusty-mpm-root>/agents/agents/` when that directory
+    /// exists, otherwise returns `framework/agents` under the framework root.
+    /// Test: `agent_source_dir_is_framework_agents`,
+    /// `agent_source_dir_prefers_submodule`.
     pub fn agent_source_dir(&self) -> PathBuf {
+        if let Some(root) = &self.trusty_mpm_root {
+            let submodule = root.join("agents").join("agents");
+            if submodule.is_dir() {
+                return submodule;
+            }
+        }
         self.agents.clone()
+    }
+
+    /// Directory holding the trusty-mpm skill *source* files.
+    ///
+    /// Why: the skill deploy step reads `.md` skill files from here and copies
+    /// them into `~/.claude/skills/`. As with agents, the `agents/` submodule
+    /// is the authoritative source when present.
+    /// What: prefers `<trusty-mpm-root>/agents/skills/` when that directory
+    /// exists, otherwise returns `framework/skills` under the framework root.
+    /// Test: `skill_source_dir_is_framework_skills`,
+    /// `skill_source_dir_prefers_submodule`.
+    pub fn skill_source_dir(&self) -> PathBuf {
+        if let Some(root) = &self.trusty_mpm_root {
+            let submodule = root.join("agents").join("skills");
+            if submodule.is_dir() {
+                return submodule;
+            }
+        }
+        self.skills.clone()
     }
 
     /// Directory Claude Code reads composed agent files from (`~/.claude/agents`).
@@ -155,6 +217,17 @@ impl FrameworkPaths {
     /// Test: `claude_agents_dir_is_dotclaude_agents`.
     pub fn claude_agents_dir(&self) -> PathBuf {
         self.claude_agents.clone()
+    }
+
+    /// Directory Claude Code reads skill files from (`~/.claude/skills`).
+    ///
+    /// Why: the skill deploy step writes `.md` skill files here so Claude Code
+    /// can resolve them at session start.
+    /// What: `.claude/skills` under the same base this `FrameworkPaths` was
+    /// resolved against.
+    /// Test: `claude_skills_dir_is_dotclaude_skills`.
+    pub fn claude_skills_dir(&self) -> PathBuf {
+        self.claude_skills.clone()
     }
 }
 
@@ -202,6 +275,71 @@ mod tests {
             PathBuf::from("/base/.trusty-mpm/framework/instructions")
         );
         assert_eq!(paths.registry, PathBuf::from("/base/.trusty-mpm/registry"));
+    }
+
+    #[test]
+    fn locate_root_finds_git_ancestor() {
+        // A `.git` directory in an ancestor must be reported as the root.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let nested = tmp.path().join("crates").join("trusty-mpm-core");
+        std::fs::create_dir_all(&nested).unwrap();
+        let found = locate_trusty_mpm_root(&nested.join("dummy-exe"));
+        assert_eq!(found.as_deref(), Some(tmp.path()));
+    }
+
+    #[test]
+    fn locate_root_none_without_git() {
+        // With no `.git` anywhere above, no root can be located.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(locate_trusty_mpm_root(&nested.join("exe")), None);
+    }
+
+    #[test]
+    fn agent_source_dir_prefers_submodule() {
+        // When the `agents/agents/` submodule directory exists under the
+        // located root, it must win over the bundled `framework/agents` path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let submodule = tmp.path().join("agents").join("agents");
+        std::fs::create_dir_all(&submodule).unwrap();
+        let mut paths = FrameworkPaths::under("/base");
+        paths.trusty_mpm_root = Some(tmp.path().to_path_buf());
+        assert_eq!(paths.agent_source_dir(), submodule);
+    }
+
+    #[test]
+    fn skill_source_dir_prefers_submodule() {
+        // When the `agents/skills/` submodule directory exists under the
+        // located root, it must win over the bundled `framework/skills` path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let submodule = tmp.path().join("agents").join("skills");
+        std::fs::create_dir_all(&submodule).unwrap();
+        let mut paths = FrameworkPaths::under("/base");
+        paths.trusty_mpm_root = Some(tmp.path().to_path_buf());
+        assert_eq!(paths.skill_source_dir(), submodule);
+    }
+
+    #[test]
+    fn skill_source_dir_is_framework_skills() {
+        // With no submodule, skill sources fall back to `framework/skills`.
+        let mut paths = FrameworkPaths::under("/base");
+        paths.trusty_mpm_root = None;
+        assert_eq!(
+            paths.skill_source_dir(),
+            PathBuf::from("/base/.trusty-mpm/framework/skills")
+        );
+    }
+
+    #[test]
+    fn claude_skills_dir_is_dotclaude_skills() {
+        // Skills must deploy to `.claude/skills` under the base.
+        let paths = FrameworkPaths::under("/base");
+        assert_eq!(
+            paths.claude_skills_dir(),
+            PathBuf::from("/base/.claude/skills")
+        );
     }
 
     #[test]
@@ -254,8 +392,9 @@ mod tests {
 
     #[test]
     fn agent_source_dir_is_framework_agents() {
-        // Agent sources must resolve to `framework/agents` under the root.
-        let paths = FrameworkPaths::under("/base");
+        // With no submodule, agent sources fall back to `framework/agents`.
+        let mut paths = FrameworkPaths::under("/base");
+        paths.trusty_mpm_root = None;
         assert_eq!(
             paths.agent_source_dir(),
             PathBuf::from("/base/.trusty-mpm/framework/agents")

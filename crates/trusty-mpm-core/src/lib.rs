@@ -41,6 +41,8 @@ pub mod project_discovery;
 pub mod session;
 pub mod session_launch;
 pub mod session_store;
+pub mod skill_deployer;
+pub mod skill_manifest;
 pub mod tmux;
 
 pub use connect::{ResolveResult, SessionSummary, resolve_target};

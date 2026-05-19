@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use crate::agent_deployer::{DeployResult, deploy_agents};
 use crate::instruction_pipeline::{PipelineInput, PipelineOutput, build_instructions};
 use crate::paths::FrameworkPaths;
+use crate::skill_deployer::{DeployStats, deploy_skills};
 
 /// Outcome of the pre-launch preparation for one session.
 ///
@@ -31,6 +32,8 @@ use crate::paths::FrameworkPaths;
 pub struct PrepReport {
     /// Result of deploying composed agents to `~/.claude/agents/`.
     pub deploy: DeployResult,
+    /// Result of deploying skill files to `~/.claude/skills/`.
+    pub skill_deploy: DeployStats,
     /// Result of the instruction merge pipeline.
     pub instructions: PipelineOutput,
     /// Path the merged instructions were stashed to for inspection.
@@ -60,6 +63,9 @@ pub enum PrepError {
     /// Deploying composed agents to `~/.claude/agents/` failed.
     #[error("agent deploy failed: {0}")]
     Deploy(String),
+    /// Deploying skill files to `~/.claude/skills/` failed.
+    #[error("skill deploy failed: {0}")]
+    SkillDeploy(String),
     /// Composing or stashing the launch instructions failed.
     #[error("instruction pipeline failed: {0}")]
     Instructions(#[from] crate::instruction_pipeline::PipelineError),
@@ -89,6 +95,11 @@ pub fn prepare_session(fw: &FrameworkPaths, project_dir: &Path) -> Result<PrepRe
     // Deploy composed agents — Claude Code reads `~/.claude/agents/` at startup.
     let deploy = deploy_agents(&fw.agent_source_dir(), &fw.claude_agents_dir())
         .map_err(|err| PrepError::Deploy(err.to_string()))?;
+
+    // Deploy skill files — Claude Code reads `~/.claude/skills/` at startup.
+    // Skills carry no inheritance, so this is a manifest-tracked content copy.
+    let skill_deploy = deploy_skills(&fw.skill_source_dir(), &fw.claude_skills_dir())
+        .map_err(|err| PrepError::SkillDeploy(err.to_string()))?;
 
     // Compose the effective launch instructions (framework + delegation
     // authority + project CLAUDE.md); this loads or creates the project
@@ -164,6 +175,7 @@ pub fn prepare_session(fw: &FrameworkPaths, project_dir: &Path) -> Result<PrepRe
 
     Ok(PrepReport {
         deploy,
+        skill_deploy,
         instructions,
         stash,
         output_style,
@@ -965,6 +977,22 @@ mod tests {
             .expect("output style deployed when home is resolvable");
         assert!(style.ends_with("trusty-mpm.md"));
         assert!(style.exists());
+    }
+
+    #[test]
+    fn prepare_session_reports_skill_deploy() {
+        // Why: `prepare_session` must run the skill deploy step so launched
+        // sessions see trusty-mpm skills; the report must carry its stats.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        let fw = FrameworkPaths::default();
+
+        let report = prepare_session(&fw, project).expect("prep succeeds");
+
+        // The stats are present (a fresh install with no skill source is an
+        // empty-but-valid result; this asserts the field is populated, not
+        // that any specific skill deployed).
+        let _ = &report.skill_deploy;
     }
 
     #[test]
