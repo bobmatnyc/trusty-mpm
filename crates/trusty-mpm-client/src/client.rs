@@ -234,6 +234,34 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+impl ChatMessage {
+    /// A user-authored chat message.
+    ///
+    /// Why: UIs threading a rolling conversation window need to append the
+    /// operator's turn; a named constructor keeps `role` strings out of call
+    /// sites.
+    /// What: builds a `ChatMessage` with `role = "user"`.
+    /// Test: `chat_message_constructors_set_role`.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: content.into(),
+        }
+    }
+
+    /// An assistant-authored chat message.
+    ///
+    /// Why: the counterpart to [`Self::user`] for appending the reply turn.
+    /// What: builds a `ChatMessage` with `role = "assistant"`.
+    /// Test: `chat_message_constructors_set_role`.
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+        }
+    }
+}
+
 /// Outcome of a `POST /llm/chat` call.
 ///
 /// Why: the caller needs both the assistant's reply and the updated history so
@@ -247,6 +275,65 @@ pub struct LlmChatOutcome {
     /// The updated conversation history, ready for the next turn.
     #[serde(default)]
     pub history: Vec<ChatMessage>,
+}
+
+/// One session row inside a [`CoordinatorContext`].
+///
+/// Why: the TUI/GUI coordinator sidebar renders each session's name, status,
+/// and a recent-output excerpt; this mirrors the daemon's `SessionSummary`.
+/// What: identity fields plus the captured tail of the session's tmux pane.
+/// Test: `coordinator_context_deserializes`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CoordinatorSession {
+    /// Session id (UUID string).
+    pub id: String,
+    /// tmux session name, e.g. `tmpm-aipowerranking`.
+    pub name: String,
+    /// Short routing prefix, e.g. `aipowerranking`.
+    pub prefix: String,
+    /// Working directory the session runs in.
+    pub workdir: String,
+    /// Lifecycle status word: `Active` / `Paused` / `Stopped` / ….
+    pub status: String,
+    /// Number of active delegations the session has running.
+    #[serde(default)]
+    pub active_delegations: u32,
+    /// Recent lines captured from the session's pane.
+    #[serde(default)]
+    pub recent_output: Vec<String>,
+}
+
+/// Snapshot returned by `GET /api/v1/coordinator/context`.
+///
+/// Why: the coordinator UI displays the per-session summaries that the daemon's
+/// coordinator reasons over; this is the deserialized view of that snapshot.
+/// What: the per-session summaries (the `recent_events` field is intentionally
+/// ignored — the UIs only need the session list).
+/// Test: `coordinator_context_deserializes`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CoordinatorContext {
+    /// Per-session activity summaries.
+    #[serde(default)]
+    pub sessions: Vec<CoordinatorSession>,
+}
+
+/// Outcome of a `POST /api/v1/coordinator/chat` call.
+///
+/// Why: a coordinator message resolves to either a routed command or an LLM
+/// answer; the caller renders both from this one shape.
+/// What: the `reply` text; `routed_to_session` and `command_output` are
+/// populated only when the message was routed to a session by `@prefix:`.
+/// Test: `coordinator_chat_outcome_deserializes`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoordinatorChatOutcome {
+    /// The assistant reply, or a note about the routed command.
+    pub reply: String,
+    /// tmux name of the session a prefixed message was routed to, if any.
+    #[serde(default)]
+    pub routed_to_session: Option<String>,
+    /// Captured pane output from a routed command, if any.
+    #[serde(default)]
+    pub command_output: Option<String>,
 }
 
 impl DaemonClient {
@@ -812,6 +899,57 @@ impl DaemonClient {
         Ok(Some(outcome))
     }
 
+    /// Fetch the cross-session coordinator snapshot.
+    ///
+    /// Why: the TUI/GUI coordinator sidebar refreshes its session list from the
+    /// daemon's activity snapshot — every session with its status and a
+    /// recent-output excerpt.
+    /// What: `GET /api/v1/coordinator/context`, returns the deserialized
+    /// [`CoordinatorContext`]; `Err` on a transport or decode failure.
+    /// Test: `coordinator_context_deserializes` covers the wire shape.
+    pub async fn coordinator_context(&self) -> anyhow::Result<CoordinatorContext> {
+        let url = format!("{}/api/v1/coordinator/context", self.base);
+        let context = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(context)
+    }
+
+    /// Send a message to the cross-session coordinator.
+    ///
+    /// Why: the coordinator is the operator's one conversational surface over
+    /// every session — a `@prefix:` message routes a command at a named
+    /// session, a plain message is answered by the LLM with full session
+    /// context. The UI owns the rolling chat history and threads it through.
+    /// What: POSTs `{ message, history }` to `/api/v1/coordinator/chat`; returns
+    /// `Ok(Some(outcome))` on success, `Ok(None)` when the daemon answers `503`
+    /// (LLM not configured for a non-prefixed message), and `Err` on transport
+    /// failure.
+    /// Test: `coordinator_chat_outcome_deserializes` covers the wire shape.
+    pub async fn coordinator_chat(
+        &self,
+        message: &str,
+        history: &[ChatMessage],
+    ) -> anyhow::Result<Option<CoordinatorChatOutcome>> {
+        let url = format!("{}/api/v1/coordinator/chat", self.base);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "message": message, "history": history }))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Ok(None);
+        }
+        let outcome: CoordinatorChatOutcome = resp.error_for_status()?.json().await?;
+        Ok(Some(outcome))
+    }
+
     /// Query pairing status via `GET /pair/status`.
     ///
     /// Why: the `/start` command branches on whether the daemon is paired.
@@ -1234,6 +1372,13 @@ mod tests {
     }
 
     #[test]
+    fn chat_message_constructors_set_role() {
+        assert_eq!(ChatMessage::user("x").role, "user");
+        assert_eq!(ChatMessage::assistant("y").role, "assistant");
+        assert_eq!(ChatMessage::user("x").content, "x");
+    }
+
+    #[test]
     fn llm_chat_response_deserializes() {
         // The `POST /llm/chat` response carries the reply and updated history.
         let json = serde_json::json!({
@@ -1247,6 +1392,48 @@ mod tests {
         assert_eq!(outcome.reply, "hi there");
         assert_eq!(outcome.history.len(), 2);
         assert_eq!(outcome.history[1].role, "assistant");
+    }
+
+    #[test]
+    fn coordinator_context_deserializes() {
+        // The `GET /api/v1/coordinator/context` snapshot carries the session
+        // summaries; the daemon's `recent_events` field is ignored.
+        let json = serde_json::json!({
+            "sessions": [{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "name": "tmpm-aipowerranking",
+                "prefix": "aipowerranking",
+                "workdir": "/tmp/proj",
+                "status": "Active",
+                "active_delegations": 3,
+                "recent_output": ["building…"],
+            }],
+            "recent_events": [],
+            "generated_at": "2026-05-19T00:00:00Z",
+        });
+        let context: CoordinatorContext = serde_json::from_value(json).unwrap();
+        assert_eq!(context.sessions.len(), 1);
+        assert_eq!(context.sessions[0].prefix, "aipowerranking");
+        assert_eq!(context.sessions[0].active_delegations, 3);
+    }
+
+    #[test]
+    fn coordinator_chat_outcome_deserializes() {
+        // A routed-command outcome carries the session name and pane output.
+        let json = serde_json::json!({
+            "reply": "Sent to tmpm-foo: run tests",
+            "routed_to_session": "tmpm-foo",
+            "command_output": "tests passed",
+        });
+        let outcome: CoordinatorChatOutcome = serde_json::from_value(json).unwrap();
+        assert_eq!(outcome.routed_to_session.as_deref(), Some("tmpm-foo"));
+        assert_eq!(outcome.command_output.as_deref(), Some("tests passed"));
+
+        // A plain LLM reply omits the routing fields.
+        let json = serde_json::json!({ "reply": "two sessions are active" });
+        let outcome: CoordinatorChatOutcome = serde_json::from_value(json).unwrap();
+        assert_eq!(outcome.reply, "two sessions are active");
+        assert!(outcome.routed_to_session.is_none());
     }
 
     #[test]

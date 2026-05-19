@@ -39,6 +39,16 @@ use crate::state::DaemonState;
 pub mod claude_config_routes;
 pub use claude_config_routes::*;
 
+/// The cross-session coordinator routes (`/api/v1/coordinator/*`).
+///
+/// Why: the coordinator's context and chat endpoints form their own cohesive
+/// cluster; keeping them in a sibling module mirrors `claude_config_routes` and
+/// keeps `api.rs` focused on the core session / hook / tmux surface.
+/// The handlers are re-exported so `router` can refer to them as
+/// `crate::api::<handler>`.
+pub mod coordinator_routes;
+pub use coordinator_routes::*;
+
 /// Typed HTTP response bodies for every endpoint.
 ///
 /// Why: keeping the response structs in their own module keeps `api.rs`
@@ -76,6 +86,8 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/optimizer", get(get_optimizer))
         .route("/overseer", get(get_overseer))
         .route("/llm/chat", post(llm_chat))
+        .route("/api/v1/coordinator/context", get(coordinator_context))
+        .route("/api/v1/coordinator/chat", post(coordinator_chat))
         .route("/tmux/sessions", get(list_tmux_sessions))
         .route("/tmux/sessions/{name}/snapshot", get(tmux_snapshot))
         .route("/tmux/adopt", post(adopt_tmux_session))

@@ -346,6 +346,56 @@ async fn llm_chat_without_overseer_is_503() {
 }
 
 #[tokio::test]
+async fn coordinator_context_returns_snapshot() {
+    // `GET /api/v1/coordinator/context` always returns a snapshot; with a
+    // registered session it appears in the `sessions` array.
+    let (state, _id) = state_with_session();
+    let snapshot = coordinator_context(State(state)).await;
+    assert_eq!(snapshot.sessions.len(), 1);
+}
+
+#[tokio::test]
+async fn coordinator_chat_without_overseer_is_503() {
+    // A non-prefixed coordinator message needs the LLM; a default daemon has
+    // no key, so the chat endpoint reports the capability unavailable.
+    let state = DaemonState::shared();
+    let err = coordinator_chat(
+        State(state),
+        Json(CoordinatorChatRequest {
+            message: "what is happening?".into(),
+            history: Vec::new(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn coordinator_chat_routes_prefixed_message() {
+    // A `@prefix:` message routes directly to the session's tmux pane and
+    // never touches the LLM, so it succeeds even with no API key configured.
+    let state = DaemonState::shared();
+    let id = SessionId::new();
+    let mut session = Session::new(id, "/tmp/p", ControlModel::Tmux, None);
+    session.status = SessionStatus::Active;
+    session.tmux_name = "tmpm-coordtest".to_string();
+    state.register_session(session);
+
+    let resp = coordinator_chat(
+        State(state),
+        Json(CoordinatorChatRequest {
+            message: "@coordtest: echo hi".into(),
+            history: Vec::new(),
+        }),
+    )
+    .await
+    .expect("prefixed routing must not require an LLM");
+    assert_eq!(resp.routed_to_session.as_deref(), Some("tmpm-coordtest"));
+    assert!(resp.command_output.is_some());
+}
+
+#[tokio::test]
 async fn openapi_spec_is_valid() {
     // `GET /api-docs/openapi.json` must return 200 with a document that
     // carries the `openapi` version key and the daemon's title.

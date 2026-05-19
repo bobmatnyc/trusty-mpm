@@ -20,9 +20,9 @@ pub mod executor;
 pub mod result;
 
 pub use client::{
-    BreakerRow, ChatMessage, ConfigRecommendation, DaemonClient, DiscoveredProjectRow, EventRow,
-    LastSeen, LlmChatOutcome, OverseerSnapshot, PairConfirm, PairRequest, PairStatus, SessionRow,
-    TmuxSessionRow,
+    BreakerRow, ChatMessage, ConfigRecommendation, CoordinatorChatOutcome, CoordinatorContext,
+    CoordinatorSession, DaemonClient, DiscoveredProjectRow, EventRow, LastSeen, LlmChatOutcome,
+    OverseerSnapshot, PairConfirm, PairRequest, PairStatus, SessionRow, TmuxSessionRow,
 };
 pub use command::TrustyCommand;
 pub use executor::CommandExecutor;

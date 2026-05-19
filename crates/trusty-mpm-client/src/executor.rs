@@ -90,6 +90,7 @@ impl CommandExecutor {
             TrustyCommand::Connect { project, .. } => self.connect(&project).await,
             TrustyCommand::Start => self.pair_state().await,
             TrustyCommand::Doctor => self.doctor().await,
+            TrustyCommand::CoordinatorChat { message } => self.coordinator_chat(&message).await,
             TrustyCommand::Pair { code: None } => self.pair_state().await,
             TrustyCommand::Pair { code: Some(_) } => {
                 // A code-carrying pair requires the caller's chat id, which is
@@ -443,6 +444,33 @@ impl CommandExecutor {
             .map(|p| p.display().to_string());
         match self.client.doctor(cwd.as_deref()).await {
             Ok(report) => CommandResult::Doctor(report),
+            Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
+        }
+    }
+
+    /// `tm coordinator <message>` — send a message to the cross-session
+    /// coordinator and return its reply.
+    ///
+    /// Why: the CLI/Telegram entry point for the coordinator; a stateless
+    /// invocation has no rolling history, so each call is a fresh conversation.
+    /// What: calls `POST /api/v1/coordinator/chat` with an empty history; maps
+    /// a routed-command outcome (or an LLM reply) to [`CommandResult::ChatReply`],
+    /// and a `503` (LLM not configured) to a clear [`CommandResult::Error`].
+    /// Test: `coordinator_chat_outcome_deserializes` in the client tests.
+    async fn coordinator_chat(&self, message: &str) -> CommandResult {
+        match self.client.coordinator_chat(message, &[]).await {
+            Ok(Some(outcome)) => {
+                // A routed command returns the captured pane output; a plain
+                // message returns the LLM reply. Surface whichever is present.
+                let reply = match outcome.command_output {
+                    Some(output) => format!("{}\n{output}", outcome.reply),
+                    None => outcome.reply,
+                };
+                CommandResult::ChatReply { reply }
+            }
+            Ok(None) => CommandResult::Error(
+                "coordinator chat is not configured (no OpenRouter API key)".to_string(),
+            ),
             Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
         }
     }

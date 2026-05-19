@@ -5434,14 +5434,10 @@ name = "trusty-mpm-tui"
 version = "0.2.7"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
  "crossterm",
- "dirs 5.0.1",
  "ratatui",
- "serde_json",
  "tokio",
- "tracing",
  "trusty-mpm-client",
  "trusty-mpm-core",
  "uuid",

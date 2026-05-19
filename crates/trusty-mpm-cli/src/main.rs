@@ -137,6 +137,15 @@ enum Command {
         #[command(subcommand)]
         action: OverseerAction,
     },
+    /// Send a message to the cross-session coordinator and print its reply.
+    ///
+    /// A message prefixed with `@session:` routes a command at that session;
+    /// a plain message is answered by the LLM with full session context.
+    #[command(alias = "coord")]
+    Coordinator {
+        /// The message to send to the coordinator.
+        message: String,
+    },
 }
 
 /// Actions for the `telegram` subcommand.
@@ -407,7 +416,34 @@ async fn main() -> anyhow::Result<()> {
         Command::Attach { target, json } => attach_cmd(&client, &url, &target, json).await,
         Command::Optimizer { action } => optimizer(&client, &url, action).await,
         Command::Overseer { action } => overseer(&client, &url, action).await,
+        Command::Coordinator { message } => coordinator(&url, message).await,
     }
+}
+
+/// `coordinator` / `coord` subcommand — message the cross-session coordinator.
+///
+/// Why: a scriptable, one-shot entry point to the coordinator so Telegram, cron
+/// jobs, and shell scripts can ask "what is happening across my sessions?" or
+/// route a `@session:` command without the TUI.
+/// What: dispatches a [`TrustyCommand::CoordinatorChat`] through the shared
+/// [`CommandExecutor`] and prints the reply (or the routed command's output);
+/// a daemon/LLM failure becomes a non-zero-exit error line.
+/// Test: covered by the executor's coordinator wire-shape tests.
+async fn coordinator(url: &str, message: String) -> anyhow::Result<()> {
+    use trusty_mpm_client::{CommandExecutor, CommandResult, TrustyCommand};
+    let executor = CommandExecutor::new(url.to_string());
+    match executor
+        .execute(TrustyCommand::CoordinatorChat { message })
+        .await
+    {
+        CommandResult::ChatReply { reply } => println!("{reply}"),
+        CommandResult::Error(msg) => {
+            eprintln!("coordinator: {msg}");
+            std::process::exit(1);
+        }
+        other => eprintln!("unexpected coordinator result: {other:?}"),
+    }
+    Ok(())
 }
 
 /// `telegram` subcommand — manage the Telegram bot (pair, status, start, stop).

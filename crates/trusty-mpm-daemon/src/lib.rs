@@ -12,6 +12,7 @@
 pub mod api;
 pub mod audit;
 pub mod claude_config;
+pub mod coordinator;
 pub mod discover;
 pub mod discovery;
 pub mod doctor;

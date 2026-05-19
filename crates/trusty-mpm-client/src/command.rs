@@ -125,6 +125,17 @@ pub enum TrustyCommand {
     /// healthy install without inspecting each piece by hand.
     /// What: triggers `GET /api/v1/doctor` and renders the resulting report.
     Doctor,
+    /// Send a free-text message to the cross-session coordinator.
+    ///
+    /// Why: `tm coordinator "<message>"` is the scripting/Telegram entry point
+    /// for the coordinator — a message prefixed with `@session:` routes a
+    /// command at that session, a plain message is answered by the LLM with
+    /// full session context.
+    /// What: the message text to send to `POST /api/v1/coordinator/chat`.
+    CoordinatorChat {
+        /// The message to send to the coordinator.
+        message: String,
+    },
     /// Show the command list.
     Help,
 }
