@@ -17,7 +17,7 @@ async fn create_and_list_session() {
 
     let created: Value = client
         .post(daemon.url("/sessions"))
-        .json(&json!({ "workdir": "/tmp/e2e-create" }))
+        .json(&json!({ "project": "/tmp/e2e-create" }))
         .send()
         .await
         .expect("create session")
@@ -50,7 +50,7 @@ async fn session_has_friendly_name() {
     let created: Value = daemon
         .client()
         .post(daemon.url("/sessions"))
-        .json(&json!({ "workdir": "/tmp/e2e-name" }))
+        .json(&json!({ "project": "/tmp/e2e-name" }))
         .send()
         .await
         .expect("create session")
@@ -80,7 +80,7 @@ async fn stop_session() {
 
     let created: Value = client
         .post(daemon.url("/sessions"))
-        .json(&json!({ "workdir": "/tmp/e2e-stop" }))
+        .json(&json!({ "project": "/tmp/e2e-stop" }))
         .send()
         .await
         .expect("create session")
@@ -151,7 +151,7 @@ async fn session_events_empty() {
 
     let created: Value = client
         .post(daemon.url("/sessions"))
-        .json(&json!({ "workdir": "/tmp/e2e-events" }))
+        .json(&json!({ "project": "/tmp/e2e-events" }))
         .send()
         .await
         .expect("create session")
@@ -179,7 +179,7 @@ async fn session_filter_by_project() {
     for path in ["/work/alpha", "/work/beta"] {
         client
             .post(daemon.url("/sessions"))
-            .json(&json!({ "workdir": path, "project_path": path }))
+            .json(&json!({ "project": path, "project_path": path }))
             .send()
             .await
             .expect("create session");
@@ -222,7 +222,7 @@ async fn reap_dead_sessions() {
 
     client
         .post(daemon.url("/sessions"))
-        .json(&json!({ "workdir": "/tmp/e2e-reap" }))
+        .json(&json!({ "project": "/tmp/e2e-reap" }))
         .send()
         .await
         .expect("create session");

@@ -65,7 +65,7 @@ async fn blocklist_blocks_pretooluse() {
 
     let created: Value = client
         .post(daemon.url("/sessions"))
-        .json(&json!({ "workdir": "/tmp/e2e-block" }))
+        .json(&json!({ "project": "/tmp/e2e-block" }))
         .send()
         .await
         .expect("create session")
@@ -103,7 +103,7 @@ async fn auto_approve_allows_pretooluse() {
 
     let created: Value = client
         .post(daemon.url("/sessions"))
-        .json(&json!({ "workdir": "/tmp/e2e-approve" }))
+        .json(&json!({ "project": "/tmp/e2e-approve" }))
         .send()
         .await
         .expect("create session")

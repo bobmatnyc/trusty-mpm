@@ -33,7 +33,7 @@ async fn hook_event_appears_in_feed() {
 
     let created: Value = client
         .post(daemon.url("/sessions"))
-        .json(&json!({ "workdir": "/tmp/e2e-hook" }))
+        .json(&json!({ "project": "/tmp/e2e-hook" }))
         .send()
         .await
         .expect("create session")

@@ -94,16 +94,18 @@ enum Command {
         #[arg(long)]
         mcp: bool,
     },
-    /// Launch a properly configured claude session and attach to it in the
-    /// current terminal (behaves like running `claude-mpm`).
+    /// Launch a session with full setup: deploys instructions, agents, and
+    /// skills, then starts Claude.
     ///
-    /// This deploys instructions, agents, and skills into the project (the full
-    /// `prepare_session` sequence) before starting or attaching to the session.
+    /// This runs the full `prepare_session` deployment sequence (instructions,
+    /// agents, skills, MCP config) into the project before starting or
+    /// attaching to the session in the current terminal (behaves like running
+    /// `claude-mpm`).
     Launch {
         /// Project directory to launch in (defaults to the current directory).
         dir: Option<String>,
     },
-    /// Start or attach to a claude session without deployment.
+    /// Start or attach to a session without running the deployment sequence.
     ///
     /// Unlike `launch`, this skips the framework-deployment sequence entirely —
     /// it does not deploy instructions, agents, or skills. It only starts the
@@ -766,7 +768,7 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
             let body: Body = client
                 .post(format!("{url}/sessions"))
                 .json(&serde_json::json!({
-                    "workdir": path,
+                    "project": path,
                     "project_path": path,
                 }))
                 .send()
@@ -1100,7 +1102,7 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
     let (tmux_name, session_id) = match client
         .post(format!("{url}/sessions"))
         .json(&serde_json::json!({
-            "workdir": path,
+            "project": path,
             "project_path": path,
             "name": folder_name,
         }))
@@ -1270,7 +1272,7 @@ async fn connect(client: &reqwest::Client, url: &str, dir: Option<String>) -> an
     let tmux_name = match client
         .post(format!("{url}/api/v1/sessions/connect"))
         .json(&serde_json::json!({
-            "workdir": path,
+            "project": path,
             "project_path": path,
             "name": folder_name,
         }))

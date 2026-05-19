@@ -96,7 +96,7 @@ async fn full_user_cycle() {
     // 1. Start a session.
     let created = client
         .post(server.url("/sessions"))
-        .json(&json!({ "workdir": "/tmp/lifecycle" }))
+        .json(&json!({ "project": "/tmp/lifecycle" }))
         .send()
         .await
         .expect("create session");

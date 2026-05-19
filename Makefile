@@ -36,11 +36,13 @@ build-release:  ## Release build (lto + strip)
 
 # ── Install / deploy ──────────────────────────────────────────────────────────
 .PHONY: install uninstall
-install:    ## Install trusty-mpm to ~/.cargo/bin
-	cargo install --path crates/trusty-mpm-cli
+install:    ## Install tm and trusty-mpmd binaries
+	cargo install --path crates/trusty-mpm-cli --locked
+	cargo install --path crates/trusty-mpm-daemon --locked
 
-uninstall:  ## Remove trusty-mpm from ~/.cargo/bin
-	cargo uninstall trusty-mpm
+uninstall:  ## Remove tm and trusty-mpmd from ~/.cargo/bin
+	cargo uninstall trusty-mpm-cli
+	cargo uninstall trusty-mpm-daemon
 
 # ── Versioning (requires cargo-release) ──────────────────────────────────────
 .PHONY: version-patch version-minor version-major

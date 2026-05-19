@@ -164,13 +164,14 @@ pub async fn recent_events(State(state): State<Arc<DaemonState>>) -> Json<Events
 ///
 /// Why: a session created by an external launcher (or the CLI) must announce
 /// itself so the dashboard and MCP tools can see it.
-/// What: the working directory the session runs in, plus an optional project
-/// and an optional caller-supplied tmux session name.
+/// What: the project directory the session runs in, plus an optional project
+/// association and an optional caller-supplied tmux session name.
 /// Test: `register_and_remove_session`.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct RegisterSession {
-    /// Working directory the session was launched in.
-    pub workdir: String,
+    /// Project directory the session was launched in (the session's working
+    /// directory). Named `project` to match the CLI `project` argument.
+    pub project: String,
     /// Optional project this session belongs to. When present, the session is
     /// associated with that registered project so `session list` can scope to
     /// it.
@@ -215,7 +216,7 @@ pub async fn register_session(
     let project_dir = body.project_path.as_deref();
     let mut session = Session::new(
         SessionId::new(),
-        body.workdir.clone(),
+        body.project.clone(),
         ControlModel::Tmux,
         project_dir,
     );

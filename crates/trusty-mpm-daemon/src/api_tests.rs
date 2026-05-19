@@ -69,7 +69,7 @@ async fn register_session_associates_project() {
     let Json(body) = register_session(
         State(Arc::clone(&state)),
         Json(RegisterSession {
-            workdir: "/work/demo".into(),
+            project: "/work/demo".into(),
             project_path: Some("/work/demo".into()),
             name: None,
         }),
@@ -91,7 +91,7 @@ async fn list_sessions_filters_by_project() {
     let _ = register_session(
         State(Arc::clone(&state)),
         Json(RegisterSession {
-            workdir: "/work/demo".into(),
+            project: "/work/demo".into(),
             project_path: Some("/work/demo".into()),
             name: None,
         }),
@@ -100,7 +100,7 @@ async fn list_sessions_filters_by_project() {
     let _ = register_session(
         State(Arc::clone(&state)),
         Json(RegisterSession {
-            workdir: "/work/other".into(),
+            project: "/work/other".into(),
             project_path: Some("/work/other".into()),
             name: None,
         }),
@@ -139,7 +139,7 @@ async fn register_and_remove_session() {
     let Json(body) = register_session(
         State(state.clone()),
         Json(RegisterSession {
-            workdir: "/tmp/new".into(),
+            project: "/tmp/new".into(),
             project_path: None,
             name: None,
         }),
@@ -167,7 +167,7 @@ async fn connect_session_registers_without_deploy() {
     let Json(body) = connect_session(
         State(Arc::clone(&state)),
         Json(RegisterSession {
-            workdir: "/tmp/connect".into(),
+            project: "/tmp/connect".into(),
             project_path: Some("/tmp/connect".into()),
             name: Some("tmpm-connect".into()),
         }),
@@ -190,7 +190,7 @@ async fn registered_session_has_friendly_tmux_name() {
     let Json(body) = register_session(
         State(Arc::clone(&state)),
         Json(RegisterSession {
-            workdir: "/tmp/friendly".into(),
+            project: "/tmp/friendly".into(),
             project_path: None,
             name: None,
         }),
@@ -233,7 +233,7 @@ async fn register_session_returns_id_even_without_tmux() {
     let Json(body) = register_session(
         State(Arc::clone(&state)),
         Json(RegisterSession {
-            workdir: "/tmp/no-tmux".into(),
+            project: "/tmp/no-tmux".into(),
             project_path: None,
             name: None,
         }),

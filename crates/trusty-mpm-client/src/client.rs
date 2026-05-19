@@ -854,7 +854,7 @@ impl DaemonClient {
     /// `claude-mpm`; the trusty-mpm behaviour comes from the custom instructions
     /// (deployed agents + project `CLAUDE.md`) prepared before launch.
     /// What: runs [`trusty_mpm_core::session_launch::prepare_session`] (deploy
-    /// agents + merge `CLAUDE.md`), POSTs `{workdir, project_path}` to
+    /// agents + merge `CLAUDE.md`), POSTs `{project, project_path}` to
     /// `/sessions`, then creates a detached tmux session via `tmux new-session`
     /// and starts `claude` in it via `tmux send-keys`. Returns the
     /// daemon-assigned tmux session name. The daemon only registers session
@@ -883,7 +883,7 @@ impl DaemonClient {
             .http
             .post(&url)
             .json(&serde_json::json!({
-                "workdir": workdir,
+                "project": workdir,
                 "project_path": workdir,
             }))
             .send()
@@ -953,7 +953,7 @@ impl DaemonClient {
     /// skips all of that — it assumes the framework is already deployed (or that
     /// the operator does not want it touched) and only wants the daemon to know
     /// about the session and the tmux host to be running.
-    /// What: POSTs `{workdir, project_path}` to `/api/v1/sessions/connect`, then
+    /// What: POSTs `{project, project_path}` to `/api/v1/sessions/connect`, then
     /// runs `tmux new-session -A` (idempotent — creates the session when absent,
     /// no-ops when it already exists). When the session is freshly created it
     /// starts `claude` in it via `tmux send-keys`; an already-running session is
@@ -972,7 +972,7 @@ impl DaemonClient {
             .http
             .post(&url)
             .json(&serde_json::json!({
-                "workdir": workdir,
+                "project": workdir,
                 "project_path": workdir,
             }))
             .send()
