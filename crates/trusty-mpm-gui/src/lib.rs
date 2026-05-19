@@ -35,6 +35,9 @@ pub fn run() {
             commands::resume_session,
             commands::stop_session,
             commands::get_breakers,
+            commands::session_output,
+            commands::coordinator_context,
+            commands::coordinator_chat,
         ])
         .run(tauri::generate_context!())
         .expect("error while running trusty-mpm-gui");

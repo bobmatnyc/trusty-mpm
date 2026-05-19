@@ -3,9 +3,10 @@
 //! Why: The desktop app must never embed business logic — all fleet state
 //! lives in the daemon. These commands are a 1:1 proxy layer so the Svelte
 //! frontend can use the same `invoke(...)` surface it uses in web mode.
-//! What: Five commands (`get_daemon_url`, `check_health`, `list_sessions`,
-//! `pause_session`, `resume_session`) that each forward to the daemon REST
-//! API and surface errors as `String` for the frontend.
+//! What: Commands (`get_daemon_url`, `check_health`, `list_sessions`,
+//! `pause_session`, `resume_session`, `stop_session`, `get_breakers`,
+//! `session_output`, `coordinator_context`, `coordinator_chat`) that each
+//! forward to the daemon REST API and surface errors as `String`.
 //! Test: Run the daemon on `127.0.0.1:7880`, invoke each command, and assert
 //! the returned JSON matches the corresponding `curl` against the daemon.
 
@@ -132,6 +133,81 @@ pub async fn get_breakers(state: State<'_, GuiState>) -> Result<Value, String> {
     resp.json::<Value>()
         .await
         .map_err(|e| format!("get_breakers parse failed: {e}"))
+}
+
+/// `GET /sessions/{id}/output` — fetch a session's current tmux pane text.
+///
+/// Why: The `FileTracking` sidebar pane scrapes the pane output for file
+/// paths; the shell proxies the call so web and desktop share one path.
+/// What: Forwards to `/sessions/{id}/output` and returns the raw JSON body
+/// (the daemon may answer with a string or an object).
+/// Test: Invoke for a live session and assert a non-error response.
+#[tauri::command]
+pub async fn session_output(id: String, state: State<'_, GuiState>) -> Result<Value, String> {
+    let url = format!("{}/sessions/{id}/output", state.daemon_url);
+    let resp = state
+        .client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("session_output request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("session_output: HTTP {}", resp.status()));
+    }
+    Ok(resp.json::<Value>().await.unwrap_or(Value::Null))
+}
+
+/// `GET /api/v1/coordinator/context` — fetch the coordinator's context.
+///
+/// Why: `CoordinatorChat` opens with a greeting summarizing the active
+/// sessions; this proxy supplies that snapshot in desktop mode.
+/// What: Forwards to `/api/v1/coordinator/context` and returns the JSON body.
+/// Test: Invoke with a live daemon and assert a JSON object is returned.
+#[tauri::command]
+pub async fn coordinator_context(state: State<'_, GuiState>) -> Result<Value, String> {
+    let url = format!("{}/api/v1/coordinator/context", state.daemon_url);
+    let resp = state
+        .client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("coordinator_context request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("coordinator_context: HTTP {}", resp.status()));
+    }
+    resp.json::<Value>()
+        .await
+        .map_err(|e| format!("coordinator_context parse failed: {e}"))
+}
+
+/// `POST /api/v1/coordinator/chat` — send a chat turn to the coordinator.
+///
+/// Why: The coordinator chat is the GUI's permanent main panel; every user
+/// message flows through here. The shell only relays the call.
+/// What: POSTs `{message, history}` to `/api/v1/coordinator/chat` and returns
+/// the JSON reply (which may carry `routed_to` / `command_output`).
+/// Test: POST a plain message against a live daemon and assert a JSON reply.
+#[tauri::command]
+pub async fn coordinator_chat(
+    message: String,
+    history: Value,
+    state: State<'_, GuiState>,
+) -> Result<Value, String> {
+    let url = format!("{}/api/v1/coordinator/chat", state.daemon_url);
+    let body = serde_json::json!({ "message": message, "history": history });
+    let resp = state
+        .client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("coordinator_chat request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("coordinator_chat: HTTP {}", resp.status()));
+    }
+    resp.json::<Value>()
+        .await
+        .map_err(|e| format!("coordinator_chat parse failed: {e}"))
 }
 
 /// Shared helper for `POST /sessions/{id}/{action}` calls.

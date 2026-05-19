@@ -32,6 +32,21 @@ export interface HookEvent {
 /** Daemon connection state, mirrored by the header health dot. */
 export type DaemonHealth = 'ok' | 'connecting' | 'error';
 
+/**
+ * A single turn in the coordinator chat transcript.
+ *
+ * `routed_to` is set when the user prefixed `@session-name:` and the
+ * coordinator dispatched the message to that session's tmux pane;
+ * `command_output` then carries whatever that pane emitted.
+ */
+export interface ChatMessage {
+  role: 'user' | 'coordinator';
+  content: string;
+  routed_to?: string;
+  command_output?: string;
+  timestamp: Date;
+}
+
 /** All sessions known to the daemon (polled). */
 export const sessions = writable<Session[]>([]);
 
@@ -46,6 +61,18 @@ export const events = writable<HookEvent[]>([]);
 
 /** Max events retained in the in-memory buffer. */
 const EVENT_CAP = 200;
+
+/** The coordinator chat transcript — the GUI's permanent main panel. */
+export const chatHistory = writable<ChatMessage[]>([]);
+
+/** Latest coordinator context snapshot (active sessions etc.), or null. */
+export const coordinatorContext = writable<any>(null);
+
+/** Whether the left sidebar is shown; toggled from the header/sidebar. */
+export const sidebarVisible = writable<boolean>(true);
+
+/** Which sidebar pane is active. */
+export const sidebarTab = writable<'sessions' | 'files'>('sessions');
 
 /**
  * Why: The sidebar must reflect daemon state without each row polling on its

@@ -1,19 +1,26 @@
 <script lang="ts">
-  // Why: The left sidebar is the primary navigation surface — picking a
-  // session here drives the entire main panel via the `activeSessionId` store.
-  // What: Renders each session as a row with a status dot, truncated id,
-  // workdir basename, uptime, a memory gauge, and pause/resume + stop actions.
+  // Why: The left sidebar is a context surface for the coordinator chat —
+  // picking a session here marks it active (the coordinator uses it for
+  // context), but the chat stays as the main panel. The sidebar is dismissable
+  // and has two panes: live sessions and tracked files.
+  // What: A tab switcher (Sessions | Files) and a close button in the header,
+  // then either session rows (status dot, id, workdir, uptime, memory gauge,
+  // pause/resume + stop) or the `<FileTracking />` pane.
   // Test: Seed `sessions` with one running session, click the row → it becomes
-  // active; click pause → `pause_session` is invoked and the list refreshes.
-  import { Pause, Play, Square } from 'lucide-svelte';
+  // active; click the Files tab → `<FileTracking />` renders; click [×] →
+  // `sidebarVisible` becomes false.
+  import { Pause, Play, Square, X } from 'lucide-svelte';
   import { invoke } from '../lib/transport';
   import {
     sessions,
     activeSessionId,
     refreshSessions,
+    sidebarVisible,
+    sidebarTab,
     type Session,
   } from '../stores/app';
   import MemoryGauge from './MemoryGauge.svelte';
+  import FileTracking from './FileTracking.svelte';
 
   /** Color of the status dot for a given session state. */
   function statusTone(status: Session['status']): string {
@@ -45,7 +52,14 @@
     return `${s}s`;
   }
 
-  /** Select a session, driving the main panel. */
+  /**
+   * Select a session as the coordinator's context target.
+   *
+   * Why: The coordinator chat is always the main panel; selecting a session
+   * only marks it active so the coordinator and the Files pane can scope to
+   * it — it does NOT replace the chat with a detail view.
+   * Test: Click a row → `activeSessionId` updates; the chat panel is unchanged.
+   */
   function select(id: string): void {
     activeSessionId.set(id);
   }
@@ -88,13 +102,52 @@
 </script>
 
 <aside
-  class="flex w-[260px] shrink-0 flex-col overflow-y-auto border-r border-trusty-border-light bg-trusty-surface-light dark:border-trusty-border dark:bg-trusty-surface"
+  class="flex h-full w-full flex-col overflow-y-auto bg-trusty-surface-light dark:bg-trusty-surface"
 >
-  {#if $sessions.length === 0}
-    <p class="px-3 py-4 text-xs opacity-60">No sessions registered.</p>
-  {/if}
+  <!-- Sidebar header: tab switcher + close button -->
+  <div
+    class="flex items-center border-b border-trusty-border-light dark:border-trusty-border"
+  >
+    <button
+      type="button"
+      on:click={() => sidebarTab.set('sessions')}
+      class={`flex-1 px-3 py-2 text-xs font-medium ${
+        $sidebarTab === 'sessions'
+          ? 'border-b-2 border-trusty-primary text-trusty-primary'
+          : 'opacity-60 hover:opacity-100'
+      }`}
+    >
+      Sessions
+    </button>
+    <button
+      type="button"
+      on:click={() => sidebarTab.set('files')}
+      class={`flex-1 px-3 py-2 text-xs font-medium ${
+        $sidebarTab === 'files'
+          ? 'border-b-2 border-trusty-primary text-trusty-primary'
+          : 'opacity-60 hover:opacity-100'
+      }`}
+    >
+      Files
+    </button>
+    <button
+      type="button"
+      on:click={() => sidebarVisible.set(false)}
+      aria-label="Hide sidebar"
+      class="px-2 py-2 opacity-60 hover:opacity-100"
+    >
+      <X size={14} />
+    </button>
+  </div>
 
-  {#each $sessions as session (session.id)}
+  {#if $sidebarTab === 'files'}
+    <FileTracking />
+  {:else}
+    {#if $sessions.length === 0}
+      <p class="px-3 py-4 text-xs opacity-60">No sessions registered.</p>
+    {/if}
+
+    {#each $sessions as session (session.id)}
     <button
       type="button"
       on:click={() => select(session.id)}
@@ -142,5 +195,6 @@
         </button>
       </div>
     </button>
-  {/each}
+    {/each}
+  {/if}
 </aside>

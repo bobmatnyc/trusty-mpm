@@ -9,6 +9,7 @@
 // name. `subscribeEvents(null, cb)` opens an EventSource on `/events`.
 
 import { apiBase, isTauri } from './api-config';
+import type { ChatMessage } from '../stores/app';
 
 /** Maps frontend command names to daemon REST routes. */
 const API_MAP: Record<string, { method: string; path: (args: any) => string }> = {
@@ -19,6 +20,9 @@ const API_MAP: Record<string, { method: string; path: (args: any) => string }> =
   stop_session:   { method: 'DELETE', path: (a) => `/sessions/${a.id}` },
   get_breakers:   { method: 'GET', path: () => '/breakers' },
   get_daemon_url: { method: 'GET', path: () => '/health' }, // no-op in web mode
+  session_output: { method: 'GET', path: (a) => `/sessions/${a.id}/output` },
+  coordinator_context: { method: 'GET', path: () => '/api/v1/coordinator/context' },
+  coordinator_chat: { method: 'POST', path: () => '/api/v1/coordinator/chat' },
 };
 
 /** Forward a call to the native Tauri command of the same name. */
@@ -62,6 +66,37 @@ async function restInvoke(command: string, args?: Record<string, unknown>): Prom
  */
 export async function invoke(command: string, args?: Record<string, unknown>): Promise<any> {
   return isTauri() ? tauriInvoke(command, args) : restInvoke(command, args);
+}
+
+/**
+ * Fetch the coordinator's current context (active sessions, workdirs).
+ *
+ * Why: `CoordinatorChat` opens with a greeting summarizing what the
+ * coordinator can see; this is the single call that supplies that snapshot.
+ * What: Dual-mode wrapper over `GET /api/v1/coordinator/context`.
+ * Test: With the daemon up, the returned value is a JSON object describing
+ * the active sessions.
+ */
+export async function coordinatorContext(): Promise<any> {
+  return invoke('coordinator_context');
+}
+
+/**
+ * Send a chat turn to the coordinator and get its reply.
+ *
+ * Why: The coordinator chat is the GUI's permanent main panel; every user
+ * message flows through here. `@session-name:` prefixes are interpreted
+ * server-side, which may populate `routed_to` / `command_output` on the reply.
+ * What: Dual-mode wrapper over `POST /api/v1/coordinator/chat` carrying the
+ * new message plus prior history for context.
+ * Test: Post a plain message → a `coordinator` reply returns; post one
+ * prefixed with `@id:` → the reply (or the user echo) carries `routed_to`.
+ */
+export async function coordinatorChat(
+  message: string,
+  history: ChatMessage[],
+): Promise<any> {
+  return invoke('coordinator_chat', { message, history });
 }
 
 /**
