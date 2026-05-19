@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 # MSRV: the codebase uses let-chains (`if let ... && ...`), stabilized in 1.88.
 rust-version = "1.88"
@@ -23,9 +23,9 @@ authors = ["Bob Matsuoka"]
 
 [workspace.dependencies]
 # Internal crates
-trusty-mpm-core = { path = "crates/trusty-mpm-core", version = "0.2.5" }
-trusty-mpm-mcp = { path = "crates/trusty-mpm-mcp", version = "0.2.5" }
-trusty-mpm-client = { path = "crates/trusty-mpm-client", version = "0.2.5" }
+trusty-mpm-core = { path = "crates/trusty-mpm-core", version = "0.2.6" }
+trusty-mpm-mcp = { path = "crates/trusty-mpm-mcp", version = "0.2.6" }
+trusty-mpm-client = { path = "crates/trusty-mpm-client", version = "0.2.6" }
 
 # trusty-common shared crates (path reference to sibling checkout).
 # trusty-mcp-core gives us JSON-RPC 2.0 / MCP envelopes + the stdio loop;
