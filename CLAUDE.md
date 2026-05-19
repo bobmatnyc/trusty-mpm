@@ -88,7 +88,7 @@ make version-minor  # bump minor version
 make version-major  # bump major version
 
 # Release
-make release-patch  # publishes to crates.io (trusty-mpm-gui excluded)
+make publish        # publishes to crates.io (trusty-mpm-gui excluded)
 ```
 
 **Layer priority for new features:** API (core/daemon) -> CLI -> TUI -> GUI
