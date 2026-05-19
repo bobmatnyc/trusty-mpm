@@ -80,6 +80,7 @@ publish: ## Publish all crates to crates.io (in dependency order)
 	cargo publish -p trusty-mpm-core
 	cargo publish -p trusty-mpm-mcp
 	cargo publish -p trusty-mpm-daemon
+	cargo publish -p trusty-mpm-client
 	cargo publish -p trusty-mpm-cli
 	cargo publish -p trusty-mpm-tui
 	cargo publish -p trusty-mpm-telegram
