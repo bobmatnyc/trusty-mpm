@@ -77,6 +77,9 @@ pub enum TelegramCommand {
     /// Start and pair — `/start [code]`.
     #[command(description = "Start and pair")]
     Start(String),
+    /// Connect to or start a session without deployment — `/connect <path>`.
+    #[command(description = "Connect to or start a session (no deployment)")]
+    Connect(String),
     /// Run a full system diagnostic.
     #[command(description = "Run full system diagnostic")]
     Doctor,
@@ -114,6 +117,10 @@ impl From<TelegramCommand> for TrustyCommand {
             TelegramCommand::Alerts => TrustyCommand::Alerts,
             TelegramCommand::Pair(code) => TrustyCommand::Pair {
                 code: non_empty(code),
+            },
+            TelegramCommand::Connect(project) => TrustyCommand::Connect {
+                project: project.trim().into(),
+                session_name: None,
             },
             TelegramCommand::Start(_) => TrustyCommand::Start,
             TelegramCommand::Doctor => TrustyCommand::Doctor,
@@ -197,14 +204,23 @@ mod tests {
             TrustyCommand::from(TelegramCommand::Doctor),
             TrustyCommand::Doctor
         );
+        // `/connect <path>` threads the project path through, no session name.
+        assert_eq!(
+            TrustyCommand::from(TelegramCommand::Connect("/work/p".into())),
+            TrustyCommand::Connect {
+                project: "/work/p".into(),
+                session_name: None,
+            }
+        );
     }
 
     #[test]
     fn bot_commands_lists_every_command() {
-        // teloxide's generated descriptor must enumerate all eighteen commands.
+        // teloxide's generated descriptor must enumerate all nineteen commands.
         let descriptions = TelegramCommand::bot_commands();
-        assert_eq!(descriptions.len(), 18);
+        assert_eq!(descriptions.len(), 19);
         assert!(descriptions.iter().any(|c| c.command == "/sessions"));
+        assert!(descriptions.iter().any(|c| c.command == "/connect"));
         assert!(descriptions.iter().any(|c| c.command == "/pair"));
         assert!(descriptions.iter().any(|c| c.command == "/start"));
         assert!(descriptions.iter().any(|c| c.command == "/projects"));

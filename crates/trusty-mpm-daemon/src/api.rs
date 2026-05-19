@@ -57,6 +57,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/sessions", get(list_sessions).post(register_session))
+        .route("/api/v1/sessions/connect", post(connect_session))
         .route("/sessions/dead", axum::routing::delete(reap_sessions))
         .route("/sessions/discover", post(discover_sessions))
         .route("/sessions/{id}", axum::routing::delete(remove_session))
@@ -236,6 +237,33 @@ pub async fn register_session(
         id,
         name: tmux_name,
     })
+}
+
+/// `POST /api/v1/sessions/connect` — register a session for a *connect* (no
+/// deployment) launch.
+///
+/// Why: `tm connect` deliberately skips the framework-deployment sequence that
+/// `tm launch` runs (instructions, agents, skills) — it only wants the daemon
+/// to start or attach to the tmux-hosted session. The deployment work lives in
+/// the client/CLI, not the daemon, so the daemon-side bookkeeping for a
+/// `connect` is identical to `register_session`: it records that the session
+/// exists. A distinct endpoint keeps the two intents observable on the wire and
+/// gives `connect` its own seam should the daemon need to diverge later.
+/// What: delegates to [`register_session`] — the daemon does no deployment in
+/// either path, so the registration body and response are the same.
+/// Test: `connect_session_registers_without_deploy` in `api_tests.rs`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/connect",
+    tag = "sessions",
+    request_body = RegisterSession,
+    responses((status = 201, description = "Session registered for connect; returns its id and name"))
+)]
+pub async fn connect_session(
+    state: State<Arc<DaemonState>>,
+    body: Json<RegisterSession>,
+) -> Json<RegisterSessionResponse> {
+    register_session(state, body).await
 }
 
 /// `DELETE /sessions/:id` — deregister a session.

@@ -184,6 +184,18 @@ impl TelegramFormatter {
                 format!("<b>Alert subscription</b>\n{}", lines.join("\n"))
             }
             CommandResult::Doctor(report) => format_doctor_report(report),
+            CommandResult::SessionStarted {
+                session,
+                workdir,
+                deployed,
+            } => {
+                let mode = if *deployed {
+                    "launched (framework deployed)"
+                } else {
+                    "connected (no deployment)"
+                };
+                format!("✅ Session <b>{session}</b> {mode}\n<code>{workdir}</code>")
+            }
             CommandResult::Help(text) => text.clone(),
             CommandResult::Error(msg) => format!("❌ {msg}"),
         }

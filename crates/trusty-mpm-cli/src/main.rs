@@ -96,13 +96,26 @@ enum Command {
     },
     /// Launch a properly configured claude session and attach to it in the
     /// current terminal (behaves like running `claude-mpm`).
+    ///
+    /// This deploys instructions, agents, and skills into the project (the full
+    /// `prepare_session` sequence) before starting or attaching to the session.
     Launch {
         /// Project directory to launch in (defaults to the current directory).
         dir: Option<String>,
     },
-    /// Connect to an existing session by ID, name prefix, or project path.
-    /// Opens the TUI focused on the matched session.
+    /// Start or attach to a claude session without deployment.
+    ///
+    /// Unlike `launch`, this skips the framework-deployment sequence entirely —
+    /// it does not deploy instructions, agents, or skills. It only starts the
+    /// tmux-hosted session (idempotent: creates it when absent, attaches when it
+    /// already exists) and hands the terminal over to it.
     Connect {
+        /// Project directory to connect in (defaults to the current directory).
+        dir: Option<String>,
+    },
+    /// Attach to an existing session by ID, name prefix, or project path.
+    /// Opens the TUI focused on the matched session.
+    Attach {
         /// Session ID, name prefix, or project directory path.
         target: String,
 
@@ -388,7 +401,8 @@ async fn main() -> anyhow::Result<()> {
             mcp,
         } => run_daemon(addr, tailscale, mcp).await,
         Command::Launch { dir } => launch(&client, &url, dir).await,
-        Command::Connect { target, json } => connect_cmd(&client, &url, &target, json).await,
+        Command::Connect { dir } => connect(&client, &url, dir).await,
+        Command::Attach { target, json } => attach_cmd(&client, &url, &target, json).await,
         Command::Optimizer { action } => optimizer(&client, &url, action).await,
         Command::Overseer { action } => overseer(&client, &url, action).await,
     }
@@ -1206,6 +1220,116 @@ async fn launch(client: &reqwest::Client, url: &str, dir: Option<String>) -> any
     Ok(())
 }
 
+/// `connect` subcommand — start or attach to a session without deployment.
+///
+/// Why: `tm connect` is the lightweight sibling of `tm launch`. Where `launch`
+/// runs the full framework-deployment sequence (`prepare_session` +
+/// `install_system_prompt`) before bringing the session up, `connect`
+/// deliberately skips all deployment — it assumes the framework is already in
+/// place (or that the operator does not want it touched) and only ensures the
+/// tmux-hosted session is running, then attaches.
+/// What: resolves `dir`, reconnects to a live session for the directory when
+/// one exists, otherwise registers the session via
+/// `POST /api/v1/sessions/connect`, creates the tmux host idempotently
+/// (`tmux new-session -A`), starts `claude` only when the session is freshly
+/// created, and `attach`es to it. No agents, skills, instructions, or
+/// system-prompt files are written.
+/// Test: `cli_parses_connect`, `cli_parses_connect_with_dir`.
+async fn connect(client: &reqwest::Client, url: &str, dir: Option<String>) -> anyhow::Result<()> {
+    // 1. Resolve the target directory (absolute, so the banner is unambiguous).
+    let path = resolve_dir(dir)?;
+    let path = path.canonicalize().unwrap_or(path);
+    let workdir = path.to_string_lossy().to_string();
+
+    // 1b. Reconnect to an existing live session for this directory if one
+    //     exists — `connect` is idempotent by design.
+    if let Some(existing) = find_existing_session(client, url, &workdir).await
+        && !existing.is_empty()
+        && tmux_has_session(&existing)
+    {
+        print_launch_banner_reconnecting(&workdir, &existing);
+        let status = std::process::Command::new("tmux")
+            .args(["attach-session", "-t", &existing])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("tmux attach-session exited with failure");
+        }
+        return Ok(());
+    }
+
+    // 2. Register the session with the daemon via the connect endpoint. No
+    //    `prepare_session` and no `install_system_prompt` — `connect` skips the
+    //    entire deployment sequence. When the daemon is unreachable we still
+    //    bring the session up under the folder-derived name.
+    #[derive(Deserialize)]
+    struct Body {
+        #[serde(default)]
+        name: String,
+    }
+    let folder_name = fallback_session_name(&path);
+    let tmux_name = match client
+        .post(format!("{url}/api/v1/sessions/connect"))
+        .json(&serde_json::json!({
+            "workdir": path,
+            "project_path": path,
+            "name": folder_name,
+        }))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(resp) => match resp.json::<Body>().await {
+                Ok(body) if !body.name.is_empty() => body.name,
+                _ => folder_name.clone(),
+            },
+            Err(err) => {
+                eprintln!("warning: daemon rejected session registration: {err}");
+                folder_name.clone()
+            }
+        },
+        Err(err) => {
+            eprintln!("warning: daemon unreachable ({err}); connecting without registration");
+            folder_name.clone()
+        }
+    };
+
+    // 3. Print the summary banner. The "Prompt:" line is "(default)" — `connect`
+    //    writes no system-prompt file.
+    print_launch_banner(&workdir, &tmux_name, None);
+
+    // 4. Create the tmux host idempotently. `new-session -A` attaches to an
+    //    existing session and creates a detached one (`-d`) otherwise; the
+    //    `has-session` probe tells us which happened so `claude` is started
+    //    only for a freshly-created session.
+    let already_running = tmux_has_session(&tmux_name);
+    let new_session = std::process::Command::new("tmux")
+        .args(["new-session", "-A", "-d", "-s", &tmux_name, "-c", &workdir])
+        .status();
+    if !matches!(new_session, Ok(s) if s.success()) {
+        anyhow::bail!("failed to create tmux session {tmux_name} in {workdir}");
+    }
+
+    // 5. Start bare `claude` inside a freshly-created session. `connect` does
+    //    not compose a `--append-system-prompt` — it does no deployment.
+    if !already_running {
+        let send = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &tmux_name, "claude", "Enter"])
+            .status();
+        if !matches!(send, Ok(s) if s.success()) {
+            anyhow::bail!("tmux session {tmux_name} created but failed to start claude");
+        }
+    }
+
+    // 6. Attach — takes over the current terminal until the user detaches.
+    let status = std::process::Command::new("tmux")
+        .args(["attach-session", "-t", &tmux_name])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("tmux attach-session exited with failure");
+    }
+    Ok(())
+}
+
 /// Compute the fallback `tmpm-<folder>` session name for a project directory.
 ///
 /// Why: when the daemon is unreachable `tm launch` still needs a tmux session
@@ -1622,13 +1746,13 @@ fn print_compression_stats(body: &serde_json::Value) {
 
 /// Resolve `target` to a session and either print JSON or open the TUI.
 ///
-/// Why: `tm connect` is the primary ergonomic entry point — operators type a
-/// short name or path rather than a full UUID.
+/// Why: `tm attach` is the ergonomic entry point for an *existing* session —
+/// operators type a short name or path rather than a full UUID.
 /// What: Fetches `/sessions`, resolves via `resolve_target`, then either
 /// serialises to JSON (`--json`) or launches the TUI pre-focused on the match.
 /// Test: Resolution logic is tested in `trusty-mpm-core::connect`; here we
 /// test CLI flag parsing only (see unit tests).
-async fn connect_cmd(
+async fn attach_cmd(
     client: &reqwest::Client,
     url: &str,
     target: &str,
@@ -3146,32 +3270,52 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_connect() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "connect", "frontend"]).unwrap();
+    fn cli_parses_attach() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "attach", "frontend"]).unwrap();
         match cli.command {
-            Command::Connect { target, json } => {
+            Command::Attach { target, json } => {
                 assert_eq!(target, "frontend");
                 assert!(!json);
             }
-            other => panic!("expected Connect, got {other:?}"),
+            other => panic!("expected Attach, got {other:?}"),
         }
     }
 
     #[test]
-    fn cli_parses_connect_with_json() {
-        let cli = Cli::try_parse_from(["trusty-mpm", "connect", "abc-123", "--json"]).unwrap();
+    fn cli_parses_attach_with_json() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "attach", "abc-123", "--json"]).unwrap();
         match cli.command {
-            Command::Connect { target, json } => {
+            Command::Attach { target, json } => {
                 assert_eq!(target, "abc-123");
                 assert!(json);
             }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_attach_requires_target() {
+        assert!(Cli::try_parse_from(["trusty-mpm", "attach"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_connect() {
+        // `tm connect` is the no-deployment session starter; it takes an
+        // optional project directory, exactly like `tm launch`.
+        let cli = Cli::try_parse_from(["trusty-mpm", "connect"]).unwrap();
+        match cli.command {
+            Command::Connect { dir } => assert_eq!(dir, None),
             other => panic!("expected Connect, got {other:?}"),
         }
     }
 
     #[test]
-    fn cli_connect_requires_target() {
-        assert!(Cli::try_parse_from(["trusty-mpm", "connect"]).is_err());
+    fn cli_parses_connect_with_dir() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "connect", "/work/p"]).unwrap();
+        match cli.command {
+            Command::Connect { dir } => assert_eq!(dir.as_deref(), Some("/work/p")),
+            other => panic!("expected Connect, got {other:?}"),
+        }
     }
 
     #[test]

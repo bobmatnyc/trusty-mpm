@@ -194,6 +194,19 @@ pub enum CommandResult {
     AlertSubscriptions(Vec<String>),
     /// `/doctor` — the full system diagnostic report.
     Doctor(trusty_mpm_core::doctor::DoctorReport),
+    /// `/launch` or `/connect` — a Claude Code session was started or attached.
+    ///
+    /// Why: both commands report the same outcome — a named tmux session is now
+    /// running — and `deployed` tells the UI whether the framework-deployment
+    /// sequence was run (`launch`) or skipped (`connect`).
+    SessionStarted {
+        /// The tmux session name that is now running.
+        session: String,
+        /// Project directory the session runs in.
+        workdir: String,
+        /// True when the framework was deployed (`launch`); false for `connect`.
+        deployed: bool,
+    },
     /// `/help` — the command list text.
     Help(String),
     /// Any failure rendered as a message rather than a panic.

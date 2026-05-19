@@ -158,6 +158,31 @@ async fn register_and_remove_session() {
 }
 
 #[tokio::test]
+async fn connect_session_registers_without_deploy() {
+    // `POST /api/v1/sessions/connect` performs the same daemon-side
+    // bookkeeping as `POST /sessions` — it registers the session and returns
+    // its id and friendly name. The daemon never deploys framework artifacts
+    // in either path; the connect/launch distinction lives in the client.
+    let state = DaemonState::shared();
+    let Json(body) = connect_session(
+        State(Arc::clone(&state)),
+        Json(RegisterSession {
+            workdir: "/tmp/connect".into(),
+            project_path: Some("/tmp/connect".into()),
+            name: Some("tmpm-connect".into()),
+        }),
+    )
+    .await;
+    assert_eq!(body.name, "tmpm-connect");
+    let listed = state.list_sessions();
+    let session = listed
+        .iter()
+        .find(|s| s.id == body.id)
+        .expect("session registered via connect");
+    assert_eq!(session.workdir, "/tmp/connect");
+}
+
+#[tokio::test]
 async fn registered_session_has_friendly_tmux_name() {
     // A registered session must carry a `tmpm-<adj>-<noun>` tmux name
     // derived from its UUID, not the legacy `trusty-mpm-<uuid>` form.

@@ -31,6 +31,7 @@ use utoipa::OpenApi;
         crate::api::health,
         crate::api::list_sessions,
         crate::api::register_session,
+        crate::api::connect_session,
         crate::api::remove_session,
         crate::api::reap_sessions,
         crate::api::set_session_pid,

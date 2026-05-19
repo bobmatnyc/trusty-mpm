@@ -86,6 +86,8 @@ impl CommandExecutor {
             TrustyCommand::Snapshot { session } => self.snapshot(&session).await,
             TrustyCommand::Kill { session_id } => self.kill(&session_id).await,
             TrustyCommand::Send { session, prompt } => self.send(&session, &prompt).await,
+            TrustyCommand::Launch { project, .. } => self.launch(&project).await,
+            TrustyCommand::Connect { project, .. } => self.connect(&project).await,
             TrustyCommand::Start => self.pair_state().await,
             TrustyCommand::Doctor => self.doctor().await,
             TrustyCommand::Pair { code: None } => self.pair_state().await,
@@ -381,6 +383,47 @@ impl CommandExecutor {
             },
             Ok(None) => CommandResult::Error(format!("session {session} not found")),
             Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
+        }
+    }
+
+    /// `/launch` — deploy the framework, then start or attach to a session.
+    ///
+    /// Why: `tm launch` (and a future `/launch` on other UIs) is the full entry
+    /// point — it runs `prepare_session` to deploy instructions, agents, and
+    /// skills before bringing the tmux-hosted session up.
+    /// What: calls [`DaemonClient::launch_session`], which runs the deployment
+    /// sequence and then registers + starts the tmux session.
+    /// Test: `execute_launch_errors_when_daemon_unreachable`.
+    async fn launch(&self, project: &std::path::Path) -> CommandResult {
+        let workdir = project.to_string_lossy().to_string();
+        match self.client.launch_session(&workdir).await {
+            Ok(session) => CommandResult::SessionStarted {
+                session,
+                workdir,
+                deployed: true,
+            },
+            Err(e) => CommandResult::Error(format!("launch failed: {e}")),
+        }
+    }
+
+    /// `/connect` — start or attach to a session *without* deploying anything.
+    ///
+    /// Why: `tm connect` is the lightweight sibling of `/launch`. It skips the
+    /// `prepare_session` deployment sequence and only ensures the tmux-hosted
+    /// session is running — idempotent: create when absent, attach when present.
+    /// What: calls [`DaemonClient::connect_session`], which registers the
+    /// session via `POST /api/v1/sessions/connect` and runs `tmux new-session
+    /// -A` without any artifact deployment.
+    /// Test: `execute_connect_errors_when_daemon_unreachable`.
+    async fn connect(&self, project: &std::path::Path) -> CommandResult {
+        let workdir = project.to_string_lossy().to_string();
+        match self.client.connect_session(&workdir).await {
+            Ok(session) => CommandResult::SessionStarted {
+                session,
+                workdir,
+                deployed: false,
+            },
+            Err(e) => CommandResult::Error(format!("connect failed: {e}")),
         }
     }
 
@@ -773,6 +816,40 @@ mod tests {
             .await
         {
             CommandResult::Error(msg) => assert!(msg.contains("not found")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_connect_errors_when_daemon_unreachable() {
+        // `/connect` registers via `POST /api/v1/sessions/connect`; with no
+        // daemon the failure surfaces as a renderable `Error`, never a panic.
+        let executor = CommandExecutor::new("http://127.0.0.1:0");
+        match executor
+            .execute(TrustyCommand::Connect {
+                project: "/tmp/no-such-project".into(),
+                session_name: None,
+            })
+            .await
+        {
+            CommandResult::Error(msg) => assert!(msg.contains("connect failed")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_launch_errors_when_daemon_unreachable() {
+        // `/launch` registers via `POST /sessions`; with no daemon the failure
+        // surfaces as a renderable `Error`.
+        let executor = CommandExecutor::new("http://127.0.0.1:0");
+        match executor
+            .execute(TrustyCommand::Launch {
+                project: "/tmp/no-such-project".into(),
+                session_name: None,
+            })
+            .await
+        {
+            CommandResult::Error(msg) => assert!(msg.contains("launch failed")),
             other => panic!("expected Error, got {other:?}"),
         }
     }

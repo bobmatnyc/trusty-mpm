@@ -10,6 +10,8 @@
 //! Test: `cargo test -p trusty-mpm-client` covers the executor; conversions are
 //! tested in the UI crates.
 
+use std::path::PathBuf;
+
 /// A UI-agnostic operator command.
 ///
 /// Why: a typed command is the shared contract between every UI and the
@@ -87,6 +89,33 @@ pub enum TrustyCommand {
         /// The prompt line to type into the session's tmux pane.
         prompt: String,
     },
+    /// Launch a Claude Code session, running the full framework-deployment
+    /// sequence first.
+    ///
+    /// Why: `tm launch` is the full entry point — it deploys instructions,
+    /// agents, and skills into the project (`prepare_session`) before starting
+    /// or attaching to the tmux-hosted session.
+    /// What: the project directory to launch in and an optional explicit tmux
+    /// session name (the daemon derives one from the folder when `None`).
+    Launch {
+        /// Project directory to launch the session in.
+        project: PathBuf,
+        /// Optional explicit tmux session name.
+        session_name: Option<String>,
+    },
+    /// Connect to — or start — a Claude Code session *without* deploying the
+    /// framework.
+    ///
+    /// Why: `tm connect` is the lightweight sibling of `Launch`. It skips the
+    /// deployment sequence entirely and only starts (or attaches to) the
+    /// tmux-hosted session — idempotent: create when absent, attach when not.
+    /// What: the project directory and an optional explicit tmux session name.
+    Connect {
+        /// Project directory to connect the session to.
+        project: PathBuf,
+        /// Optional explicit tmux session name.
+        session_name: Option<String>,
+    },
     /// First-contact command: report pairing status and onboarding guidance.
     Start,
     /// Run the full trusty-mpm system diagnostic.
@@ -120,6 +149,7 @@ pub fn help_text() -> &'static str {
      /snapshot <session> — capture a tmux pane\n\
      /kill <id> — kill a session\n\
      /send <session> <prompt> — send a prompt to a Claude Code session\n\
+     /connect <path> — connect to or start a session (no deployment)\n\
      /alerts — show alert subscriptions\n\
      /pair <code> — pair this bot with your daemon\n\
      /start — pairing status and onboarding\n\
@@ -148,6 +178,7 @@ mod tests {
             "/snapshot",
             "/kill",
             "/send",
+            "/connect",
             "/alerts",
             "/pair",
             "/start",

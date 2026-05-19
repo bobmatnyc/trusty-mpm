@@ -942,6 +942,103 @@ impl DaemonClient {
         }
         Ok(body.name)
     }
+
+    /// Connect to — or start — a Claude Code session in `workdir` *without*
+    /// running the framework-deployment sequence.
+    ///
+    /// Why: `tm connect` is the lightweight sibling of `launch_session`. Where
+    /// `launch_session` first runs
+    /// [`trusty_mpm_core::session_launch::prepare_session`] to deploy
+    /// instructions, agents, and skills into the project, `connect` deliberately
+    /// skips all of that — it assumes the framework is already deployed (or that
+    /// the operator does not want it touched) and only wants the daemon to know
+    /// about the session and the tmux host to be running.
+    /// What: POSTs `{workdir, project_path}` to `/api/v1/sessions/connect`, then
+    /// runs `tmux new-session -A` (idempotent — creates the session when absent,
+    /// no-ops when it already exists). When the session is freshly created it
+    /// starts `claude` in it via `tmux send-keys`; an already-running session is
+    /// left untouched. The system-prompt file is still built and passed so a
+    /// freshly-started `claude` is a configured PM — that is prompt composition,
+    /// not artifact deployment. Returns the daemon-assigned tmux session name.
+    /// Test: `connect_session_errors_when_daemon_unreachable`.
+    pub async fn connect_session(&self, workdir: &str) -> anyhow::Result<String> {
+        #[derive(Deserialize)]
+        struct Body {
+            #[serde(default)]
+            name: String,
+        }
+        let url = format!("{}/api/v1/sessions/connect", self.base);
+        let body: Body = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "workdir": workdir,
+                "project_path": workdir,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        // Build the `--append-system-prompt` text so a freshly-started `claude`
+        // is a configured PM. This is prompt composition from bundled assets,
+        // not deployment of agents/skills/hooks into the project — `connect`
+        // only skips the latter (`prepare_session`).
+        let claude_cmd = match trusty_mpm_core::session_launch::build_system_prompt() {
+            Some(prompt) => {
+                let path = std::env::temp_dir().join(format!(
+                    "trusty-mpm-system-prompt-{}.txt",
+                    uuid::Uuid::new_v4()
+                ));
+                match std::fs::write(&path, &prompt) {
+                    Ok(()) => format!("claude --append-system-prompt-file {}", path.display()),
+                    Err(err) => {
+                        tracing::warn!(%err, "failed to write system prompt file; launching bare claude");
+                        "claude".to_string()
+                    }
+                }
+            }
+            None => "claude".to_string(),
+        };
+
+        // `tmux new-session -A` is idempotent: it attaches to the session when
+        // it already exists and creates it (detached, `-d`) otherwise. The
+        // `has-session` probe distinguishes the two so `claude` is started only
+        // for a freshly-created session — an already-running one is left alone.
+        let already_running = std::process::Command::new("tmux")
+            .args(["has-session", "-t", &body.name])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        let new_session = std::process::Command::new("tmux")
+            .args(["new-session", "-A", "-d", "-s", &body.name, "-c", workdir])
+            .status();
+        match new_session {
+            Ok(status) if status.success() => {
+                if !already_running {
+                    let send = std::process::Command::new("tmux")
+                        .args(["send-keys", "-t", &body.name, &claude_cmd, "Enter"])
+                        .status();
+                    if !matches!(send, Ok(s) if s.success()) {
+                        return Err(anyhow::anyhow!(
+                            "tmux session {} created but failed to start claude",
+                            body.name
+                        ));
+                    }
+                }
+            }
+            Ok(_) | Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "failed to create tmux session {} in {}",
+                    body.name,
+                    workdir
+                ));
+            }
+        }
+        Ok(body.name)
+    }
 }
 
 /// Render a tmux snapshot JSON value as a flat text block.
@@ -994,6 +1091,17 @@ mod tests {
         let client = DaemonClient::new("http://127.0.0.1:0");
         let result = client.launch_session("/tmp/no-such-project").await;
         assert!(result.is_err(), "expected launch to fail with no daemon");
+    }
+
+    #[tokio::test]
+    async fn connect_session_errors_when_daemon_unreachable() {
+        // Why: `tm connect` registers via `POST /api/v1/sessions/connect`
+        // before touching tmux; when the daemon POST fails the error must
+        // surface rather than proceeding to spawn tmux against an
+        // unregistered session.
+        let client = DaemonClient::new("http://127.0.0.1:0");
+        let result = client.connect_session("/tmp/no-such-project").await;
+        assert!(result.is_err(), "expected connect to fail with no daemon");
     }
 
     #[test]
