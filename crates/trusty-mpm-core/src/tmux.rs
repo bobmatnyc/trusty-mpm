@@ -64,7 +64,10 @@ impl TmuxTarget {
 /// Test: see the per-variant tests in this module.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TmuxCommand {
-    /// `new-session -d -s <name> [-c <dir>]` — create a detached session.
+    /// `new-session -A -d -s <name> [-c <dir>]` — create a detached session,
+    /// or attach to it if a session with the same name already exists (the
+    /// `-A` flag makes the command idempotent rather than failing on a
+    /// duplicate session name).
     NewSession {
         /// Session name.
         name: String,
@@ -135,8 +138,12 @@ pub const PANE_LIST_FORMAT: &str = "#{pane_id}:#{pane_active}";
 pub fn tmux_argv(cmd: &TmuxCommand) -> Vec<String> {
     match cmd {
         TmuxCommand::NewSession { name, workdir } => {
+            // `-A` attaches to an existing session of the same name instead
+            // of failing with "duplicate session"; combined with `-d` it
+            // stays detached, making session creation idempotent.
             let mut argv = vec![
                 "new-session".to_string(),
+                "-A".to_string(),
                 "-d".to_string(),
                 "-s".to_string(),
                 name.clone(),
@@ -228,7 +235,15 @@ mod tests {
         });
         assert_eq!(
             argv,
-            ["new-session", "-d", "-s", "trusty-mpm-1", "-c", "/tmp/proj"]
+            [
+                "new-session",
+                "-A",
+                "-d",
+                "-s",
+                "trusty-mpm-1",
+                "-c",
+                "/tmp/proj"
+            ]
         );
     }
 
@@ -238,7 +253,7 @@ mod tests {
             name: "s".into(),
             workdir: None,
         });
-        assert_eq!(argv, ["new-session", "-d", "-s", "s"]);
+        assert_eq!(argv, ["new-session", "-A", "-d", "-s", "s"]);
     }
 
     #[test]

@@ -127,6 +127,10 @@ impl TmuxDriver {
     }
 
     /// Create a detached tmux session named `name`, optionally in `workdir`.
+    ///
+    /// Idempotent: if a session with the same name already exists, the
+    /// underlying `tmux new-session -A` attaches to it instead of failing
+    /// with a "duplicate session" error.
     pub fn create_session(&self, name: &str, workdir: Option<&str>) -> Result<()> {
         self.run(&TmuxCommand::NewSession {
             name: name.to_string(),
