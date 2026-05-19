@@ -130,6 +130,14 @@ pub fn prepare_session(fw: &FrameworkPaths, project_dir: &Path) -> Result<PrepRe
         }
     };
 
+    // Inject the `trusty-memory` MCP server into the project's `.mcp.json` so
+    // the launched `claude` process can reach the memory tools (`memory_recall`,
+    // `memory_store`, …). Non-fatal: the session still launches, it just lacks
+    // the memory tools.
+    if let Err(err) = inject_trusty_memory_mcp(project_dir) {
+        tracing::warn!("failed to inject trusty-memory MCP server: {err}");
+    }
+
     // Remove the now-redundant global `trusty-memory` hook entries so they no
     // longer fire for every Claude Code session (including claude-mpm). The
     // project hooks above scope them to trusty-mpm sessions. Non-fatal.
@@ -267,8 +275,11 @@ fn write_output_style(project_dir: &Path) -> Result<(), PrepError> {
 /// Why: these hooks must fire only for trusty-mpm-managed sessions, not for
 /// every Claude Code instance on the machine. Writing them at the project
 /// level (rather than `~/.claude/settings.json`) scopes them to projects
-/// prepared by trusty-mpm. The block covers all four Claude Code hook event
-/// types so memory captures the full session lifecycle.
+/// prepared by trusty-mpm. The block covers the `PostToolUse`, `Stop`, and
+/// `UserPromptSubmit` events — the `trusty-memory` binary does not implement a
+/// `claude.pre-tool-use` handler, so a `PreToolUse` hook would only error on
+/// every tool call. These three events capture the session lifecycle for
+/// memory.
 const TRUSTY_MEMORY_HOOKS: &str = r#"{
   "PostToolUse": [
     {
@@ -277,18 +288,6 @@ const TRUSTY_MEMORY_HOOKS: &str = r#"{
         {
           "type": "command",
           "command": "trusty-memory hooks fire claude.post-tool-use",
-          "timeout": 60
-        }
-      ]
-    }
-  ],
-  "PreToolUse": [
-    {
-      "matcher": "*",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "trusty-memory hooks fire claude.pre-tool-use",
           "timeout": 60
         }
       ]
@@ -361,6 +360,76 @@ fn write_project_hooks(project_dir: &Path) -> Result<(), PrepError> {
         .map_err(|err| PrepError::Deploy(err.to_string()))?;
     std::fs::write(&settings_path, serialized).map_err(|source| PrepError::Io {
         path: settings_path.clone(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// The `trusty-memory` MCP server definition injected into a project's
+/// `.mcp.json`.
+///
+/// Why: Claude Code reads MCP servers from `<project>/.mcp.json`; a launched
+/// trusty-mpm session needs the `trusty-memory` server registered there so the
+/// memory tools (`memory_recall`, `memory_store`, …) are available.
+const TRUSTY_MEMORY_MCP_SERVER: &str = r#"{
+  "type": "stdio",
+  "command": "trusty-memory",
+  "args": ["mcp", "serve"]
+}"#;
+
+/// Inject the `trusty-memory` MCP server into the project's `.mcp.json`.
+///
+/// Why: `prepare_session` configures hooks and instructions but, without this,
+/// the launched `claude` process has no access to the memory tools because the
+/// `trusty-memory` MCP server is never registered in `<project>/.mcp.json`.
+/// What: reads an existing `<project_path>/.mcp.json` (starting from `{}` when
+/// absent or malformed), adds/updates the `trusty-memory` entry under
+/// `mcpServers` with [`TRUSTY_MEMORY_MCP_SERVER`], and writes the merged JSON
+/// back pretty-printed — preserving all other MCP servers. Idempotent: if the
+/// entry already matches, the file is left untouched.
+/// Test: `inject_trusty_memory_mcp_adds_server`,
+/// `inject_trusty_memory_mcp_preserves_existing`,
+/// `inject_trusty_memory_mcp_is_idempotent`.
+fn inject_trusty_memory_mcp(project_path: &Path) -> Result<(), PrepError> {
+    let mcp_path = project_path.join(".mcp.json");
+
+    // Load existing config to preserve unrelated servers; tolerate a missing or
+    // malformed file by starting from an empty object.
+    let mut config = match std::fs::read_to_string(&mcp_path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+        Err(_) => serde_json::Value::Object(serde_json::Map::new()),
+    };
+
+    // The bundled server block is a constant and is guaranteed to parse.
+    let server: serde_json::Value = serde_json::from_str(TRUSTY_MEMORY_MCP_SERVER)
+        .expect("bundled trusty-memory MCP server block is valid JSON");
+
+    // Ensure `mcpServers` is an object we can insert into.
+    let servers = config
+        .as_object_mut()
+        .expect("config starts as an object")
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !servers.is_object() {
+        *servers = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let servers = servers
+        .as_object_mut()
+        .expect("mcpServers normalized to an object");
+
+    // Idempotent: skip the write when the entry already matches.
+    if servers.get("trusty-memory") == Some(&server) {
+        return Ok(());
+    }
+    servers.insert("trusty-memory".to_string(), server);
+
+    let serialized =
+        serde_json::to_string_pretty(&config).map_err(|err| PrepError::Deploy(err.to_string()))?;
+    std::fs::write(&mcp_path, serialized).map_err(|source| PrepError::Io {
+        path: mcp_path.clone(),
         source,
     })?;
     Ok(())
@@ -603,7 +672,9 @@ mod tests {
     #[test]
     fn write_project_hooks_writes_all_event_types() {
         // Why: the trusty-memory hooks must be scoped to the project and cover
-        // the full session lifecycle — all four Claude Code hook events.
+        // the session lifecycle — PostToolUse, Stop, and UserPromptSubmit.
+        // PreToolUse is intentionally absent: trusty-memory has no
+        // `claude.pre-tool-use` handler.
         let tmp = tempdir().unwrap();
         let project = tmp.path();
 
@@ -614,7 +685,7 @@ mod tests {
         )
         .unwrap();
         let hooks = value["hooks"].as_object().expect("hooks must be an object");
-        for event in ["PostToolUse", "PreToolUse", "Stop", "UserPromptSubmit"] {
+        for event in ["PostToolUse", "Stop", "UserPromptSubmit"] {
             let groups = hooks[event]
                 .as_array()
                 .unwrap_or_else(|| panic!("{event} must be an array"));
@@ -627,6 +698,26 @@ mod tests {
                 "{event} command must invoke trusty-memory"
             );
         }
+    }
+
+    #[test]
+    fn write_project_hooks_omits_pre_tool_use() {
+        // Why: trusty-memory has no `claude.pre-tool-use` handler, so a
+        // PreToolUse hook would error on every tool call. The written hooks
+        // block must not register one.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+
+        write_project_hooks(project).expect("write succeeds");
+
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(project.join(".claude").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            value["hooks"].get("PreToolUse").is_none(),
+            "PreToolUse hook must not be registered"
+        );
     }
 
     #[test]
@@ -660,6 +751,106 @@ mod tests {
         assert_eq!(
             value["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn inject_trusty_memory_mcp_adds_server() {
+        // Why: a launched session needs the `trusty-memory` MCP server in
+        // `.mcp.json` for the memory tools to be available; injection must
+        // create the file with the server registered.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+
+        inject_trusty_memory_mcp(project).expect("injection succeeds");
+
+        let mcp_path = project.join(".mcp.json");
+        assert!(mcp_path.exists(), ".mcp.json must be created");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        let server = &value["mcpServers"]["trusty-memory"];
+        assert_eq!(server["type"], serde_json::json!("stdio"));
+        assert_eq!(server["command"], serde_json::json!("trusty-memory"));
+        assert_eq!(server["args"], serde_json::json!(["mcp", "serve"]));
+    }
+
+    #[test]
+    fn inject_trusty_memory_mcp_preserves_existing() {
+        // Why: injection must not clobber MCP servers the operator already
+        // configured (e.g. `trusty-search`).
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join(".mcp.json"),
+            r#"{"mcpServers":{"trusty-search":{"type":"stdio","command":"trusty-search","args":["serve"]}}}"#,
+        )
+        .unwrap();
+
+        inject_trusty_memory_mcp(project).expect("injection succeeds");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(project.join(".mcp.json")).unwrap())
+                .unwrap();
+        let servers = value["mcpServers"]
+            .as_object()
+            .expect("mcpServers must be an object");
+        assert!(
+            servers.contains_key("trusty-search"),
+            "existing server must survive injection"
+        );
+        assert!(
+            servers.contains_key("trusty-memory"),
+            "trusty-memory must be injected"
+        );
+        assert_eq!(
+            value["mcpServers"]["trusty-search"]["command"],
+            serde_json::json!("trusty-search")
+        );
+    }
+
+    #[test]
+    fn inject_trusty_memory_mcp_is_idempotent() {
+        // Why: `/connect` and `tm session start` may run repeatedly; a second
+        // injection must not duplicate or alter the `trusty-memory` entry.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+
+        inject_trusty_memory_mcp(project).expect("first injection succeeds");
+        let after_first = std::fs::read_to_string(project.join(".mcp.json")).expect("file exists");
+
+        inject_trusty_memory_mcp(project).expect("second injection succeeds");
+        let after_second = std::fs::read_to_string(project.join(".mcp.json")).expect("file exists");
+
+        assert_eq!(
+            after_first, after_second,
+            "re-injecting must leave the file unchanged"
+        );
+        let value: serde_json::Value = serde_json::from_str(&after_second).unwrap();
+        assert_eq!(
+            value["mcpServers"].as_object().unwrap().len(),
+            1,
+            "trusty-memory must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn prepare_session_injects_trusty_memory_mcp() {
+        // Why: `prepare_session` is the single launch-prep entry point; it must
+        // register the trusty-memory MCP server so launched sessions get the
+        // memory tools.
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        let fw = FrameworkPaths::default();
+
+        prepare_session(&fw, project).expect("prep succeeds");
+
+        let mcp_path = project.join(".mcp.json");
+        assert!(mcp_path.exists(), ".mcp.json must exist after prep");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        assert_eq!(
+            value["mcpServers"]["trusty-memory"]["command"],
+            serde_json::json!("trusty-memory")
         );
     }
 
