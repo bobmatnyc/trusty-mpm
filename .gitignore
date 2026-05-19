@@ -16,6 +16,7 @@ Cargo.lock.bak
 .claude-mpm/
 .claude/
 .fastembed_cache/
+.mcp.json
 
 # Tauri-generated build artifacts (regenerated on every GUI build)
 crates/trusty-mpm-gui/gen/schemas/
