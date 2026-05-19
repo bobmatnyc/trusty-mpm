@@ -5282,7 +5282,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-cli"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -5303,7 +5303,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-client"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -5320,7 +5320,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-core"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5343,7 +5343,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-daemon"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5380,7 +5380,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-gui"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -5393,7 +5393,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-mcp"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5411,7 +5411,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-telegram"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -5431,7 +5431,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-tui"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "clap",
