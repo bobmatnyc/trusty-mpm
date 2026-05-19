@@ -387,7 +387,9 @@ mod tests {
         assert!(prompt.contains("\n\n---\n\n"));
         // BASE_PM is the non-overridable floor: it must come last.
         let base = prompt.find("# BASE_PM Framework Floor").expect("base_pm");
-        let delegation = prompt.find("# Agent Delegation Routing").expect("delegation");
+        let delegation = prompt
+            .find("# Agent Delegation Routing")
+            .expect("delegation");
         assert!(base > delegation, "BASE_PM floor must be appended last");
         // Ticketing-specific content was stripped from the bundled assets.
         assert!(!prompt.contains("mcp__mcp-ticketer__"));

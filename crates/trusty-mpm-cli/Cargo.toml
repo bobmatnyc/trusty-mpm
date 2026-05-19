@@ -20,6 +20,10 @@ path = "src/main.rs"
 # `--no-default-features` to avoid GTK native deps. trusty-mpm-gui is not
 # published to crates.io (publish = false) so it cannot be a dep here.
 default = []
+# Declare the feature so cfg(feature = "gui") guards in main.rs compile cleanly.
+# The trusty-mpm-gui dep is intentionally omitted (publish=false, Tauri build.rs
+# writes outside OUT_DIR). Enable via a local .cargo/config.toml override only.
+gui = []
 
 [dependencies]
 # Internal crates — the unified binary embeds every mode (daemon, TUI, Telegram).
