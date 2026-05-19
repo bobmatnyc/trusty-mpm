@@ -16,10 +16,10 @@ name = "tm"
 path = "src/main.rs"
 
 [features]
-# `gui` is enabled by default for local/release builds. CI builds with
-# `--no-default-features` (or excludes this crate) to avoid GTK native deps.
-default = ["gui"]
-gui = ["dep:trusty-mpm-gui"]
+# `gui` is enabled by default for local builds. CI and crates.io builds use
+# `--no-default-features` to avoid GTK native deps. trusty-mpm-gui is not
+# published to crates.io (publish = false) so it cannot be a dep here.
+default = []
 
 [dependencies]
 # Internal crates — the unified binary embeds every mode (daemon, TUI, Telegram).
@@ -28,9 +28,6 @@ trusty-mpm-client.workspace = true
 trusty-mpm-daemon = { path = "../trusty-mpm-daemon", version = "0.2.1" }
 trusty-mpm-tui = { path = "../trusty-mpm-tui", version = "0.2.1" }
 trusty-mpm-telegram = { path = "../trusty-mpm-telegram", version = "0.2.1" }
-# Optional: the Tauri GUI pulls in GTK/glib native libs that are unavailable on
-# CI runners. Gated behind the `gui` feature so headless builds (CI) can skip it.
-trusty-mpm-gui = { path = "../trusty-mpm-gui", version = "0.2.1", optional = true }
 
 tokio.workspace = true
 # Async (not blocking) reqwest: `#[tokio::main]` covers every subcommand, so the
