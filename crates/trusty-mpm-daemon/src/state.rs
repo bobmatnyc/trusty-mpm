@@ -866,7 +866,11 @@ mod tests {
     use trusty_mpm_core::session::{ControlModel, SessionStatus};
 
     fn sample_session() -> Session {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut s = Session::new(SessionId::new(), "/tmp/p", ControlModel::Tmux, None);
+        s.tmux_name = format!("tmpm-test-{n}");
         s.status = SessionStatus::Active;
         s
     }
