@@ -87,6 +87,7 @@ impl CommandExecutor {
             TrustyCommand::Kill { session_id } => self.kill(&session_id).await,
             TrustyCommand::Send { session, prompt } => self.send(&session, &prompt).await,
             TrustyCommand::Start => self.pair_state().await,
+            TrustyCommand::Doctor => self.doctor().await,
             TrustyCommand::Pair { code: None } => self.pair_state().await,
             TrustyCommand::Pair { code: Some(_) } => {
                 // A code-carrying pair requires the caller's chat id, which is
@@ -383,6 +384,26 @@ impl CommandExecutor {
         }
     }
 
+    /// `/doctor` — run the full system diagnostic.
+    ///
+    /// Why: a single command that confirms the whole trusty-mpm stack is wired
+    /// correctly; every UI funnels `/doctor` here so the report is identical.
+    /// What: resolves the process cwd as the project to scope the instruction
+    /// probe, calls `GET /api/v1/doctor`, and maps the result to
+    /// [`CommandResult::Doctor`]; an unreachable daemon becomes an `Error`.
+    /// Test: `execute_doctor_against_test_daemon`.
+    async fn doctor(&self) -> CommandResult {
+        // The instruction-pipeline probe is project-scoped; the process cwd is
+        // the best "current project" guess a stateless executor can offer.
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string());
+        match self.client.doctor(cwd.as_deref()).await {
+            Ok(report) => CommandResult::Doctor(report),
+            Err(e) => CommandResult::Error(format!("daemon unreachable: {e}")),
+        }
+    }
+
     /// `/start` and `/pair` (no code) — query the pairing status.
     async fn pair_state(&self) -> CommandResult {
         match self.client.pair_status().await {
@@ -644,6 +665,19 @@ mod tests {
                 assert_eq!(path, "/work/discovered-demo");
             }
             other => panic!("expected ProjectRegistered, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_doctor_against_test_daemon() {
+        // `/doctor` returns a five-check report against a live daemon.
+        let (_state, url) = spawn_test_daemon().await;
+        let executor = CommandExecutor::new(url);
+        match executor.execute(TrustyCommand::Doctor).await {
+            CommandResult::Doctor(report) => {
+                assert_eq!(report.checks.len(), 5);
+            }
+            other => panic!("expected Doctor, got {other:?}"),
         }
     }
 

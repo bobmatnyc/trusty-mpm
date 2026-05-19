@@ -192,6 +192,8 @@ pub enum CommandResult {
     },
     /// `/alerts` — the current alert subscription, one line per entry.
     AlertSubscriptions(Vec<String>),
+    /// `/doctor` — the full system diagnostic report.
+    Doctor(trusty_mpm_core::doctor::DoctorReport),
     /// `/help` — the command list text.
     Help(String),
     /// Any failure rendered as a message rather than a panic.

@@ -89,6 +89,13 @@ pub enum TrustyCommand {
     },
     /// First-contact command: report pairing status and onboarding guidance.
     Start,
+    /// Run the full trusty-mpm system diagnostic.
+    ///
+    /// Why: `/doctor` verifies the whole stack — instructions, agents, skills,
+    /// memory, and search — in one command so an operator can confirm a
+    /// healthy install without inspecting each piece by hand.
+    /// What: triggers `GET /api/v1/doctor` and renders the resulting report.
+    Doctor,
     /// Show the command list.
     Help,
 }
@@ -116,6 +123,7 @@ pub fn help_text() -> &'static str {
      /alerts — show alert subscriptions\n\
      /pair <code> — pair this bot with your daemon\n\
      /start — pairing status and onboarding\n\
+     /doctor — run full system diagnostic\n\
      /help — this message"
 }
 
@@ -143,6 +151,7 @@ mod tests {
             "/alerts",
             "/pair",
             "/start",
+            "/doctor",
             "/help",
         ] {
             assert!(text.contains(cmd), "help text missing {cmd}");

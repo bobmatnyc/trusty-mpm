@@ -96,6 +96,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/pair/confirm", post(pair_confirm))
         .route("/pair/status", get(pair_status))
         .route("/pair/reset", post(pair_reset))
+        .route("/api/v1/doctor", get(doctor))
         .merge(
             SwaggerUi::new("/api-docs")
                 .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
@@ -1132,6 +1133,47 @@ pub async fn pair_status(
 pub async fn pair_reset(State(state): State<Arc<DaemonState>>) -> Json<PairResetResponse> {
     PairingService::new(&state).reset();
     Json(PairResetResponse { reset: true })
+}
+
+// ---- diagnostics --------------------------------------------------------
+
+/// Query parameters for `GET /api/v1/doctor`.
+///
+/// Why: the instruction-pipeline probe must be scoped to a specific project
+/// (`<project>/.trusty-mpm/last-instructions.md`); the daemon cannot see the
+/// caller's cwd, so the CLI passes the resolved path here.
+/// What: an optional `project` path; when absent the instruction probe reports
+/// a warning rather than a definitive result.
+/// Test: `doctor_endpoint_returns_report`.
+#[derive(serde::Deserialize, Default)]
+pub struct DoctorQuery {
+    /// Optional project directory to scope the instruction-pipeline probe to.
+    pub project: Option<PathBuf>,
+}
+
+/// `GET /api/v1/doctor` — run the full trusty-mpm stack diagnostic.
+///
+/// Why: a misconfigured stack fails in confusing ways; one endpoint that runs
+/// every "is this wired correctly?" probe gives operators (and the `tm doctor`
+/// CLI / Telegram `/doctor` command) a single actionable verdict.
+/// What: delegates to [`crate::doctor::run_doctor`], which probes the
+/// instruction pipeline, agent and skill deployment, and the trusty-memory /
+/// trusty-search sidecars, and returns the assembled [`DoctorReport`] as JSON.
+/// The endpoint always returns `200` — individual failures live in the report's
+/// per-check statuses, not the HTTP status.
+/// Test: `doctor_endpoint_returns_report`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/doctor",
+    tag = "config",
+    params(("project" = Option<String>, Query, description = "Project directory to scope the instruction probe to")),
+    responses((status = 200, description = "Full diagnostic report"))
+)]
+pub async fn doctor(
+    State(_state): State<Arc<DaemonState>>,
+    Query(query): Query<DoctorQuery>,
+) -> Json<trusty_mpm_core::doctor::DoctorReport> {
+    Json(crate::doctor::run_doctor(query.project.as_deref()).await)
 }
 
 /// Parse a UUID string into a `SessionId`, mapping failure to a `400`-mapped

@@ -823,6 +823,28 @@ impl DaemonClient {
         Ok(body)
     }
 
+    /// Run the full system diagnostic via `GET /api/v1/doctor`.
+    ///
+    /// Why: the `tm doctor` CLI command and the Telegram `/doctor` command both
+    /// need the daemon's verdict on whether the trusty-mpm stack is correctly
+    /// wired; this is the one transport call behind both.
+    /// What: `GET /api/v1/doctor`, passing the caller's `project` path so the
+    /// daemon can scope the instruction-pipeline probe. Returns the parsed
+    /// [`DoctorReport`]; `Err` on a transport or decode failure.
+    /// Test: covered by the executor's doctor test.
+    pub async fn doctor(
+        &self,
+        project: Option<&str>,
+    ) -> anyhow::Result<trusty_mpm_core::doctor::DoctorReport> {
+        let url = format!("{}/api/v1/doctor", self.base);
+        let mut request = self.http.get(&url);
+        if let Some(project) = project {
+            request = request.query(&[("project", project)]);
+        }
+        let report = request.send().await?.error_for_status()?.json().await?;
+        Ok(report)
+    }
+
     /// Launch a fresh Claude Code session in `workdir`.
     ///
     /// Why: the TUI's `/connect <dir>` command is the single entry point for

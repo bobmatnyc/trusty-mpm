@@ -66,6 +66,7 @@ use utoipa::OpenApi;
         crate::api::pair_confirm,
         crate::api::pair_status,
         crate::api::pair_reset,
+        crate::api::doctor,
     ),
     components(schemas(
         trusty_mpm_core::session::Session,

@@ -77,6 +77,9 @@ pub enum TelegramCommand {
     /// Start and pair — `/start [code]`.
     #[command(description = "Start and pair")]
     Start(String),
+    /// Run a full system diagnostic.
+    #[command(description = "Run full system diagnostic")]
+    Doctor,
     /// Show all commands.
     #[command(description = "Show all commands")]
     Help,
@@ -113,6 +116,7 @@ impl From<TelegramCommand> for TrustyCommand {
                 code: non_empty(code),
             },
             TelegramCommand::Start(_) => TrustyCommand::Start,
+            TelegramCommand::Doctor => TrustyCommand::Doctor,
             TelegramCommand::Help => TrustyCommand::Help,
         }
     }
@@ -188,13 +192,18 @@ mod tests {
             TrustyCommand::from(TelegramCommand::Start("A4X9KZ".into())),
             TrustyCommand::Start
         );
+        // `/doctor` maps one-to-one onto the diagnostic command.
+        assert_eq!(
+            TrustyCommand::from(TelegramCommand::Doctor),
+            TrustyCommand::Doctor
+        );
     }
 
     #[test]
     fn bot_commands_lists_every_command() {
-        // teloxide's generated descriptor must enumerate all seventeen commands.
+        // teloxide's generated descriptor must enumerate all eighteen commands.
         let descriptions = TelegramCommand::bot_commands();
-        assert_eq!(descriptions.len(), 17);
+        assert_eq!(descriptions.len(), 18);
         assert!(descriptions.iter().any(|c| c.command == "/sessions"));
         assert!(descriptions.iter().any(|c| c.command == "/pair"));
         assert!(descriptions.iter().any(|c| c.command == "/start"));
@@ -202,6 +211,7 @@ mod tests {
         assert!(descriptions.iter().any(|c| c.command == "/adopt"));
         assert!(descriptions.iter().any(|c| c.command == "/send"));
         assert!(descriptions.iter().any(|c| c.command == "/discover"));
+        assert!(descriptions.iter().any(|c| c.command == "/doctor"));
     }
 
     #[test]

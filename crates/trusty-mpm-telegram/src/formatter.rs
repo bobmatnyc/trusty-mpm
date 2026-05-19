@@ -183,6 +183,7 @@ impl TelegramFormatter {
             CommandResult::AlertSubscriptions(lines) => {
                 format!("<b>Alert subscription</b>\n{}", lines.join("\n"))
             }
+            CommandResult::Doctor(report) => format_doctor_report(report),
             CommandResult::Help(text) => text.clone(),
             CommandResult::Error(msg) => format!("❌ {msg}"),
         }
@@ -280,6 +281,60 @@ pub fn format_discovered_projects(projects: &[DiscoveredProjectSummary]) -> Stri
         ));
     }
     text
+}
+
+/// Render a [`DoctorReport`] as a Telegram HTML message body.
+///
+/// Why: the `/doctor` command's diagnostic must be readable on a phone — one
+/// emoji-tagged line per check plus an overall verdict.
+/// What: returns a heading, one `<icon> <name> — <message>` line per check, and
+/// a final overall-status line. Each check's icon reflects its
+/// [`CheckStatus`](trusty_mpm_core::doctor::CheckStatus).
+/// Test: `format_doctor_report_lists_each_check`.
+fn format_doctor_report(report: &trusty_mpm_client::DoctorReport) -> String {
+    let mut text = String::from("<b>trusty-mpm doctor</b>\n");
+    for check in &report.checks {
+        text.push_str(&format!(
+            "\n{} <b>{}</b> — {}",
+            status_icon(check.status),
+            html_escape(&check.name),
+            html_escape(&check.message),
+        ));
+    }
+    text.push_str(&format!(
+        "\n\n{} <b>overall: {}</b>",
+        status_icon(report.overall),
+        status_word(report.overall),
+    ));
+    text
+}
+
+/// The emoji icon for a doctor [`CheckStatus`](trusty_mpm_core::doctor::CheckStatus).
+///
+/// Why: the `/doctor` message marks each check with a glanceable status symbol.
+/// What: `Ok → ✅`, `Warn → ⚠️`, `Fail → ❌`.
+/// Test: covered by `format_doctor_report_lists_each_check`.
+fn status_icon(status: trusty_mpm_core::doctor::CheckStatus) -> &'static str {
+    use trusty_mpm_core::doctor::CheckStatus;
+    match status {
+        CheckStatus::Ok => "✅",
+        CheckStatus::Warn => "⚠️",
+        CheckStatus::Fail => "❌",
+    }
+}
+
+/// A one-word label for a doctor [`CheckStatus`](trusty_mpm_core::doctor::CheckStatus).
+///
+/// Why: the overall verdict reads better with a word than a bare icon.
+/// What: `Ok → "healthy"`, `Warn → "warnings"`, `Fail → "failed"`.
+/// Test: covered by `format_doctor_report_lists_each_check`.
+fn status_word(status: trusty_mpm_core::doctor::CheckStatus) -> &'static str {
+    use trusty_mpm_core::doctor::CheckStatus;
+    match status {
+        CheckStatus::Ok => "healthy",
+        CheckStatus::Warn => "warnings",
+        CheckStatus::Fail => "failed",
+    }
 }
 
 /// True when a string fits within Telegram's 64-byte callback-data budget.
@@ -533,6 +588,22 @@ mod tests {
     fn short_id_truncates_long_ids() {
         assert_eq!(short_id("0123456789abcdef"), "01234567…");
         assert_eq!(short_id("short"), "short");
+    }
+
+    #[test]
+    fn format_doctor_report_lists_each_check() {
+        use trusty_mpm_client::{CheckStatus, DoctorCheck, DoctorReport};
+        let report = DoctorReport::from_checks(vec![
+            DoctorCheck::new("instructions", CheckStatus::Ok, "pipeline ran"),
+            DoctorCheck::new("memory", CheckStatus::Fail, "unreachable"),
+        ]);
+        let text = TelegramFormatter::format(&CommandResult::Doctor(report));
+        assert!(text.contains("trusty-mpm doctor"));
+        assert!(text.contains("instructions"));
+        assert!(text.contains("memory"));
+        assert!(text.contains("unreachable"));
+        // A single Fail makes the overall verdict failed.
+        assert!(text.contains("overall: failed"));
     }
 
     #[test]

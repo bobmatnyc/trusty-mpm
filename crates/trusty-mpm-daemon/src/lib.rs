@@ -14,6 +14,7 @@ pub mod audit;
 pub mod claude_config;
 pub mod discover;
 pub mod discovery;
+pub mod doctor;
 pub mod error;
 pub mod llm_overseer;
 pub mod lock;

@@ -23,6 +23,7 @@ pub mod connect;
 pub mod delegation_authority;
 pub mod deterministic_overseer;
 pub mod discovery;
+pub mod doctor;
 pub mod error;
 pub mod external_session;
 pub mod hook;

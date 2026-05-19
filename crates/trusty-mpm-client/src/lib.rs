@@ -30,3 +30,4 @@ pub use result::{
     CommandResult, DecisionCounts, DiscoveredProjectSummary, RecommendationSummary, SessionSummary,
     TmuxSessionSummary,
 };
+pub use trusty_mpm_core::doctor::{CheckStatus, DoctorCheck, DoctorReport};

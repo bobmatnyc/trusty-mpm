@@ -56,6 +56,8 @@ enum Command {
     },
     /// Show the recent hook-event feed.
     Events,
+    /// Run a full system diagnostic of the trusty-mpm stack.
+    Doctor,
     /// Launch the ratatui multi-session TUI dashboard.
     Tui {
         /// Base URL of the trusty-mpm daemon.
@@ -357,6 +359,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Project { action } => project(&client, &url, action).await,
         Command::Session { action } => session(&client, &url, action).await,
         Command::Events => events(&client, &url).await,
+        Command::Doctor => doctor(&url).await,
         Command::Tui {
             url: tui_url,
             interval_ms,
@@ -2047,6 +2050,64 @@ async fn events(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `doctor` subcommand — run and print the full system diagnostic.
+///
+/// Why: a misconfigured trusty-mpm stack fails confusingly; `tm doctor` runs
+/// every health probe in one command and prints a formatted verdict so the
+/// operator can confirm — or fix — a broken install at a glance.
+/// What: runs [`TrustyCommand::Doctor`] through the shared [`CommandExecutor`]
+/// (which calls `GET /api/v1/doctor`), then prints one status-tagged line per
+/// check plus an overall verdict. An unreachable daemon prints an error line.
+/// Test: `cli_parses_doctor` covers parsing; the report path is covered by the
+/// executor's `execute_doctor_against_test_daemon` test.
+async fn doctor(url: &str) -> anyhow::Result<()> {
+    use trusty_mpm_client::{CommandExecutor, CommandResult, TrustyCommand};
+    use trusty_mpm_core::doctor::CheckStatus;
+
+    let executor = CommandExecutor::new(url.to_string());
+    match executor.execute(TrustyCommand::Doctor).await {
+        CommandResult::Doctor(report) => {
+            println!("trusty-mpm doctor");
+            for check in &report.checks {
+                println!(
+                    "  {} {:<13} {}",
+                    status_icon(check.status),
+                    check.name,
+                    check.message,
+                );
+            }
+            println!(
+                "\noverall: {} {}",
+                status_icon(report.overall),
+                match report.overall {
+                    CheckStatus::Ok => "all checks passed",
+                    CheckStatus::Warn => "passed with warnings",
+                    CheckStatus::Fail => "one or more checks failed",
+                },
+            );
+        }
+        CommandResult::Error(msg) => eprintln!("doctor failed: {msg}"),
+        other => eprintln!("doctor: unexpected result {other:?}"),
+    }
+    Ok(())
+}
+
+/// Render a [`CheckStatus`] as a status icon for terminal output.
+///
+/// Why: the `tm doctor` table marks each check with a glanceable symbol; one
+/// helper keeps the mapping consistent between the per-check lines and the
+/// overall verdict.
+/// What: `Ok → ✅`, `Warn → ⚠️`, `Fail → ❌`.
+/// Test: covered indirectly by the `doctor` output.
+fn status_icon(status: trusty_mpm_core::doctor::CheckStatus) -> &'static str {
+    use trusty_mpm_core::doctor::CheckStatus;
+    match status {
+        CheckStatus::Ok => "\u{2705}",
+        CheckStatus::Warn => "\u{26a0}\u{fe0f}",
+        CheckStatus::Fail => "\u{274c}",
+    }
+}
+
 /// `daemon` subcommand — run the HTTP daemon (or MCP server) with auto port
 /// selection, lock-file service discovery, and optional Tailscale exposure.
 ///
@@ -2268,6 +2329,12 @@ mod tests {
     fn cli_parses_start() {
         let cli = Cli::try_parse_from(["trusty-mpm", "start"]).unwrap();
         assert!(matches!(cli.command, Command::Start));
+    }
+
+    #[test]
+    fn cli_parses_doctor() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Command::Doctor));
     }
 
     #[test]

@@ -683,6 +683,20 @@ async fn pair_reset_clears_pairing() {
 }
 
 #[tokio::test]
+async fn doctor_endpoint_returns_report() {
+    // `GET /api/v1/doctor` always returns a five-check report; the per-check
+    // statuses carry the diagnosis, not the HTTP status.
+    let state = DaemonState::shared();
+    let Json(report) = doctor(State(state), Query(DoctorQuery::default())).await;
+    assert_eq!(report.checks.len(), 5);
+    let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["instructions", "agents", "skills", "memory", "search"]
+    );
+}
+
+#[tokio::test]
 async fn apply_claude_config_unknown_rec_is_404() {
     let dir = tempfile::tempdir().unwrap();
     let state = DaemonState::shared();
